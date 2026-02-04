@@ -2,11 +2,11 @@ use ndarray::{Array, Array1};
 use ndarray_rand::RandomExt;
 use rand_distr::Uniform;
 
-use rust_nn::autograd::{Tensor, no_grad};
-use rust_nn::loader::ModelLoader;
-use rust_nn::models::{LlamaConfig, LlamaModel}; // 确保 models 模块暴露了这些
-use rust_nn::tokenizer::LlamaTokenizer;
-use rust_nn::kv_cache::LlamaKVCache; // 新增：引入 KV Cache
+use Lumen::autograd::{Tensor, no_grad};
+use Lumen::loader::ModelLoader;
+use Lumen::models::{LlamaConfig, LlamaModel}; // 确保 models 模块暴露了这些
+use Lumen::tokenizer::LlamaTokenizer;
+use Lumen::kv_cache::LlamaKVCache; // 新增：引入 KV Cache
 
 use std::io::{self, Write};
 use mimalloc::MiMalloc;
@@ -128,8 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🦀 Loading Rusty Llama...");
     let model = LlamaModel::new(config.clone()); // Clone config 用于 Cache 初始化
 
-    let tokenizer_path = r"C:\Users\chen-\Downloads\tokenizer.json";
-    let weight_path = r"C:\Users\chen-\Downloads\model.safetensors";
+    let tokenizer_path = r"tokenizer.json";
+    let weight_path = r"model.safetensors";
 
     let tokenizer = LlamaTokenizer::from_file(tokenizer_path)?;
 
