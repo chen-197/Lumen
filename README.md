@@ -23,7 +23,7 @@
 
 ### 🏗️ 丰富的模型支持
 
-* **Transformers**: 完整支持 **Llama** 架构，包含 **RoPE**（旋转位置编码）、**GQA**（分组查询注意力）和 **SwiGLU**。
+* **Transformers**: 完整支持 **Llama** 架构，包含 **RoPE**（旋转位置编码）、**GQA**（分组查询注意力）和 **SwiGLU**等。
 * **RNN Family**: 原生支持 **RNN**、**LSTM**、**GRU**，适用于序列建模。
 * **CNN Support**: 支持卷积操作（Im2Col + GEMM），适用于计算机视觉任务。
 
