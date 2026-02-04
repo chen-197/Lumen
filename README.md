@@ -16,7 +16,7 @@
 
 ### 🚀 优秀性能 (High Performance)
 
-* **Static KV Cache**: 针对自回归模型（如 Llama）实现了**静态 KV Cache 预分配**策略，推理过程中 **0 动态内存分配**，彻底消除显存碎片。
+* **Static KV Cache**: 针对自回归模型（如 Llama）实现了**静态 KV Cache 预分配**策略，推理过程中 **0 动态内存分配**，彻底消除内存碎片。
 * **Decoding Optimization**: 针对 `Batch=1` 的 Decoding 阶段，实现了手写并行矩阵-向量乘法（Vector-Matrix Multiplication），突破 BLAS 库在小矩阵上的性能瓶颈。
 * **Zero-Copy Design**: 广泛使用内部可变性模式（Interior Mutability）和视图切片，最大程度减少张量数据的内存拷贝。
 * **Rayon Parallelism**: 对 GQA Attention、Softmax、RMSNorm 和 Convolution 进行了细粒度的多线程并行优化。
