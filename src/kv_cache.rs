@@ -3,8 +3,8 @@ use ndarray::{Array4, s};
 
 #[derive(Clone)]
 pub struct LlamaKVCache {
-    pub k_cache: Tensor,
-    pub v_cache: Tensor,
+    pub k_cache: Array4<f32>,
+    pub v_cache: Array4<f32>,
     pub max_seq_len: usize,
     pub dim: usize,
     pub head_num: usize,
@@ -20,8 +20,8 @@ impl LlamaKVCache {
         let v_data = Array4::<f32>::zeros((1, head_num, max_seq_len, head_dim));
 
         Self {
-            k_cache: Tensor::from_data_no_grad(k_data.into_dyn()),
-            v_cache: Tensor::from_data_no_grad(v_data.into_dyn()),
+            k_cache: k_data,
+            v_cache: v_data,
             max_seq_len,
             dim: head_dim,
             head_num,
@@ -35,37 +35,26 @@ impl LlamaKVCache {
             panic!("KV Cache overflow! Max: {}, Current: {}", self.max_seq_len, end_pos);
         }
 
-        {
-            let mut k_storage = self.k_cache.data_mut();
-            let mut k_view = k_storage.view_mut().into_dimensionality::<ndarray::Ix4>().unwrap();
-            
-            let k_in = k.data_ref();
-            let k_in_view = k_in.view().into_dimensionality::<ndarray::Ix4>().unwrap();
-            
-            k_view.slice_mut(s![.., .., start_pos..end_pos, ..]).assign(&k_in_view);
-        }
+        let k_in = k.data_ref();
+        let k_in_view = k_in.view().into_dimensionality::<ndarray::Ix4>().unwrap();
+        self.k_cache
+            .slice_mut(s![.., .., start_pos..end_pos, ..])
+            .assign(&k_in_view);
 
-        {
-            let mut v_storage = self.v_cache.data_mut();
-            let mut v_view = v_storage.view_mut().into_dimensionality::<ndarray::Ix4>().unwrap();
-            
-            let v_in = v.data_ref();
-            let v_in_view = v_in.view().into_dimensionality::<ndarray::Ix4>().unwrap();
-            
-            v_view.slice_mut(s![.., .., start_pos..end_pos, ..]).assign(&v_in_view);
-        }
+        let v_in = v.data_ref();
+        let v_in_view = v_in.view().into_dimensionality::<ndarray::Ix4>().unwrap();
+        self.v_cache
+            .slice_mut(s![.., .., start_pos..end_pos, ..])
+            .assign(&v_in_view);
     }
 
     pub fn get_view(&self, current_len: usize) -> (Tensor, Tensor) {
-        let k_storage = self.k_cache.data_ref();
-        let k_slice = k_storage.slice(s![.., .., ..current_len, ..]).to_owned();
-        
-        let v_storage = self.v_cache.data_ref();
-        let v_slice = v_storage.slice(s![.., .., ..current_len, ..]).to_owned();
+        let k_slice = self.k_cache.slice(s![.., .., ..current_len, ..]).to_owned();
+        let v_slice = self.v_cache.slice(s![.., .., ..current_len, ..]).to_owned();
 
         (
-            Tensor::from_data_no_grad(k_slice.into_dyn()),
-            Tensor::from_data_no_grad(v_slice.into_dyn())
+            Tensor::from_array_no_grad(k_slice.into_dyn()),
+            Tensor::from_array_no_grad(v_slice.into_dyn())
         )
     }
 }

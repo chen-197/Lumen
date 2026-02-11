@@ -1,5 +1,6 @@
 use crate::autograd::Tensor;
 use ndarray::prelude::*;
+use ndarray::Zip;
 
 pub trait Optimizer {
     fn step(&mut self);
@@ -44,28 +45,50 @@ impl Optimizer for SGD {
     fn step(&mut self) {
         for (i, param) in self.params.iter().enumerate() {
             let mut p_inner = param.0.borrow_mut();
-            
-            // 只有当参数有梯度时才更新
-            if let Some(grad) = &p_inner.grad {
+            // 先把 grad clone 出来（ArcArray clone 仅增 refcount，不复制数据），避免与 data.view_mut() 的可变借用冲突
+            let grad = match p_inner.grad.clone() {
+                Some(g) => g,
+                None => continue,
+            };
+
+            {
                 if self.momentum == 0.0 {
-                    // 标准 SGD: w = w - lr * grad
-                    p_inner.data = &p_inner.data - &(grad * self.lr);
+                    // 标准 SGD（尽量原地更新，避免每步分配）:
+                    // w -= lr * grad
+                    // 说明：ArcArray 的 DataMut 实现内部用 Arc::make_mut，
+                    // 当数据被共享时会触发一次 copy-on-write；未共享时为真·原地。
+                    let lr = self.lr;
+                    Zip::from(p_inner.data.view_mut())
+                        .and(grad.view())
+                        .for_each(|w, g| {
+                            *w -= lr * *g;
+                        });
                 } else {
                     // SGD with Momentum
                     // v = m * v + grad (有的实现是 v = m * v + lr * grad，这里参考 PyTorch 默认行为)
                     // w = w - lr * v
-                    
-                    let v_old = if let Some(v) = &self.velocities[i] {
-                        v.clone()
-                    } else {
-                        ArrayD::zeros(p_inner.data.shape())
-                    };
 
-                    let v_new = &(&v_old * self.momentum) + grad;
-                    
-                    p_inner.data = &p_inner.data - &(&v_new * self.lr);
-                    
-                    self.velocities[i] = Some(v_new);
+                    if self.velocities[i].is_none() {
+                        self.velocities[i] = Some(ArrayD::zeros(p_inner.data.shape()));
+                    }
+
+                    let m = self.momentum;
+                    let lr = self.lr;
+                    let v_buf = self.velocities[i].as_mut().unwrap();
+
+                    // v = m * v + grad
+                    Zip::from(v_buf.view_mut())
+                        .and(grad.view())
+                        .for_each(|v, g| {
+                            *v = m * (*v) + *g;
+                        });
+
+                    // w -= lr * v
+                    Zip::from(p_inner.data.view_mut())
+                        .and(v_buf)
+                        .for_each(|w, vv| {
+                            *w -= lr * *vv;
+                        });
                 }
             }
         }
@@ -115,36 +138,39 @@ impl Optimizer for Adam {
         for (i, param) in self.params.iter().enumerate() {
             let mut p_inner = param.0.borrow_mut();
 
-            if let Some(grad) = &p_inner.grad {
+            // 先把 grad clone 出来，避免与 data.view_mut() 的可变借用冲突
+            let grad = match p_inner.grad.as_ref() {
+                Some(g) => g.clone(),
+                None => continue,
+            };
+
+            {
                 // 初始化状态 (如果第一次运行)
                 if self.exp_avg[i].is_none() {
                     self.exp_avg[i] = Some(ArrayD::zeros(p_inner.data.shape()));
                     self.exp_avg_sq[i] = Some(ArrayD::zeros(p_inner.data.shape()));
                 }
 
-                let m_prev = self.exp_avg[i].as_ref().unwrap();
-                let v_prev = self.exp_avg_sq[i].as_ref().unwrap();
+                // 复用缓冲 + 单次 Zip 完成 m/v 更新与参数更新：
+                // m = beta1*m + (1-beta1)*g
+                // v = beta2*v + (1-beta2)*g^2
+                // w -= lr * (m/bc1) / (sqrt(v/bc2) + eps)
+                let lr = self.lr;
+                let eps = self.eps;
+                let m_buf = self.exp_avg[i].as_mut().unwrap();
+                let v_buf = self.exp_avg_sq[i].as_mut().unwrap();
 
-                // 更新一阶矩 m: m_t = beta1 * m_{t-1} + (1 - beta1) * g
-                let m_t = &(m_prev * beta1) + &(grad * (1.0 - beta1));
-
-                // 更新二阶矩 v: v_t = beta2 * v_{t-1} + (1 - beta2) * g^2
-                // g^2 是逐元素平方
-                let grad_sq = grad.mapv(|x| x * x);
-                let v_t = &(v_prev * beta2) + &(&grad_sq * (1.0 - beta2));
-
-                // 计算 hat_m 和 hat_v (Bias Correction)
-                let m_hat = &m_t / bias_correction1;
-                let v_hat = &v_t / bias_correction2;
-
-                // 更新参数: w = w - lr * m_hat / (sqrt(v_hat) + eps)
-                let denorm = v_hat.mapv(|x| x.sqrt() + self.eps);
-                let step_update = &m_hat / &denorm;
-
-                p_inner.data = &p_inner.data - &(&step_update * self.lr);
-
-                self.exp_avg[i] = Some(m_t);
-                self.exp_avg_sq[i] = Some(v_t);
+                Zip::from(p_inner.data.view_mut())
+                    .and(m_buf.view_mut())
+                    .and(v_buf.view_mut())
+                    .and(grad.view())
+                    .for_each(|w, m, v, g| {
+                        *m = beta1 * (*m) + (1.0 - beta1) * g;
+                        *v = beta2 * (*v) + (1.0 - beta2) * g * g;
+                        let m_hat = *m / bias_correction1;
+                        let v_hat = *v / bias_correction2;
+                        *w -= lr * (m_hat / (v_hat.sqrt() + eps));
+                    });
             }
         }
     }

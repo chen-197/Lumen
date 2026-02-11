@@ -16,7 +16,7 @@ use std::rc::Rc;
 ///     3. Probs = Softmax(Masked_Scores)
 pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
     let (output, output_data) = {
-        let x = input.data();
+        let x = input.data_ref();
         let shape = x.shape(); // [B, H, Q, K]
         // 健壮性检查
         if shape.len() != 4 {
@@ -92,7 +92,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
     // Softmax derivative: dy_j/dx_i = y_i * (delta_ij - y_j)
     // Combined: dX = scale * ( Y * (Grad - sum(Y * Grad, axis=-1)) )
     Tensor(Rc::new(RefCell::new(TensorData {
-        data: output,
+        data: output.into_shared(),
         grad: None,
         parents: vec![input.clone()],
         backward_op: Some(Box::new(move |grad| {

@@ -26,7 +26,7 @@ impl MSELoss {
         let target_clone = target.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: arr0(loss_val).into_dyn(),
+            data: arr0(loss_val).into_dyn().into_shared(),
             grad: None,
             parents: vec![output.clone(), target.clone()],
             backward_op: Some(Box::new(move |grad_output| {
@@ -114,7 +114,7 @@ impl CrossEntropyLoss {
         let softmax_cache = softmax_output;
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: arr0(loss_val).into_dyn(),
+            data: arr0(loss_val).into_dyn().into_shared(),
             grad: None,
             parents: vec![input_logits.clone(), target_onehot.clone()],
             backward_op: Some(Box::new(move |grad_output| {

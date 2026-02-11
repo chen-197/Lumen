@@ -66,7 +66,7 @@ impl Module for RMSNorm {
         let eps = self.eps; // copy scalar
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: output_data,
+            data: output_data.into_shared(),
             grad: None,
             parents: vec![input.clone(), self.weight.clone()],
             backward_op: Some(Box::new(move |grad_output| {

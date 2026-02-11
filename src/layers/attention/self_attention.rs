@@ -7,9 +7,17 @@ use crate::ops::matmul::batch_matmul;
 use crate::ops::shape::{permute, reshape};
 
 use ndarray::linalg::general_mat_mul;
-use ndarray::{Array2, Array4};
+use ndarray::Array4;
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+thread_local! {
+    // attention scores buffer: S * L
+    static ATT_SCORES_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    // attention ctx buffer: S * D
+    static ATT_CTX_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
 
 pub struct KVCacheInner {
     pub k: Array4<f32>, // [B, H_kv, max_seq, D]
@@ -84,7 +92,7 @@ impl SelfAttention {
 
     /// forward：eval 用预分配 cache；train 走原逻辑（cat + repeat_kv）
     pub fn forward(&self, x: Tensor, cache: Option<KVCache>) -> (Tensor, Option<KVCache>) {
-        let x_shape = x.data().shape().to_vec();
+        let x_shape = x.data_ref().shape().to_vec();
         let (b, s, _) = (x_shape[0], x_shape[1], x_shape[2]);
 
         let h = self.n_head;
@@ -98,21 +106,30 @@ impl SelfAttention {
         let v = self.w_v.forward(x);
 
         // 2) reshape/permute 到 [B, H, S, D] / [B, H_kv, S, D]
-        let q = permute(
-            &reshape(&q, vec![b as i32, s as i32, h as i32, d as i32]),
-            vec![0, 2, 1, 3],
-        );
-        let k = permute(
-            &reshape(&k, vec![b as i32, s as i32, h_kv as i32, d as i32]),
-            vec![0, 2, 1, 3],
-        );
-        let v = permute(
-            &reshape(&v, vec![b as i32, s as i32, h_kv as i32, d as i32]),
-            vec![0, 2, 1, 3],
-        );
-
-        // eval 路径：预分配 cache + 不 repeat_kv（ndarray 快路径）
+        // eval 路径：彻底绕开 Tensor shape ops（不产生中间 Tensor，也不触发 copy）
         if is_no_grad() {
+            let q = Tensor::from_data_no_grad(
+                q.data_arc()
+                    .into_shape((b, s, h, d))
+                    .expect("Q reshape failed")
+                    .permuted_axes([0, 2, 1, 3])
+                    .into_dyn(),
+            );
+            let k = Tensor::from_data_no_grad(
+                k.data_arc()
+                    .into_shape((b, s, h_kv, d))
+                    .expect("K reshape failed")
+                    .permuted_axes([0, 2, 1, 3])
+                    .into_dyn(),
+            );
+            let v = Tensor::from_data_no_grad(
+                v.data_arc()
+                    .into_shape((b, s, h_kv, d))
+                    .expect("V reshape failed")
+                    .permuted_axes([0, 2, 1, 3])
+                    .into_dyn(),
+            );
+
             // 3) 初始化/取出 cache（预分配）
             let cache_handle: KVCache = match cache {
                 Some(c) => c,
@@ -135,41 +152,81 @@ impl SelfAttention {
                     self.max_seq
                 );
 
-                let k_src = k_rot
-                    .data()
-                    .to_owned()
+                // 注意：data_ref() 返回 Ref<'_>，不能链式直接拿 view，否则 Ref 会过早 drop（E0716）。
+                let k_ref = k_rot.data_ref();
+                let k_src = k_ref
+                    .view()
                     .into_dimensionality::<ndarray::Ix4>()
-                    .unwrap(); // [B,H_kv,S,D]
-                let v_src = v
-                    .data()
-                    .to_owned()
+                    .unwrap(); // [B,H_kv,S,D] view
+
+                let v_ref = v.data_ref();
+                let v_src = v_ref
+                    .view()
                     .into_dimensionality::<ndarray::Ix4>()
                     .unwrap();
 
-                c.k.slice_mut(ndarray::s![.., .., past_len..new_len, ..])
-                    .assign(&k_src);
-                c.v.slice_mut(ndarray::s![.., .., past_len..new_len, ..])
-                    .assign(&v_src);
+                // KV cache 写入：
+                // - decode_step (S=1) 走更轻量的 slice + copy_from_slice（避免 assign 的逐元素/广播开销）
+                // - S>1 保持 assign（依然是 view 写入，不产生额外 cat/copy）
+                if s == 1 {
+                    let d = k_src.dim().3;
+                    let h_kv = k_src.dim().1;
+                    for bb in 0..b {
+                        for hk in 0..h_kv {
+                            let src_k = k_src.slice(ndarray::s![bb, hk, 0, ..]);
+                            let src_v = v_src.slice(ndarray::s![bb, hk, 0, ..]);
+                            // 避免对 c 的两个可变借用重叠：用两个作用域分开 k/v 写入
+                            {
+                                let mut dst_k =
+                                    c.k.slice_mut(ndarray::s![bb, hk, past_len, ..]);
+                                dst_k
+                                    .as_slice_mut()
+                                    .expect("dst_k not contiguous")
+                                    .copy_from_slice(
+                                        src_k.as_slice().expect("src_k not contiguous"),
+                                    );
+                                debug_assert_eq!(dst_k.len(), d);
+                            }
+                            {
+                                let mut dst_v =
+                                    c.v.slice_mut(ndarray::s![bb, hk, past_len, ..]);
+                                dst_v
+                                    .as_slice_mut()
+                                    .expect("dst_v not contiguous")
+                                    .copy_from_slice(
+                                        src_v.as_slice().expect("src_v not contiguous"),
+                                    );
+                                debug_assert_eq!(dst_v.len(), d);
+                            }
+                        }
+                    }
+                } else {
+                    c.k.slice_mut(ndarray::s![.., .., past_len..new_len, ..])
+                        .assign(&k_src);
+                    c.v.slice_mut(ndarray::s![.., .., past_len..new_len, ..])
+                        .assign(&v_src);
+                }
                 c.len = new_len;
             }
 
             // 6) GQA attention（不 repeat_kv）
-            let context_bhsd = {
+            // 6) GQA attention（不 repeat_kv）。为了绕开 eval 的 permute/reshape copy，
+            // 这里直接产出 [B,S,H,D]（BSHD）布局，后续 reshape 到 [B,S,H*D] 可视为 view。
+            let context_bshd = {
                 let c = cache_handle.borrow();
                 let total_len = c.len;
-                let q4 = q_rot
-                    .data()
-                    .to_owned()
+                let q_ref = q_rot.data_ref();
+                let q4 = q_ref
+                    .view()
                     .into_dimensionality::<ndarray::Ix4>()
-                    .unwrap(); // [B,H,S,D]
-                let k4 = c.k.slice(ndarray::s![.., .., 0..total_len, ..]).to_owned(); // [B,H_kv,L,D]
-                let v4 = c.v.slice(ndarray::s![.., .., 0..total_len, ..]).to_owned(); // [B,H_kv,L,D]
-                gqa_attention_no_repeat(&q4, &k4, &v4, self.scale, self.causal, n_rep, past_len)
+                    .unwrap(); // [B,H,S,D] view
+                let k4 = c.k.slice(ndarray::s![.., .., 0..total_len, ..]); // view [B,H_kv,L,D]
+                let v4 = c.v.slice(ndarray::s![.., .., 0..total_len, ..]); // view [B,H_kv,L,D]
+                gqa_attention_no_repeat_bshd_view(&q4, &k4, &v4, self.scale, self.causal, n_rep, past_len)
             };
 
-            // 7) 输出投影：context [B,H,S,D] -> [B,S,H*D] -> w_o
-            let context = Tensor::from_data_no_grad(context_bhsd.into_dyn());
-            let context = permute(&context, vec![0, 2, 1, 3]);
+            // 7) 输出投影：context [B,S,H,D] -> [B,S,H*D] -> w_o （全 view，不触发 copy）
+            let context = Tensor::from_data_no_grad(context_bshd.into_dyn().into_shared());
             let context = reshape(&context, vec![b as i32, s as i32, (h * d) as i32]);
             let output = self.w_o.forward(context);
 
@@ -177,6 +234,9 @@ impl SelfAttention {
         }
 
         // train 路径：走原来的逻辑（可导）
+        let q = permute(&reshape(&q, vec![b as i32, s as i32, h as i32, d as i32]), vec![0, 2, 1, 3]);
+        let k = permute(&reshape(&k, vec![b as i32, s as i32, h_kv as i32, d as i32]), vec![0, 2, 1, 3]);
+        let v = permute(&reshape(&v, vec![b as i32, s as i32, h_kv as i32, d as i32]), vec![0, 2, 1, 3]);
 
         // 希望训练时禁止传 cache：
         if cache.is_some() {
@@ -235,7 +295,7 @@ impl Module for SelfAttention {
 // x: [B, H_kv, S, D] -> [B, H, S, D]
 
 pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
-    let data_ref = x.data();
+    let data_ref = x.data_ref();
     let shape = data_ref.shape();
     let (b, n_kv, s, d) = (shape[0], shape[1], shape[2], shape[3]);
 
@@ -260,13 +320,13 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
 // eval 路径核心：GQA attention（不 repeat_kv）
 // q: [B, H, S, D]
 // k/v: [B, H_kv, L, D]
-// 返回 context: [B, H, S, D]
+// 返回 context: [B, S, H, D]（BSHD，便于后续 reshape 到 [B,S,H*D] 视为 view）
 // past_len: cache 写入前的长度（用于 causal mask 的 absolute index）
 
-fn gqa_attention_no_repeat(
-    q: &Array4<f32>,
-    k: &Array4<f32>,
-    v: &Array4<f32>,
+fn gqa_attention_no_repeat_bshd_view(
+    q: &ndarray::ArrayView4<f32>,
+    k: &ndarray::ArrayView4<f32>,
+    v: &ndarray::ArrayView4<f32>,
     scale: f32,
     causal: bool,
     n_rep: usize,
@@ -278,33 +338,116 @@ fn gqa_attention_no_repeat(
     assert_eq!(d, d2);
     assert_eq!(h, h_kv * n_rep);
 
-    let mut out = Array4::<f32>::zeros((b, h, s, d));
+    let mut out = Array4::<f32>::zeros((b, s, h, d));
 
-    for bb in 0..b {
-        for hq in 0..h {
+    // 将 out 变换为 [H,B,S,D]，对 head 维并行写入（线程间互不重叠）
+    let mut out_hbsd = out.view_mut().permuted_axes([2, 0, 1, 3]);
+    out_hbsd
+        .outer_iter_mut()
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(hq, mut out_for_head)| {
             let hk = hq / n_rep;
 
-            let q_mat = q.slice(ndarray::s![bb, hq, .., ..]); // [S,D]
-            let k_mat = k.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
-            let v_mat = v.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
+            // decode(S=1) 热路径：online softmax + 直接累加 ctx，完全不需要 scores/ctx buffer
+            if s == 1 {
+                for bb in 0..b {
+                    let q_vec = q.slice(ndarray::s![bb, hq, 0, ..]); // [D]
+                    let k_mat = k.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
+                    let v_mat = v.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
 
-            let mut scores = Array2::<f32>::zeros((s, l));
-            general_mat_mul(1.0, &q_mat, &k_mat.t(), 0.0, &mut scores);
+                    let q_abs = past_len; // i == 0
 
-            // causal mask 用 absolute index：key_j <= past_len + query_i
-            softmax_inplace(&mut scores, scale, causal, past_len);
+                    // 1) max
+                    let mut maxv = f32::NEG_INFINITY;
+                    for j in 0..l {
+                        // causal mask
+                        if causal && j > q_abs {
+                            continue;
+                        }
+                        let kj = k_mat.slice(ndarray::s![j, ..]);
+                        let mut dot = 0.0f32;
+                        for i in 0..d {
+                            dot += q_vec[i] * kj[i];
+                        }
+                        let score = dot * scale;
+                        if score > maxv {
+                            maxv = score;
+                        }
+                    }
 
-            let mut ctx = Array2::<f32>::zeros((s, d));
-            general_mat_mul(1.0, &scores, &v_mat, 0.0, &mut ctx);
+                    // 2) sum + ctx
+                    let mut sum = 0.0f32;
+                    // out_for_head: [B,S,D] and S==1
+                    let mut out_row = out_for_head.slice_mut(ndarray::s![bb, 0, ..]);
+                    out_row.fill(0.0);
 
-            out.slice_mut(ndarray::s![bb, hq, .., ..]).assign(&ctx);
-        }
-    }
+                    for j in 0..l {
+                        if causal && j > q_abs {
+                            continue;
+                        }
+                        let kj = k_mat.slice(ndarray::s![j, ..]);
+                        let mut dot = 0.0f32;
+                        for i in 0..d {
+                            dot += q_vec[i] * kj[i];
+                        }
+                        let w = (dot * scale - maxv).exp();
+                        sum += w;
+
+                        for i in 0..d {
+                            out_row[i] += w * v_mat[[j, i]];
+                        }
+                    }
+
+                    let inv = 1.0f32 / (sum + 1e-9);
+                    for i in 0..d {
+                        out_row[i] *= inv;
+                    }
+                }
+                return;
+            }
+
+            // per-thread buffer reuse
+            ATT_SCORES_BUF.with(|sb| {
+                ATT_CTX_BUF.with(|cb| {
+                    let mut scores_buf = sb.borrow_mut();
+                    let mut ctx_buf = cb.borrow_mut();
+
+                    if scores_buf.len() != s * l {
+                        scores_buf.resize(s * l, 0.0);
+                    }
+                    if ctx_buf.len() != s * d {
+                        ctx_buf.resize(s * d, 0.0);
+                    }
+
+                    let mut scores = ndarray::ArrayViewMut2::from_shape((s, l), &mut scores_buf[..])
+                        .expect("scores buffer shape mismatch");
+                    let mut ctx = ndarray::ArrayViewMut2::from_shape((s, d), &mut ctx_buf[..])
+                        .expect("ctx buffer shape mismatch");
+
+                    for bb in 0..b {
+                        let q_mat = q.slice(ndarray::s![bb, hq, .., ..]); // [S,D]
+                        let k_mat = k.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
+                        let v_mat = v.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
+
+                        scores.fill(0.0);
+                        general_mat_mul(1.0, &q_mat, &k_mat.t(), 0.0, &mut scores);
+                        softmax_inplace_view(&mut scores, scale, causal, past_len);
+
+                        ctx.fill(0.0);
+                        general_mat_mul(1.0, &scores, &v_mat, 0.0, &mut ctx);
+
+                        // out_for_head: [B,S,D]
+                        out_for_head.slice_mut(ndarray::s![bb, .., ..]).assign(&ctx);
+                    }
+                })
+            });
+        });
 
     out
 }
 
-fn softmax_inplace(scores: &mut Array2<f32>, scale: f32, causal: bool, past_len: usize) {
+fn softmax_inplace_view(scores: &mut ndarray::ArrayViewMut2<f32>, scale: f32, causal: bool, past_len: usize) {
     let (s, l) = scores.dim();
 
     for i in 0..s {

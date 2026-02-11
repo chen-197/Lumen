@@ -139,7 +139,7 @@ impl LlamaAttention {
 
         // Scale
         let scale = (self.head_dim as f32).sqrt().recip();
-        scores = scores * Tensor::from_data_no_grad(ndarray::arr0(scale).into_dyn());
+        scores = scores * Tensor::from_array_no_grad(ndarray::arr0(scale).into_dyn());
 
         // Causal Masking
         // 只有在 prefill (seq_len > 1) 时才需要 mask
@@ -226,7 +226,7 @@ impl LlamaAttention {
             .unwrap()
             .into_dyn();
 
-        Tensor::from_data_no_grad(res)
+        Tensor::from_array_no_grad(res)
     }
 
     fn create_causal_mask(&self, seq_len: usize, total_len: usize, pos: usize) -> Tensor {
@@ -248,7 +248,7 @@ impl LlamaAttention {
                 }
             }
         }
-        Tensor::from_data_no_grad(mask.into_dyn())
+        Tensor::from_array_no_grad(mask.into_dyn())
     }
 }
 

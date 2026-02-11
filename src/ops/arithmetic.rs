@@ -3,35 +3,45 @@ use crate::autograd::{Tensor, TensorData};
 use std::ops::{Add, Sub, Mul};
 use std::rc::Rc;
 use std::cell::RefCell;
-use ndarray::{ArrayD, Axis, Zip};
+use ndarray::{ArrayD, ArrayViewD, Zip};
 
-fn reduce_gradient(grad: &ArrayD<f32>, target_shape: &[usize]) -> ArrayD<f32> {
+fn reduce_gradient(grad: ArrayViewD<'_, f32>, target_shape: &[usize]) -> ArrayD<f32> {
     if grad.shape() == target_shape {
-        return grad.clone();
+        return grad.to_owned().into_dyn();
     }
-    let mut res = grad.clone();
+
+    // 将 view materialize 成 owned，然后按旧逻辑做 reduce/broadcast
+    let mut res = grad.to_owned().into_dyn();
     let g_ndim = res.ndim();
     let t_ndim = target_shape.len();
-    
+
     if g_ndim > t_ndim {
         for _ in 0..(g_ndim - t_ndim) {
-            res = res.sum_axis(Axis(0));
+            res = res.sum_axis(ndarray::Axis(0));
         }
     }
+
     for i in 0..res.ndim() {
         if target_shape[i] == 1 && res.shape()[i] > 1 {
-            let summed = res.sum_axis(Axis(i));
-            res = summed.insert_axis(Axis(i));
+            let summed = res.sum_axis(ndarray::Axis(i));
+            res = summed.insert_axis(ndarray::Axis(i));
         } else if target_shape[i] != res.shape()[i] {
-            panic!("Gradient shape mismatch. Grad: {:?}, Target: {:?}", grad.shape(), target_shape);
+            panic!(
+                "Gradient shape mismatch. Grad: {:?}, Target: {:?}",
+                grad.shape(),
+                target_shape
+            );
         }
     }
+
     if res.shape() != target_shape {
         if res.len() == target_shape.iter().product::<usize>() {
+            // 这里继续使用 into_shape()，保持现有行为
             return res.into_shape(target_shape).unwrap();
         }
         panic!("Reduction failed.");
     }
+
     res
 }
 
@@ -44,14 +54,14 @@ impl Add for Tensor {
         let rhs = rhs.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![self.clone(), rhs.clone()],
             backward_op: Some(Box::new(move |grad| {
                 let l_shape = lhs.data_ref().shape().to_vec();
                 let r_shape = rhs.data_ref().shape().to_vec();
-                lhs.add_grad(reduce_gradient(grad, &l_shape));
-                rhs.add_grad(reduce_gradient(grad, &r_shape));
+                lhs.add_grad(reduce_gradient(grad.view(), &l_shape));
+                rhs.add_grad(reduce_gradient(grad.view(), &r_shape));
             })),
             requires_grad: true
         })))
@@ -71,17 +81,17 @@ impl Sub for Tensor {
         let rhs = rhs.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![self.clone(), rhs.clone()],
             backward_op: Some(Box::new(move |grad| {
                 let l_shape = lhs.data_ref().shape().to_vec();
                 let r_shape = rhs.data_ref().shape().to_vec();
-                lhs.add_grad(reduce_gradient(grad, &l_shape));
+                lhs.add_grad(reduce_gradient(grad.view(), &l_shape));
                 
                 // 并行取反
                 let grad_neg = Zip::from(grad).par_map_collect(|&x| -x);
-                rhs.add_grad(reduce_gradient(&grad_neg, &r_shape));
+                rhs.add_grad(reduce_gradient(grad_neg.view(), &r_shape));
             })),
             requires_grad: true
         })))
@@ -101,7 +111,7 @@ impl Mul for Tensor {
         let rhs = rhs.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![self.clone(), rhs.clone()],
             backward_op: Some(Box::new(move |grad| {
@@ -121,8 +131,8 @@ impl Mul for Tensor {
 
                 let l_shape = a_data.shape().to_vec();
                 let r_shape = b_data.shape().to_vec();
-                lhs.add_grad(reduce_gradient(&g_lhs, &l_shape));
-                rhs.add_grad(reduce_gradient(&g_rhs, &r_shape));
+                lhs.add_grad(reduce_gradient(g_lhs.view(), &l_shape));
+                rhs.add_grad(reduce_gradient(g_rhs.view(), &r_shape));
             })),
             requires_grad: true
         })))
@@ -142,7 +152,7 @@ pub fn sum(input: &Tensor) -> Tensor {
     let input_clone = input.clone();
     
     Tensor(Rc::new(RefCell::new(TensorData {
-        data: result,
+        data: result.into_shared(),
         grad: None,
         parents: vec![input.clone()],
         backward_op: Some(Box::new(move |grad| {

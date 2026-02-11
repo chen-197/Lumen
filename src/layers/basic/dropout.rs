@@ -9,7 +9,8 @@ impl Dropout { pub fn new(p: f32) -> Self { Dropout { p, training: true } } }
 impl Module for Dropout {
     fn forward(&self, input: Tensor) -> Tensor {
         if self.training && self.p > 0.0 {
-            let shape = input.data().shape().to_vec();
+            // Avoid cloning the full tensor data just to read the shape.
+            let shape = input.data_ref().shape().to_vec();
             let dist = Bernoulli::new(1.0 - self.p as f64).unwrap();
             let mask_arr = Array::random(ndarray::IxDyn(&shape), dist).mapv(|x| if x { 1.0f32 } else { 0.0f32 });
             let scale = 1.0 / (1.0 - self.p);

@@ -19,8 +19,11 @@ impl Embedding {
     }
 
     pub fn forward(&self, indices: &Tensor) -> Tensor {
-        let w_data = self.weight.data();
-        let idx_data = indices.data();
+        // 重要：并行闭包中不能捕获 Ref<'_>（不是 Sync）。
+        // 使用 ArcArray clone（仅增 refcount，不拷贝数据），可安全跨线程。
+        let w_data = self.weight.data_arc();
+        // Use ArcArray clone to avoid capturing RefCell borrow guards in rayon closures.
+        let idx_data = indices.data_arc();
         let e_dim = self.embed_dim;
         let v_size = self.vocab_size;
 
@@ -31,15 +34,22 @@ impl Embedding {
 
         // 2. 将数据展平以便进行并行处理
         let num_elements = idx_data.len();
-        let idx_flat = idx_data.view().into_shape(num_elements).expect("Flatten indices failed");
+        let idx_flat = idx_data
+            .view()
+            .into_shape(num_elements)
+            .expect("Flatten indices failed");
         let mut out_flat = out.view_mut().into_shape((num_elements, e_dim)).expect("Flatten output failed");
+
+        let w_2d = w_data
+            .into_dimensionality::<ndarray::Ix2>()
+            .expect("Embedding weight must be 2D");
 
         Zip::from(out_flat.outer_iter_mut())
             .and(&idx_flat)
             .par_for_each(|mut out_row, &idx_f32| {
                 let idx = idx_f32 as usize;
                 if idx < v_size {
-                    let w_row = w_data.slice(ndarray::s![idx, ..]);
+                    let w_row = w_2d.slice(ndarray::s![idx, ..]);
                     out_row.assign(&w_row);
                 } else {
                     panic!("Embedding index out of bounds: {} >= {}", idx, v_size);
@@ -53,11 +63,11 @@ impl Embedding {
         let e_snap = e_dim;
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: out.into_dyn(),
+            data: out.into_dyn().into_shared(),
             grad: None,
             parents: vec![indices.clone(), self.weight.clone()],
             backward_op: Some(Box::new(move |grad| {
-                let binding = indices_clone.data();
+                let binding = indices_clone.data_ref();
                 let idx_flat = binding.view().into_shape(num_elements).unwrap();
                 let grad_2d = grad.view().into_shape((num_elements, e_snap)).unwrap();
 

@@ -99,18 +99,18 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let result = res_2d.into_shape(out_shape).unwrap().into_dyn();
 
     if !build_graph {
-        return Tensor::from_data_no_grad(result);
+        return Tensor::from_array_no_grad(result);
     }
 
     let a_clone = a.clone();
     let b_clone = b.clone();
 
     Tensor(Rc::new(RefCell::new(TensorData {
-        data: result,
+        data: result.into_shared(),
         grad: None,
         parents: vec![a_clone.clone(), b_clone.clone()],
         requires_grad: true,
-        backward_op: Some(Box::new(move |grad: &ndarray::ArrayD<f32>| {
+        backward_op: Some(Box::new(move |grad: &ndarray::ArrayViewD<f32>| {
             // grad: [..., N] -> [M,N]
             let g_len = grad.len();
             let g_m = g_len / n_dim;
@@ -191,17 +191,17 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     let output_dyn = output.into_dyn();
 
     if !build_graph {
-        return Tensor::from_data_no_grad(output_dyn);
+        return Tensor::from_array_no_grad(output_dyn);
     }
 
     let lhs_clone = lhs.clone();
     let rhs_clone = rhs.clone();
 
     Tensor(Rc::new(RefCell::new(TensorData {
-        data: output_dyn,
+        data: output_dyn.into_shared(),
         grad: None,
         parents: vec![lhs_clone.clone(), rhs_clone.clone()],
-        backward_op: Some(Box::new(move |grad: &ndarray::ArrayD<f32>| {
+        backward_op: Some(Box::new(move |grad: &ndarray::ArrayViewD<f32>| {
             let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
             let l_data = lhs_clone.0.borrow().data.clone();
             let r_data = rhs_clone.0.borrow().data.clone();

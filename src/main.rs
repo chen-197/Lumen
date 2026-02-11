@@ -2,14 +2,14 @@ use ndarray::{Array, Array1};
 use ndarray_rand::RandomExt;
 use rand_distr::Uniform;
 
-use Lumen::autograd::{Tensor, no_grad};
-use Lumen::loader::ModelLoader;
-use Lumen::models::{LlamaConfig, LlamaModel}; // 确保 models 模块暴露了这些
-use Lumen::tokenizer::LlamaTokenizer;
-use Lumen::kv_cache::LlamaKVCache; // 新增：引入 KV Cache
+use lumen::autograd::{Tensor, no_grad};
+use lumen::kv_cache::LlamaKVCache;
+use lumen::loader::ModelLoader;
+use lumen::models::{LlamaConfig, LlamaModel}; // 确保 models 模块暴露了这些
+use lumen::tokenizer::LlamaTokenizer; // 新增：引入 KV Cache
 
-use std::io::{self, Write};
 use mimalloc::MiMalloc;
+use std::io::{self, Write};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -81,12 +81,16 @@ fn sample_top_p(
     // 3) Softmax
     let mut maxv = f32::NEG_INFINITY;
     for &v in &adjusted {
-        if v > maxv { maxv = v; }
+        if v > maxv {
+            maxv = v;
+        }
     }
     let mut probs: Vec<f32> = adjusted.iter().map(|x| (x - maxv).exp()).collect();
     let sum: f32 = probs.iter().sum();
     let inv = 1.0 / (sum + 1e-9);
-    for p in probs.iter_mut() { *p *= inv; }
+    for p in probs.iter_mut() {
+        *p *= inv;
+    }
 
     // 4) Top-P
     let mut idxs: Vec<usize> = (0..probs.len()).collect();
@@ -97,7 +101,9 @@ fn sample_top_p(
     for (rank, &i) in idxs.iter().enumerate() {
         cumulative += probs[i];
         cut = rank + 1;
-        if cumulative >= top_p { break; }
+        if cumulative >= top_p {
+            break;
+        }
     }
     idxs.truncate(cut.max(1));
 
@@ -106,7 +112,9 @@ fn sample_top_p(
     let mut acc = 0.0f32;
     for &i in &idxs {
         acc += probs[i] / cumulative;
-        if r <= acc { return i; }
+        if r <= acc {
+            return i;
+        }
     }
     *idxs.last().unwrap()
 }
@@ -137,7 +145,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📦 Loading weights from: {}", weight_path);
         ModelLoader::load_llama_weights(weight_path, &model.named_parameters())?;
     } else {
-        println!("⚠️ Weights not found at {}, output will be random noise.", weight_path);
+        println!(
+            "⚠️ Weights not found at {}, output will be random noise.",
+            weight_path
+        );
     }
 
     println!("\n✨ System Ready. Type 'exit' to quit.");
@@ -185,20 +196,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let max_gen = 200;
             let mut prev_gen_text = String::new();
-            
+
             // 采样参数
             let temperature = 0.8;
             let top_p = 0.9;
             let repetition_penalty = 1.05;
             let recent_window = 64usize;
-            
+
             // 位置指针 pos
-            let mut pos = 0; 
+            let mut pos = 0;
 
             for _ in 0..max_gen {
                 // 3. Prefill vs Decoding 逻辑分离
                 let input_ids: Vec<usize>;
-                
+
                 if pos == 0 {
                     // Prefill: 一次性喂入整个 Prompt
                     input_ids = tokens.clone();
@@ -207,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     input_ids = vec![*tokens.last().unwrap()];
                 }
 
-                let input_tensor = Tensor::from_data_no_grad(
+                let input_tensor = Tensor::from_array_no_grad(
                     Array::from_shape_vec(
                         (1, input_ids.len()),
                         input_ids.iter().map(|&x| x as f32).collect(),
@@ -227,20 +238,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 取最后一步的 logits
                 let logits_ref = logits.data_ref();
                 let last_step_logits = logits_ref.slice(ndarray::s![0, -1, ..]);
-                
+
                 // Copy to vec for sampling
                 let logits_vec: Vec<f32> = last_step_logits.iter().cloned().collect();
 
                 let start = tokens.len().saturating_sub(recent_window);
                 let recent = &tokens[start..];
 
-                let next_token = sample_top_p(
-                    &logits_vec, 
-                    temperature, 
-                    top_p, 
-                    repetition_penalty, 
-                    recent
-                );
+                let next_token =
+                    sample_top_p(&logits_vec, temperature, top_p, repetition_penalty, recent);
 
                 // Stop check
                 if stop_ids.contains(&next_token) {

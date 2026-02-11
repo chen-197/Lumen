@@ -1,5 +1,6 @@
 // src/autograd.rs
 use ndarray::prelude::*;
+pub use ndarray::{ArcArray, IxDyn};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -50,10 +51,12 @@ pub fn no_grad<R>(f: impl FnOnce() -> R) -> R {
 }
 
 pub struct TensorData {
-    pub data: ArrayD<f32>,
-    pub grad: Option<ArrayD<f32>>,
+    pub data: ArcArray<f32, IxDyn>,
+    /// 梯度：使用 ArcArray 便于 optimizer 侧 clone 为零拷贝（仅增 refcount）
+    pub grad: Option<ArcArray<f32, IxDyn>>,
     pub parents: Vec<Tensor>,
-    pub backward_op: Option<Box<dyn Fn(&ArrayD<f32>)>>,
+    /// backward_op 接收 grad 的 view，避免在反传遍历时额外 to_owned
+    pub backward_op: Option<Box<dyn Fn(&ArrayViewD<f32>)>>,
     pub requires_grad: bool,
 }
 
@@ -67,7 +70,7 @@ impl Tensor {
     pub fn new(data: ArrayD<f32>) -> Self {
         let req = !is_no_grad();
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: Vec::new(),
             backward_op: None,
@@ -76,34 +79,49 @@ impl Tensor {
     }
 
     /// 获取数据的只读引用（零拷贝）
-    pub fn data_ref(&self) -> Ref<'_, ArrayD<f32>> {
+    pub fn data_ref(&self) -> Ref<'_, ArcArray<f32, IxDyn>> {
         let borrow = self.0.borrow();
         Ref::map(borrow, |t| &t.data)
     }
 
     /// 获取梯度的只读引用（零拷贝）
-    pub fn grad_ref(&self) -> Ref<'_, Option<ArrayD<f32>>> {
+    pub fn grad_ref(&self) -> Ref<'_, Option<ArcArray<f32, IxDyn>>> {
         let borrow = self.0.borrow();
         Ref::map(borrow, |t| &t.grad)
     }
 
     /// 获取数据的可变引用
-    pub fn data_mut(&self) -> RefMut<'_, ArrayD<f32>> {
+    pub fn data_mut(&self) -> RefMut<'_, ArcArray<f32, IxDyn>> {
         let borrow = self.0.borrow_mut();
         RefMut::map(borrow, |t| &mut t.data)
     }
 
     /// 获取梯度的可变引用
-    pub fn grad_mut(&self) -> RefMut<'_, Option<ArrayD<f32>>> {
+    pub fn grad_mut(&self) -> RefMut<'_, Option<ArcArray<f32, IxDyn>>> {
         let borrow = self.0.borrow_mut();
         RefMut::map(borrow, |t| &mut t.grad)
     }
 
     pub fn data(&self) -> ArrayD<f32> {
+        self.0.borrow().data.to_owned()
+    }
+
+    /// 快路径：返回共享数据（clone 仅增加引用计数，不复制）
+    pub fn data_arc(&self) -> ArcArray<f32, IxDyn> {
         self.0.borrow().data.clone()
     }
 
+    /// 慢路径：返回 owned 的 grad（会拷贝）
     pub fn grad(&self) -> Option<ArrayD<f32>> {
+        self.0
+            .borrow()
+            .grad
+            .as_ref()
+            .map(|g| g.to_owned())
+    }
+
+    /// 快路径：返回共享 grad（clone 仅增 refcount，不复制）
+    pub fn grad_arc(&self) -> Option<ArcArray<f32, IxDyn>> {
         self.0.borrow().grad.clone()
     }
 
@@ -114,7 +132,7 @@ impl Tensor {
     /// 创建叶子张量（显式指定 requires_grad）
     pub fn from_data_with_grad_flag(data: ArrayD<f32>, requires_grad: bool) -> Tensor {
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![],
             backward_op: None,
@@ -129,8 +147,19 @@ impl Tensor {
     }
 
     /// 推理/常量：不需要梯度
-    pub fn from_data_no_grad(data: ArrayD<f32>) -> Tensor {
-        Tensor::from_data_with_grad_flag(data, false)
+    pub fn from_data_no_grad(data: ArcArray<f32, IxDyn>) -> Tensor {
+        Tensor(Rc::new(RefCell::new(TensorData {
+            data,
+            grad: None,
+            parents: vec![],
+            backward_op: None,
+            requires_grad: false,
+        })))
+    }
+
+    /// 兼容旧接口：传入 ArrayD 作为常量
+    pub fn from_array_no_grad(data: ArrayD<f32>) -> Tensor {
+        Tensor::from_data_no_grad(data.into_shared())
     }
 
     /// 训练参数：需要梯度（叶子）
@@ -174,9 +203,11 @@ impl Tensor {
         }
 
         if let Some(existing) = &inner.grad {
-            inner.grad = Some(existing + &grad);
+            // existing 为共享 ArcArray；累加时会产生一个 owned ArrayD，然后再转回 shared。
+            let summed = existing.to_owned() + &grad;
+            inner.grad = Some(summed.into_shared());
         } else {
-            inner.grad = Some(grad);
+            inner.grad = Some(grad.into_shared());
         }
     }
 
@@ -203,13 +234,15 @@ impl Tensor {
 
         build_topo(self, &mut topo, &mut visited);
 
-        self.add_grad(ArrayD::ones(self.data().shape()));
+        let shape = self.data_ref().shape().to_vec();
+        self.add_grad(ArrayD::ones(shape));
 
         for node in topo.iter().rev() {
             let inner = node.0.borrow();
             if let Some(grad) = &inner.grad {
                 if let Some(op) = &inner.backward_op {
-                    op(grad);
+                    let gv = grad.view();
+                    op(&gv.into_dyn());
                 }
             }
         }
@@ -225,12 +258,12 @@ impl Tensor {
 
     pub fn set_raw_data(&self, shape: Vec<usize>, raw_data: Vec<f32>) {
         let new_data = Array::from_shape_vec(shape, raw_data).unwrap().into_dyn();
-        self.0.borrow_mut().data = new_data;
+        self.0.borrow_mut().data = new_data.into_shared();
     }
 
     /// detach：返回一个新 Tensor（数据拷贝），requires_grad=false，且无 parents/backward_op
     pub fn detach(&self) -> Tensor {
-        let d = self.0.borrow().data.clone();
+        let d = self.0.borrow().data.to_owned();
         Tensor::from_data_with_grad_flag(d, false)
     }
 }

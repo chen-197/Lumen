@@ -21,15 +21,15 @@ impl Module for ReLU {
 
         let input_clone = input.clone();
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
                 let input_d = input_clone.data_ref();
-                let mut grad_input = grad.clone();
+                let mut grad_input = grad.to_owned().into_dyn();
 
                 // Backward: 原地修改梯度
-                Zip::from(&mut grad_input)
+                Zip::from(grad_input.view_mut())
                     .and(&*input_d)
                     .par_for_each(|g, &x| {
                         if x <= 0.0 {
@@ -65,13 +65,13 @@ impl Module for Sigmoid {
         let input_clone = input.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
-                let mut grad_input = grad.clone();
+                let mut grad_input = grad.to_owned().into_dyn();
                 // Backward: grad * y * (1 - y)
-                Zip::from(&mut grad_input)
+                Zip::from(grad_input.view_mut())
                     .and(&output_data)
                     .par_for_each(|g, &y| {
                         *g = *g * y * (1.0 - y);
@@ -106,13 +106,13 @@ impl Module for Tanh {
         let input_clone = input.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
-                let mut grad_input = grad.clone();
+                let mut grad_input = grad.to_owned().into_dyn();
                 // Backward: grad * (1 - y^2)
-                Zip::from(&mut grad_input)
+                Zip::from(grad_input.view_mut())
                     .and(&output_data)
                     .par_for_each(|g, &y| {
                         *g = *g * (1.0 - y * y);
@@ -148,7 +148,7 @@ impl Module for SiLU {
         let input_clone = input.clone();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data,
+            data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
@@ -159,7 +159,7 @@ impl Module for SiLU {
                     sig + x * sig * (1.0 - sig)
                 });
 
-                input_clone.add_grad(&dx * grad);
+                input_clone.add_grad((&dx * grad).into_dyn());
             })),
             requires_grad: true,
         })))
@@ -225,7 +225,7 @@ impl Module for Softmax {
         let axis_idx = self.axis;
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: y,
+            data: y.into_shared(),
             grad: None,
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad_output| {
@@ -285,7 +285,7 @@ impl Module for Gelu {
 
         let input_clone = input.clone();
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: output,
+            data: output.into_shared(),
             grad: None,
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
@@ -297,7 +297,7 @@ impl Module for Gelu {
                     let sech2 = 1.0 - tanh_i * tanh_i;
                     0.5 * (1.0 + tanh_i) + 0.5 * x * sech2 * C * (1.0 + 3.0 * K * x * x)
                 });
-                input_clone.add_grad(&dx * grad);
+                input_clone.add_grad((&dx * grad).into_dyn());
             })),
             requires_grad: true,
         })))

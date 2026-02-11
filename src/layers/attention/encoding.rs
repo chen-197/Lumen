@@ -1,4 +1,4 @@
-use crate::autograd::{Tensor, TensorData};
+use crate::autograd::{is_no_grad, Tensor, TensorData};
 use ndarray::{Array, ArrayD, Ix2, Zip, s}; // 引入 Ix2
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,8 +21,8 @@ impl RotaryEmbedding {
             dim,
             max_seq_len,
             theta,
-            cos_cache: Tensor::from_data_no_grad(cos),
-            sin_cache: Tensor::from_data_no_grad(sin),
+            cos_cache: Tensor::from_array_no_grad(cos),
+            sin_cache: Tensor::from_array_no_grad(sin),
         }
     }
 
@@ -54,7 +54,7 @@ impl RotaryEmbedding {
     }
 
     pub fn forward(&self, x: &Tensor, offset: usize) -> Tensor {
-        let x_data = x.data();
+        let x_data = x.data_ref();
         let shape = x_data.shape();
         let (b, h, seq_len, d) = (shape[0], shape[1], shape[2], shape[3]);
         assert_eq!(d, self.dim, "RoPE dimension mismatch");
@@ -117,14 +117,19 @@ impl RotaryEmbedding {
                     });
             });
 
+        // 推理/不需要梯度：直接返回常量，不构图
+        if is_no_grad() || !x.requires_grad() {
+            return Tensor::from_data_no_grad(out.into_dyn().into_shared());
+        }
+
         let x_clone = x.clone();
 
-        // 为 Backward 准备数据：需要拥有所有权的 2D 数组 (或者 slice view 的 clone)
+        // 为 Backward 准备数据：需要拥有所有权的 2D 数组
         let cos_backward = cos_slice_2d.to_owned();
         let sin_backward = sin_slice_2d.to_owned();
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: out.into_dyn(),
+            data: out.into_dyn().into_shared(),
             grad: None,
             parents: vec![x.clone()],
             backward_op: Some(Box::new(move |grad| {
