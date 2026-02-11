@@ -5,7 +5,7 @@ use rand_distr::Uniform;
 use lumen::autograd::{Tensor, no_grad};
 use lumen::kv_cache::LlamaKVCache;
 use lumen::loader::ModelLoader;
-use lumen::models::{LlamaConfig, LlamaModel}; // 确保 models 模块暴露了这些
+use lumen::models::{LlamaConfig, LlamaModel}; 
 use lumen::tokenizer::LlamaTokenizer; // 新增：引入 KV Cache
 
 use mimalloc::MiMalloc;

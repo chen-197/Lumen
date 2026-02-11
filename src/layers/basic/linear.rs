@@ -1,6 +1,6 @@
 // src/layers/linear.rs
 use crate::autograd::Tensor;
-use crate::init::{tensor_init, InitType}; // 引入 Init
+use crate::init::{tensor_init, InitType}; 
 use crate::module::Module;
 use crate::ops::matmul::matmul;
 

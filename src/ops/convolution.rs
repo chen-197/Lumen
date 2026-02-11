@@ -1,7 +1,8 @@
 // src/ops/convolution.rs
 use crate::autograd::{Tensor, TensorData};
 use ndarray::linalg::general_mat_mul;
-use ndarray::{s, Array, Array2, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD, ArrayViewMut2, Axis, Data, IxDyn, Zip};
+use ndarray::{s, Array, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD, ArrayViewMut2, Axis, Data, IxDyn, Zip};
+// use ndarray::Array2;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -87,6 +88,7 @@ fn im2col_2d_fast_into(
 
 // Input: [Cin*KH*KW, Hout*Wout] -> Accumulate to: [Cin, H, W]
 // 这是一个累加过程 (+=)，因为多个卷积窗口可能重叠在同一个输入像素上
+/* 我注释这些是因为
 fn col2im_2d_fast(
     col: &Array2<f32>,
     input_shape: (usize, usize, usize), // (Cin, H, W)
@@ -134,7 +136,7 @@ fn col2im_2d_fast(
         }
     }
     img
-}
+}*/
 
 // View 版本：避免为了 col2im 再分配一个 Array2。
 fn col2im_2d_fast_view(

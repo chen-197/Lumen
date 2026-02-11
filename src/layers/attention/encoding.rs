@@ -6,7 +6,7 @@ use std::rc::Rc;
 pub struct RotaryEmbedding {
     dim: usize,
     max_seq_len: usize,
-    theta: f32,
+    // theta: f32,
     // 缓存预计算的 cos/sin
     // Shape: [1, 1, Max_Seq, Dim]
     cos_cache: Tensor,
@@ -20,7 +20,7 @@ impl RotaryEmbedding {
         Self {
             dim,
             max_seq_len,
-            theta,
+            // theta,
             cos_cache: Tensor::from_array_no_grad(cos),
             sin_cache: Tensor::from_array_no_grad(sin),
         }

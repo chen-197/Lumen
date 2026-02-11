@@ -17,7 +17,7 @@ impl LSTM {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let w_x = Linear::new(input_size, 4 * hidden_size);
         let w_h = Linear::new(hidden_size, 4 * hidden_size);
-        // 我们的切分顺序是: [Input, Forget, Cell, Output]
+        // 切分顺序是: [Input, Forget, Cell, Output]
         // 所以 Forget Gate 在索引 [hidden_size .. 2*hidden_size]
 
         if let Some(bias_tensor) = &w_x.bias {

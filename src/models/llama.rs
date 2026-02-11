@@ -5,7 +5,7 @@ use crate::module::Module;
 use crate::ops::matmul::batch_matmul;
 use std::collections::HashMap;
 
-/// Llama 配置参数
+// Llama 配置参数
 #[derive(Clone, Debug)]
 pub struct LlamaConfig {
     pub vocab_size: usize,
@@ -35,8 +35,8 @@ impl Default for LlamaConfig {
     }
 }
 
-/// Llama MLP 层 (SwiGLU)
-/// 公式: down(act(gate(x)) * up(x))
+// Llama MLP 层 (SwiGLU)
+// 公式: down(act(gate(x)) * up(x))
 struct LlamaMLP {
     gate_proj: Linear,
     up_proj: Linear,
@@ -64,7 +64,7 @@ impl LlamaMLP {
     }
 }
 
-/// Llama Attention 层 (集成 Static KV Cache)
+// Llama Attention 层 (集成 Static KV Cache)
 struct LlamaAttention {
     w_q: Linear,
     w_k: Linear,
@@ -93,10 +93,10 @@ impl LlamaAttention {
         }
     }
 
-    /// Forward
-    /// x: [Batch, Seq, Hidden]
-    /// cache: 预分配的 Static Cache
-    /// pos: 当前 x 在序列中的起始位置
+    // Forward
+    // x: [Batch, Seq, Hidden]
+    // cache: 预分配Cache
+    // pos: x在序列中的起始位置
     fn forward(&self, x: Tensor, cache: &mut LlamaKVCache, pos: usize) -> Tensor {
         let (b, seq_len, _) = {
             let d = x.data_ref();
@@ -211,7 +211,6 @@ impl LlamaAttention {
         ]);
 
         // 2. Broadcast/Repeat to [B, H_kv, n_rep, T, D]
-        // 临时方案：使用 ndarray 的 broadcast + to_owned
         let x_arr = x_expanded.data_ref();
         let target_shape = vec![b, h_kv, n_rep, t, d_dim];
 
@@ -252,7 +251,7 @@ impl LlamaAttention {
     }
 }
 
-/// Llama Decoder Block
+// Llama Decoder Block
 struct LlamaDecoderLayer {
     self_attn: LlamaAttention,
     mlp: LlamaMLP,
@@ -313,8 +312,8 @@ impl LlamaModel {
         }
     }
 
-    /// caches: 每一层对应的预分配 Cache
-    /// pos: 当前输入的起始位置 (Generation Step)
+    // caches: 每一层对应的预分配 Cache
+    // pos: 当前输入的起始位置 (Generation Step)
     pub fn forward(&self, input_ids: Tensor, caches: &mut Vec<LlamaKVCache>, pos: usize) -> Tensor {
         // Embedding
         let mut x = self.embed_tokens.forward(&input_ids);
