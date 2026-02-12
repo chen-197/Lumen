@@ -6,7 +6,7 @@ use std::rc::Rc;
 pub struct RotaryEmbedding {
     dim: usize,
     max_seq_len: usize,
-    // theta: f32,
+    theta: f32,
     // 缓存预计算的 cos/sin
     // Shape: [1, 1, Max_Seq, Dim]
     cos_cache: Tensor,
@@ -20,7 +20,7 @@ impl RotaryEmbedding {
         Self {
             dim,
             max_seq_len,
-            // theta,
+            theta,
             cos_cache: Tensor::from_array_no_grad(cos),
             sin_cache: Tensor::from_array_no_grad(sin),
         }
@@ -164,4 +164,68 @@ impl RotaryEmbedding {
             requires_grad: true,
         })))
     }
+
+    /// Apply RoPE for a single token at absolute position `pos`.
+    ///
+    /// Decode (S=1) hot-path helper to avoid allocating intermediate q_rot/k_rot tensors.
+    /// `src` and `dst` must both have length == `self.dim`.
+    #[inline]
+    pub fn rope_1token_copy(&self, src: &[f32], dst: &mut [f32], pos: usize) {
+        assert_eq!(src.len(), self.dim, "RoPE src len mismatch");
+        assert_eq!(dst.len(), self.dim, "RoPE dst len mismatch");
+        if pos >= self.max_seq_len {
+            panic!(
+                "RoPE index out of range: pos {} >= max {}",
+                pos, self.max_seq_len
+            );
+        }
+
+        // Cache layout: [1,1,Max_Seq,Dim]
+        let cos_cache_ref = self.cos_cache.data_ref();
+        let sin_cache_ref = self.sin_cache.data_ref();
+        let cos_view = cos_cache_ref.slice(s![0, 0, pos, ..]);
+        let cos_row = cos_view
+            .as_slice()
+            .expect("RoPE cos row not contiguous");
+        let sin_view = sin_cache_ref.slice(s![0, 0, pos, ..]);
+        let sin_row = sin_view
+            .as_slice()
+            .expect("RoPE sin row not contiguous");
+
+        let half = self.dim / 2;
+        for j in 0..half {
+            let x1 = src[j];
+            let x2 = src[j + half];
+            let c = cos_row[j];
+            let s_val = sin_row[j];
+            dst[j] = x1 * c - x2 * s_val;
+            dst[j + half] = x2 * c + x1 * s_val;
+        }
+    }
+
+    /// Get (cos, sin) row at position `pos` as owned Vecs.
+    /// This is useful to pass into rayon-parallel decode kernels without capturing Tensor/Rc.
+    pub fn cos_sin_row_vec(&self, pos: usize) -> (Vec<f32>, Vec<f32>) {
+        if pos >= self.max_seq_len {
+            panic!(
+                "RoPE index out of range: pos {} >= max {}",
+                pos, self.max_seq_len
+            );
+        }
+        let cos_cache_ref = self.cos_cache.data_ref();
+        let sin_cache_ref = self.sin_cache.data_ref();
+
+        let cos_view = cos_cache_ref.slice(s![0, 0, pos, ..]);
+        let sin_view = sin_cache_ref.slice(s![0, 0, pos, ..]);
+
+        let cos_row = cos_view
+            .as_slice()
+            .expect("RoPE cos row not contiguous");
+        let sin_row = sin_view
+            .as_slice()
+            .expect("RoPE sin row not contiguous");
+
+        (cos_row.to_vec(), sin_row.to_vec())
+    }
+
 }

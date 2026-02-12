@@ -13,12 +13,12 @@ pub trait Module {
     fn forward(&self, input: Tensor) -> Tensor;
     fn parameters(&self) -> Vec<Tensor>;
 
-    // 训练模式：允许构图
+    /// 训练模式：允许构图
     fn train_mode(&mut self) {
         set_inference_mode(false);
     }
 
-    // 推理模式：禁止构图（等价 no_grad）
+    /// 推理模式：禁止构图（等价 no_grad）
     fn eval_mode(&mut self) {
         set_inference_mode(true);
     }

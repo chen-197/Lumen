@@ -26,7 +26,7 @@ impl Drop for NoGradGuard {
     }
 }
 
-// 开/关 全局推理模式（eval_mode/train_mode 可调用它）
+/// 开/关 全局推理模式（eval_mode/train_mode 可调用它）
 pub fn set_inference_mode(on: bool) {
     INFERENCE_MODE.store(on, Ordering::Relaxed);
 }
@@ -36,15 +36,15 @@ pub fn is_inference_mode() -> bool {
     INFERENCE_MODE.load(Ordering::Relaxed)
 }
 
-// no_grad 的判定：
-// - 在 NoGradGuard 作用域内为 true
-// - 或者处于 inference_mode 为 true
+/// no_grad 的判定：
+/// - 在 NoGradGuard 作用域内为 true
+/// - 或者处于 inference_mode 为 true
 #[inline]
 pub fn is_no_grad() -> bool {
     NO_GRAD_DEPTH.load(Ordering::Relaxed) > 0 || is_inference_mode()
 }
 
-// 便利封装：no_grad(|| { ... })
+/// 便利封装：no_grad(|| { ... })
 pub fn no_grad<R>(f: impl FnOnce() -> R) -> R {
     let _g = NoGradGuard::enter();
     f()
@@ -52,10 +52,10 @@ pub fn no_grad<R>(f: impl FnOnce() -> R) -> R {
 
 pub struct TensorData {
     pub data: ArcArray<f32, IxDyn>,
-    // 梯度：使用 ArcArray 便于 optimizer 侧 clone 为零拷贝（仅增 refcount）
+    /// 梯度：使用 ArcArray 便于 optimizer 侧 clone 为零拷贝（仅增 refcount）
     pub grad: Option<ArcArray<f32, IxDyn>>,
     pub parents: Vec<Tensor>,
-    // backward_op 接收 grad 的 view，避免在反传遍历时额外 to_owned
+    /// backward_op 接收 grad 的 view，避免在反传遍历时额外 to_owned
     pub backward_op: Option<Box<dyn Fn(&ArrayViewD<f32>)>>,
     pub requires_grad: bool,
 }
@@ -64,9 +64,9 @@ pub struct TensorData {
 pub struct Tensor(pub(crate) Rc<RefCell<TensorData>>);
 
 impl Tensor {
-    // 默认构造叶子张量：
-    // - 推理模式/no_grad 下：requires_grad=false
-    // - 否则：requires_grad=true（更适合训练时手工造张量）
+    /// 默认构造叶子张量：
+    /// - 推理模式/no_grad 下：requires_grad=false
+    /// - 否则：requires_grad=true（更适合训练时手工造张量）
     pub fn new(data: ArrayD<f32>) -> Self {
         let req = !is_no_grad();
         Tensor(Rc::new(RefCell::new(TensorData {
@@ -78,25 +78,25 @@ impl Tensor {
         })))
     }
 
-    // 获取数据的只读引用（零拷贝）
+    /// 获取数据的只读引用（零拷贝）
     pub fn data_ref(&self) -> Ref<'_, ArcArray<f32, IxDyn>> {
         let borrow = self.0.borrow();
         Ref::map(borrow, |t| &t.data)
     }
 
-    // 获取梯度的只读引用（零拷贝）
+    /// 获取梯度的只读引用（零拷贝）
     pub fn grad_ref(&self) -> Ref<'_, Option<ArcArray<f32, IxDyn>>> {
         let borrow = self.0.borrow();
         Ref::map(borrow, |t| &t.grad)
     }
 
-    // 获取数据的可变引用
+    /// 获取数据的可变引用
     pub fn data_mut(&self) -> RefMut<'_, ArcArray<f32, IxDyn>> {
         let borrow = self.0.borrow_mut();
         RefMut::map(borrow, |t| &mut t.data)
     }
 
-    // 获取梯度的可变引用
+    /// 获取梯度的可变引用
     pub fn grad_mut(&self) -> RefMut<'_, Option<ArcArray<f32, IxDyn>>> {
         let borrow = self.0.borrow_mut();
         RefMut::map(borrow, |t| &mut t.grad)
@@ -106,12 +106,12 @@ impl Tensor {
         self.0.borrow().data.to_owned()
     }
 
-    // 快路径：返回共享数据（clone 仅增加引用计数，不复制）
+    /// 快路径：返回共享数据（clone 仅增加引用计数，不复制）
     pub fn data_arc(&self) -> ArcArray<f32, IxDyn> {
         self.0.borrow().data.clone()
     }
 
-    // 慢路径：返回 owned 的 grad（会拷贝）
+    /// 慢路径：返回 owned 的 grad（会拷贝）
     pub fn grad(&self) -> Option<ArrayD<f32>> {
         self.0
             .borrow()
@@ -120,7 +120,7 @@ impl Tensor {
             .map(|g| g.to_owned())
     }
 
-    // 快路径：返回共享 grad（clone 仅增 refcount，不复制）
+    /// 快路径：返回共享 grad（clone 仅增 refcount，不复制）
     pub fn grad_arc(&self) -> Option<ArcArray<f32, IxDyn>> {
         self.0.borrow().grad.clone()
     }
@@ -129,7 +129,7 @@ impl Tensor {
         crate::ops::arithmetic::sum(self)
     }
 
-    // 创建叶子张量（显式指定 requires_grad）
+    /// 创建叶子张量（显式指定 requires_grad）
     pub fn from_data_with_grad_flag(data: ArrayD<f32>, requires_grad: bool) -> Tensor {
         Tensor(Rc::new(RefCell::new(TensorData {
             data: data.into_shared(),
@@ -140,13 +140,13 @@ impl Tensor {
         })))
     }
 
-    // 创建叶子张量：根据 is_no_grad() 自动决定 requires_grad
+    /// 创建叶子张量：根据 is_no_grad() 自动决定 requires_grad
     pub fn from_data(data: ArrayD<f32>) -> Tensor {
         let req = !is_no_grad();
         Tensor::from_data_with_grad_flag(data, req)
     }
 
-    // 推理/常量：不需要梯度
+    /// 推理/常量：不需要梯度
     pub fn from_data_no_grad(data: ArcArray<f32, IxDyn>) -> Tensor {
         Tensor(Rc::new(RefCell::new(TensorData {
             data,
@@ -157,12 +157,12 @@ impl Tensor {
         })))
     }
 
-    // 兼容旧接口：传入 ArrayD 作为常量
+    /// 兼容旧接口：传入 ArrayD 作为常量
     pub fn from_array_no_grad(data: ArrayD<f32>) -> Tensor {
         Tensor::from_data_no_grad(data.into_shared())
     }
 
-    // 训练参数：需要梯度（叶子）
+    /// 训练参数：需要梯度（叶子）
     pub fn parameter(data: ArrayD<f32>) -> Tensor {
         Tensor::from_data_with_grad_flag(data, true)
     }
@@ -261,14 +261,14 @@ impl Tensor {
         self.0.borrow_mut().data = new_data.into_shared();
     }
 
-    // detach：返回一个新 Tensor（数据拷贝），requires_grad=false，且无 parents/backward_op
+    /// detach：返回一个新 Tensor（数据拷贝），requires_grad=false，且无 parents/backward_op
     pub fn detach(&self) -> Tensor {
         let d = self.0.borrow().data.to_owned();
         Tensor::from_data_with_grad_flag(d, false)
     }
 }
 
-// 切断梯度流（等价于 t.detach()）
+/// 切断梯度流（等价于 t.detach()）
 pub fn detach(t: &Tensor) -> Tensor {
     t.detach()
 }

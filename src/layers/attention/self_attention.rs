@@ -17,6 +17,8 @@ thread_local! {
     static ATT_SCORES_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
     // attention ctx buffer: S * D
     static ATT_CTX_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    // decode(S=1) q RoPE buffer: D
+    static ATT_Q_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
 pub struct KVCacheInner {
@@ -106,8 +108,203 @@ impl SelfAttention {
         let v = self.w_v.forward(x);
 
         // 2) reshape/permute 到 [B, H, S, D] / [B, H_kv, S, D]
-        // eval 路径：彻底绕开 Tensor shape ops（不产生中间 Tensor，也不触发 copy）
+        // eval 路径：尽量绕开 Tensor shape ops（不产生中间 Tensor，也不触发 copy）
         if is_no_grad() {
+            // ------------- decode(S=1) ultra hot-path -------------
+            // Goal:
+            // - Only rotate NEW token's Q/K (with offset=past_len)
+            // - Write rotated K directly into KV cache (no k_rot tensor)
+            // - Fuse RoPE(Q) + online-softmax attention (no scores buffer)
+            // - Output BSHD layout to avoid permute copies
+            let cache_handle: KVCache = match cache {
+                Some(c) => c,
+                None => Rc::new(RefCell::new(KVCacheInner::new(b, h_kv, self.max_seq, d))),
+            };
+
+            let past_len = cache_handle.borrow().len;
+            if s == 1 {
+                // Projected shapes are [B,1,H*D] / [B,1,Hkv*D]. For S=1 we can view them as [B,H,D].
+                let q3 = q
+                    .data_arc()
+                    .into_shape((b, h, d))
+                    .expect("Q reshape [B,H,D] failed");
+                let k3 = k
+                    .data_arc()
+                    .into_shape((b, h_kv, d))
+                    .expect("K reshape [B,H_kv,D] failed");
+                let v3 = v
+                    .data_arc()
+                    .into_shape((b, h_kv, d))
+                    .expect("V reshape [B,H_kv,D] failed");
+
+                // 1) Write NEW token into KV cache. Rotate K on-the-fly into destination.
+                {
+                    let mut c = cache_handle.borrow_mut();
+                    let new_len = past_len + 1;
+                    assert!(
+                        new_len <= self.max_seq,
+                        "KV cache overflow: new_len={} > max_seq={}",
+                        new_len,
+                        self.max_seq
+                    );
+
+                    for bb in 0..b {
+                        for hk in 0..h_kv {
+                            let k_view = k3.slice(ndarray::s![bb, hk, ..]);
+                            let src_k = k_view
+                                .as_slice()
+                                .expect("K src not contiguous");
+                            let v_view = v3.slice(ndarray::s![bb, hk, ..]);
+                            let src_v = v_view
+                                .as_slice()
+                                .expect("V src not contiguous");
+                            // K: RoPE rotate and write directly
+                            {
+                                let mut dst_k = c.k.slice_mut(ndarray::s![bb, hk, past_len, ..]);
+                                let dst_k_sl = dst_k
+                                    .as_slice_mut()
+                                    .expect("K dst not contiguous");
+                                self.rope.rope_1token_copy(src_k, dst_k_sl, past_len);
+                            }
+                            // V: direct memcpy
+                            {
+                                let mut dst_v = c.v.slice_mut(ndarray::s![bb, hk, past_len, ..]);
+                                dst_v
+                                    .as_slice_mut()
+                                    .expect("V dst not contiguous")
+                                    .copy_from_slice(src_v);
+                            }
+                        }
+                    }
+                    c.len = new_len;
+                }
+
+                // 2) Fused attention: RoPE(Q) on-the-fly + online softmax + weighted sum.
+                let total_len = past_len + 1;
+                let out_vec = {
+                    let c = cache_handle.borrow();
+                let k_cache = c.k.slice(ndarray::s![.., .., 0..total_len, ..]); // [B,H_kv,L,D]
+                let v_cache = c.v.slice(ndarray::s![.., .., 0..total_len, ..]); // [B,H_kv,L,D]
+
+                let mut out_vec = vec![0.0f32; b * h * d]; // [B,H,D] for S=1
+
+                // NOTE: rayon parallel closures must not capture `self` because `SelfAttention` contains `Tensor` (Rc<RefCell<_>>) which is !Sync.
+                // Extract only plain data needed for decode kernel.
+                let scale = self.scale;
+                let causal = self.causal;
+                let (cos_row_vec, sin_row_vec) = self.rope.cos_sin_row_vec(past_len);
+                let half_d = d / 2;
+
+                // Parallel over (bb, hh) rows: out_vec is [B*H, D] contiguous
+                out_vec
+                    .par_chunks_mut(d)
+                    .enumerate()
+                    .for_each(|(row, out_row)| {
+                        let bb = row / h;
+                        let hh = row % h;
+                        let hk = hh / n_rep;
+
+                        // Per-thread buffer for rotated Q (length D)
+                        ATT_Q_BUF.with(|qb| {
+                            let mut qb = qb.borrow_mut();
+                            if qb.len() < d {
+                                qb.resize(d, 0.0);
+                            }
+                            let qbuf = &mut qb[..d];
+
+                            // RoPE rotate Q for this head at position past_len (on-the-fly)
+                            let q_view = q3.slice(ndarray::s![bb, hh, ..]);
+                            let q_src = q_view
+                                .as_slice()
+                                .expect("Q src not contiguous");
+                            for j in 0..half_d {
+                                let x1 = q_src[j];
+                                let x2 = q_src[j + half_d];
+                                let c = cos_row_vec[j];
+                                let s_val = sin_row_vec[j];
+                                qbuf[j] = x1 * c - x2 * s_val;
+                                qbuf[j + half_d] = x1 * s_val + x2 * c;
+                            }
+
+                            // One-pass online softmax (log-sum-exp streaming), no scores buffer.
+                            // Avoid per-step slice() overhead by taking contiguous [L,D] blocks.
+                            let k_bd = k_cache
+                                .slice(ndarray::s![bb, hk, 0..total_len, ..])
+                                .into_dimensionality::<ndarray::Ix2>()
+                                .unwrap();
+                            let v_bd = v_cache
+                                .slice(ndarray::s![bb, hk, 0..total_len, ..])
+                                .into_dimensionality::<ndarray::Ix2>()
+                                .unwrap();
+                            let k_sl = k_bd.as_slice().expect("K cache block not contiguous");
+                            let v_sl = v_bd.as_slice().expect("V cache block not contiguous");
+
+                            ATT_CTX_BUF.with(|cb| {
+                                let mut cb = cb.borrow_mut();
+                                if cb.len() < d {
+                                    cb.resize(d, 0.0);
+                                }
+                                let ctx = &mut cb[..d];
+                                for i in 0..d {
+                                    ctx[i] = 0.0;
+                                }
+
+                                let mut m = f32::NEG_INFINITY;
+                                let mut l = 0.0f32;
+
+                                for j in 0..total_len {
+                                    if causal && j > past_len {
+                                        break;
+                                    }
+                                    let k_row = &k_sl[j * d..(j + 1) * d];
+                                    let mut dot = 0.0f32;
+                                    for i in 0..d {
+                                        dot += qbuf[i] * k_row[i];
+                                    }
+                                    let score = dot * scale;
+                                    if score > m {
+                                        let s = (m - score).exp();
+                                        for i in 0..d {
+                                            ctx[i] *= s;
+                                        }
+                                        l *= s;
+                                        m = score;
+                                        let v_row = &v_sl[j * d..(j + 1) * d];
+                                        for i in 0..d {
+                                            ctx[i] += v_row[i];
+                                        }
+                                        l += 1.0;
+                                    } else {
+                                        let w = (score - m).exp();
+                                        let v_row = &v_sl[j * d..(j + 1) * d];
+                                        for i in 0..d {
+                                            ctx[i] += w * v_row[i];
+                                        }
+                                        l += w;
+                                    }
+                                }
+
+                                let inv = 1.0f32 / (l + 1e-9);
+                                for i in 0..d {
+                                    out_row[i] = ctx[i] * inv;
+                                }
+                            });
+                        });
+                    });
+
+
+                    out_vec
+                };
+
+                // 3) Output projection: [B,1,H,D] -> [B,1,H*D] (view reshape) -> w_o
+                let out_bshd = Array4::from_shape_vec((b, 1, h, d), out_vec).expect("out shape");
+                let context = Tensor::from_data_no_grad(out_bshd.into_dyn().into_shared());
+                let context = reshape(&context, vec![b as i32, 1, (h * d) as i32]);
+                let output = self.w_o.forward(context);
+
+                return (output, Some(cache_handle));
+            }
+
             let q = Tensor::from_data_no_grad(
                 q.data_arc()
                     .into_shape((b, s, h, d))
@@ -131,13 +328,9 @@ impl SelfAttention {
             );
 
             // 3) 初始化/取出 cache（预分配）
-            let cache_handle: KVCache = match cache {
-                Some(c) => c,
-                None => Rc::new(RefCell::new(KVCacheInner::new(b, h_kv, self.max_seq, d))),
-            };
+            // (cache_handle 已在上面创建)
 
-            // 4) RoPE：offset = past_len
-            let past_len = cache_handle.borrow().len;
+            // 4) RoPE：offset = past_len（S>1 prefill 路径保持原实现）
             let q_rot = self.rope.forward(&q, past_len);
             let k_rot = self.rope.forward(&k, past_len);
 

@@ -69,7 +69,7 @@ impl CrossEntropyLoss {
             let targets_2d = targets_ref.view().into_shape((batch_size, dim)).unwrap();
 
             // 2. Prepare Output container
-            // 分配内存存 Softmax 结果供 Backward 使用
+            // 必须分配内存存 Softmax 结果供 Backward 使用
             let mut softmax_out_flat = Array2::<f32>::zeros((batch_size, dim));
             
             // 3. Parallel Compute: Softmax + CrossEntropy Sum
