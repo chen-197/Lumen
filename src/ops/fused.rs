@@ -3,17 +3,17 @@ use ndarray::{Array, Axis, Zip};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Fused Scale + Causal Mask + Softmax
-///
-/// Args:
-///     input: [Batch, Head, Q_Len, K_Len]
-///     scale: float, attention scale factor (1/sqrt(d))
-///     is_causal: bool, whether to apply causal mask
-///
-/// Logic:
-///     1. Scores = Input * Scale
-///     2. Masked_Scores = Scores + Mask (if causal)
-///     3. Probs = Softmax(Masked_Scores)
+// Fused Scale + Causal Mask + Softmax
+//
+// Args:
+//     input: [Batch, Head, Q_Len, K_Len]
+//     scale: float, attention scale factor (1/sqrt(d))
+//     is_causal: bool, whether to apply causal mask
+//
+// Logic:
+//     1. Scores = Input * Scale
+//     2. Masked_Scores = Scores + Mask (if causal)
+//     3. Probs = Softmax(Masked_Scores)
 pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
     let (output, output_data) = {
         let x = input.data_ref();

@@ -1,5 +1,5 @@
 use crate::autograd::{is_no_grad, Tensor, TensorData};
-use ndarray::{Array, ArrayD, Ix2, Zip, s}; // 引入 Ix2
+use ndarray::{Array, ArrayD, Ix2, Zip, s}; 
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -165,10 +165,10 @@ impl RotaryEmbedding {
         })))
     }
 
-    /// Apply RoPE for a single token at absolute position `pos`.
-    ///
-    /// Decode (S=1) hot-path helper to avoid allocating intermediate q_rot/k_rot tensors.
-    /// `src` and `dst` must both have length == `self.dim`.
+    // Apply RoPE for a single token at absolute position `pos`.
+    //
+    // Decode (S=1) hot-path helper to avoid allocating intermediate q_rot/k_rot tensors.
+    // `src` and `dst` must both have length == `self.dim`.
     #[inline]
     pub fn rope_1token_copy(&self, src: &[f32], dst: &mut [f32], pos: usize) {
         assert_eq!(src.len(), self.dim, "RoPE src len mismatch");
@@ -203,8 +203,8 @@ impl RotaryEmbedding {
         }
     }
 
-    /// Get (cos, sin) row at position `pos` as owned Vecs.
-    /// This is useful to pass into rayon-parallel decode kernels without capturing Tensor/Rc.
+    // Get (cos, sin) row at position `pos` as owned Vecs.
+    // This is useful to pass into rayon-parallel decode kernels without capturing Tensor/Rc.
     pub fn cos_sin_row_vec(&self, pos: usize) -> (Vec<f32>, Vec<f32>) {
         if pos >= self.max_seq_len {
             panic!(

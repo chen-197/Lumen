@@ -1,6 +1,6 @@
 use crate::autograd::{Tensor, TensorData};
 use crate::module::Module;
-use ndarray::{Array2, Zip};
+use ndarray::{Array2, ArrayD, Zip};
 use std::cell::RefCell;
 use std::rc::Rc;
 

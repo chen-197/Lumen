@@ -92,7 +92,7 @@ impl SelfAttention {
         }
     }
 
-    /// forward：eval 用预分配 cache；train 走原逻辑（cat + repeat_kv）
+    // forward：eval 用预分配 cache；train 走原逻辑（cat + repeat_kv）
     pub fn forward(&self, x: Tensor, cache: Option<KVCache>) -> (Tensor, Option<KVCache>) {
         let x_shape = x.data_ref().shape().to_vec();
         let (b, s, _) = (x_shape[0], x_shape[1], x_shape[2]);

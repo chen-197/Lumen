@@ -3,7 +3,7 @@ use crate::autograd::{Tensor, TensorData};
 use std::ops::{Add, Sub, Mul};
 use std::rc::Rc;
 use std::cell::RefCell;
-use ndarray::{ArrayD, ArrayViewD, Zip};
+use ndarray::{ArrayD, ArrayViewD, Axis, Zip};
 
 fn reduce_gradient(grad: ArrayViewD<'_, f32>, target_shape: &[usize]) -> ArrayD<f32> {
     if grad.shape() == target_shape {

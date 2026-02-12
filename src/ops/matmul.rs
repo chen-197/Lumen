@@ -5,8 +5,8 @@ use rayon::prelude::*; // 用于并行优化
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// A[..., K] @ B^T, where B is [N(out), K(in)]
-/// output: [..., N]
+// A[..., K] @ B^T, where B is [N(out), K(in)]
+// output: [..., N]
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let build_graph = !is_no_grad() && (a.requires_grad() || b.requires_grad());
 
@@ -154,9 +154,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     })))
 }
 
-/// lhs: [B, H, M, K]
-/// rhs: [B, H, K, N]
-/// out: [B, H, M, N]
+// lhs: [B, H, M, K]
+// rhs: [B, H, K, N]
+// out: [B, H, M, N]
 pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     let build_graph = !is_no_grad() && (lhs.requires_grad() || rhs.requires_grad());
 
