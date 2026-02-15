@@ -1,9 +1,10 @@
 use crate::autograd::Tensor;
-use crate::kv_cache::LlamaKVCache;
-use crate::layers::{Embedding, Linear, RMSNorm, RotaryEmbedding, SiLU};
+use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};
+use crate::layers::attention::self_attention::KVCacheInner;
 use crate::module::Module;
-use crate::ops::matmul::batch_matmul;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 // Llama 配置参数
 #[derive(Clone, Debug)]
@@ -64,197 +65,19 @@ impl LlamaMLP {
     }
 }
 
-// Llama Attention 层 (集成 Static KV Cache)
-struct LlamaAttention {
-    w_q: Linear,
-    w_k: Linear,
-    w_v: Linear,
-    w_o: Linear,
-    rope: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    hidden_size: usize,
-}
-
-impl LlamaAttention {
-    fn new(config: &LlamaConfig) -> Self {
-        let head_dim = config.hidden_size / config.num_attention_heads;
-        Self {
-            w_q: Linear::new_no_bias(config.hidden_size, config.num_attention_heads * head_dim),
-            w_k: Linear::new_no_bias(config.hidden_size, config.num_key_value_heads * head_dim),
-            w_v: Linear::new_no_bias(config.hidden_size, config.num_key_value_heads * head_dim),
-            w_o: Linear::new_no_bias(config.num_attention_heads * head_dim, config.hidden_size),
-            rope: RotaryEmbedding::new(head_dim, config.max_seq_len, config.rope_theta),
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim,
-            hidden_size: config.hidden_size,
-        }
-    }
-
-    // Forward
-    // x: [Batch, Seq, Hidden]
-    // cache: 预分配的 Static Cache
-    // pos: 当前 x 在序列中的起始位置
-    fn forward(&self, x: Tensor, cache: &mut LlamaKVCache, pos: usize) -> Tensor {
-        let (b, seq_len, _) = {
-            let d = x.data_ref();
-            (d.shape()[0], d.shape()[1], d.shape()[2])
-        };
-
-        //QKV Proj
-        let q = self.w_q.forward(x.clone());
-        let k = self.w_k.forward(x.clone());
-        let v = self.w_v.forward(x);
-
-        // Reshape Heads
-        // [B, Seq, H * D] -> [B, H, Seq, D]
-        let q = self.reshape_heads(q, self.num_heads);
-        let k = self.reshape_heads(k, self.num_kv_heads);
-        let v = self.reshape_heads(v, self.num_kv_heads);
-
-        // RoPE
-        let q_rot = self.rope.forward(&q, pos);
-        let k_rot = self.rope.forward(&k, pos);
-
-        // KV Cache Update
-        cache.update(&k_rot, &v, pos);
-
-        // Retrieve KV (获取完整的 context)
-        let total_len = pos + seq_len;
-        let (k_all, v_all) = cache.get_view(total_len);
-
-        // GQA Handling (Grouped Query Attention)
-        // 如果 KV heads 少于 Q heads，需要重复 KV
-        // [B, H_kv, T, D] -> [B, H_q, T, D]
-        let k_all = self.repeat_kv(k_all);
-        let v_all = self.repeat_kv(v_all);
-
-        // Attention Scores: Q @ K^T
-        // Q: [B, H, Seq, D]
-        // K: [B, H, Total, D] -> K^T: [B, H, D, Total]
-        // Scores: [B, H, Seq, Total]
-        let mut scores = batch_matmul(&q_rot, &k_all.transpose(2, 3));
-
-        // Scale
-        let scale = (self.head_dim as f32).sqrt().recip();
-        scores = scores * Tensor::from_array_no_grad(ndarray::arr0(scale).into_dyn());
-
-        // Causal Masking
-        // 只有在 prefill (seq_len > 1) 时才需要 mask
-        // 在 decoding (seq_len == 1) 时，Q 只有一个 token，自然关注所有之前的 token
-        if seq_len > 1 {
-            // 创建一个下三角 Mask
-            let mask = self.create_causal_mask(seq_len, total_len, pos);
-            scores = scores + mask;
-        }
-
-        // Softmax
-        // 对最后一个维度 (Total_Len) 做 Softmax
-        let probs = crate::layers::activation::Softmax::new(3).forward(scores);
-
-        // Output: Probs @ V
-        // [B, H, Seq, Total] @ [B, H, Total, D] -> [B, H, Seq, D]
-        let output = batch_matmul(&probs, &v_all);
-
-        // Reshape back
-        // [B, H, Seq, D] -> [B, Seq, H, D] -> [B, Seq, Hidden]
-        let output = output.permute(vec![0, 2, 1, 3]).reshape(vec![
-            b.try_into().unwrap(),
-            seq_len.try_into().unwrap(),
-            self.hidden_size.try_into().unwrap(),
-        ]);
-
-        // Out Proj
-        self.w_o.forward(output)
-    }
-
-    fn reshape_heads(&self, x: Tensor, n_heads: usize) -> Tensor {
-        let d = x.data_ref();
-        let shape = d.shape();
-        let b = shape[0];
-        let seq = shape[1];
-        let dim = self.head_dim;
-
-        // [B, Seq, H * D] -> [B, Seq, H, D] -> [B, H, Seq, D]
-        x.reshape(vec![
-            b.try_into().unwrap(),
-            seq.try_into().unwrap(),
-            n_heads.try_into().unwrap(),
-            dim.try_into().unwrap(),
-        ])
-        .permute(vec![0, 2, 1, 3])
-    }
-
-    fn repeat_kv(&self, x: Tensor) -> Tensor {
-        let n_rep = self.num_heads / self.num_kv_heads;
-        if n_rep == 1 {
-            return x;
-        }
-
-        // GQA 展开逻辑
-        // x: [B, H_kv, T, D]
-        // Need: [B, H_q, T, D] where H_q = H_kv * n_rep
-
-        let d = x.data_ref();
-        let shape = d.shape();
-        let (b, h_kv, t, d_dim) = (shape[0], shape[1], shape[2], shape[3]);
-
-        // 1. [B, H_kv, 1, T, D]
-        let x_expanded = x.reshape(vec![
-            b.try_into().unwrap(),
-            h_kv.try_into().unwrap(),
-            1,
-            t.try_into().unwrap(),
-            d_dim.try_into().unwrap(),
-        ]);
-
-        // 2. Broadcast/Repeat to [B, H_kv, n_rep, T, D]
-        // 临时方案：使用 ndarray 的 broadcast + to_owned
-        let x_arr = x_expanded.data_ref();
-        let target_shape = vec![b, h_kv, n_rep, t, d_dim];
-
-        let broadcasted = x_arr
-            .broadcast(target_shape)
-            .expect("Broadcast failed")
-            .to_owned();
-
-        // 3. Reshape to [B, H_q, T, D]
-        let res = broadcasted
-            .into_shape((b, h_kv * n_rep, t, d_dim))
-            .unwrap()
-            .into_dyn();
-
-        Tensor::from_array_no_grad(res)
-    }
-
-    fn create_causal_mask(&self, seq_len: usize, total_len: usize, pos: usize) -> Tensor {
-        // Mask shape: [1, 1, Seq, Total]
-        // 创建全 0 矩阵
-        // 将非法位置填为 -inf
-        let mut mask = ndarray::Array4::<f32>::zeros((1, 1, seq_len, total_len));
-        let min_val = f32::NEG_INFINITY;
-
-        for i in 0..seq_len {
-            // row (query idx)
-            for j in 0..total_len {
-                // col (key idx)
-                // 绝对位置比较
-                let q_pos = pos + i;
-                let k_pos = j;
-                if k_pos > q_pos {
-                    mask[[0, 0, i, j]] = min_val;
-                }
-            }
-        }
-        Tensor::from_array_no_grad(mask.into_dyn())
-    }
-}
+// NOTE:
+// llama.rs 之前自带了一套 LlamaAttention（repeat_kv + 显式 score/prob Tensor + KVCache::get_view 分配）。
+// 这里直接复用 self_attention.rs 的实现：
+// - eval/no_grad: 支持 KV cache 预分配、decode(S=1) online-softmax 热路径、GQA 不 repeat_kv。
+// - train: 走可导的标准路径（fused_softmax + batch_matmul）。
+//
+// 因此：
+// - LlamaDecoderLayer::self_attn 改为 SelfAttention
+// - Cache 类型改为 layers::KVCache（Rc<RefCell<KVCacheInner>>）
 
 // Llama Decoder Block
 struct LlamaDecoderLayer {
-    self_attn: LlamaAttention,
+    self_attn: SelfAttention,
     mlp: LlamaMLP,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
@@ -263,21 +86,40 @@ struct LlamaDecoderLayer {
 impl LlamaDecoderLayer {
     fn new(config: &LlamaConfig) -> Self {
         Self {
-            self_attn: LlamaAttention::new(config),
+            self_attn: SelfAttention::new(
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.max_seq_len,
+                config.rope_theta,
+                true, // causal
+            ),
             mlp: LlamaMLP::new(config),
             input_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps),
             post_attention_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps),
         }
     }
 
-    fn forward(&self, x: Tensor, cache: &mut LlamaKVCache, pos: usize) -> Tensor {
+    // 推理路径：传入 cache（Rc<RefCell<_>>），用于增量 decode。
+    fn forward_infer(&self, x: Tensor, cache: KVCache) -> (Tensor, KVCache) {
         // Pre-Norm Architecture
         // h = x + Attention(Norm(x))
         let norm_x = self.input_layernorm.forward(x.clone());
-        let attn_out = self.self_attn.forward(norm_x, cache, pos);
+        let (attn_out, cache_out) = self.self_attn.forward(norm_x, Some(cache));
+        let cache_out = cache_out.expect("SelfAttention should return cache in eval/no_grad path");
         let h = x + attn_out;
 
         // out = h + MLP(Norm(h))
+        let norm_h = self.post_attention_layernorm.forward(h.clone());
+        let mlp_out = self.mlp.forward(norm_h);
+        (h + mlp_out, cache_out)
+    }
+
+    // 训练路径：不允许传 cache（SelfAttention 会 panic）。
+    fn forward_train(&self, x: Tensor) -> Tensor {
+        let norm_x = self.input_layernorm.forward(x.clone());
+        let (attn_out, _cache) = self.self_attn.forward(norm_x, None);
+        let h = x + attn_out;
         let norm_h = self.post_attention_layernorm.forward(h.clone());
         let mlp_out = self.mlp.forward(norm_h);
         h + mlp_out
@@ -313,22 +155,63 @@ impl LlamaModel {
         }
     }
 
-    // caches: 每一层对应的预分配 Cache
-    // pos: 当前输入的起始位置 (Generation Step)
-    pub fn forward(&self, input_ids: Tensor, caches: &mut Vec<LlamaKVCache>, pos: usize) -> Tensor {
-        // Embedding
+    /// 为推理/生成初始化每层 KV cache。
+    ///
+    /// SelfAttention 的 cache 内部会维护 `len`，所以推理阶段不再需要显式传 `pos`。
+    pub fn init_kv_caches(&self, batch_size: usize) -> Vec<KVCache> {
+        let head_dim = self.config.hidden_size / self.config.num_attention_heads;
+        let h_kv = self.config.num_key_value_heads;
+        let max_seq = self.config.max_seq_len;
+
+        (0..self.config.num_hidden_layers)
+            .map(|_| Rc::new(RefCell::new(KVCacheInner::new(batch_size, h_kv, max_seq, head_dim))))
+            .collect()
+    }
+
+    /// 重置 cache（在新对话/新样本开始前调用）。
+    pub fn reset_kv_caches(&self, caches: &mut [KVCache]) {
+        for c in caches {
+            c.borrow_mut().reset();
+        }
+    }
+
+    /// 推理/生成（需要 caches）。
+    ///
+    /// `pos` 参数为了兼容旧调用方保留，但会被忽略：长度由 cache 内部维护。
+    pub fn forward(&self, input_ids: Tensor, caches: &mut Vec<KVCache>, _pos: usize) -> Tensor {
+        assert_eq!(
+            caches.len(),
+            self.layers.len(),
+            "KV cache count mismatch: got {}, expected {}",
+            caches.len(),
+            self.layers.len()
+        );
+
+        // Embedding: [B,S] -> [B,S,H]
         let mut x = self.embed_tokens.forward(&input_ids);
 
         // Decoder Layers
         for (i, layer) in self.layers.iter().enumerate() {
-            let layer_cache = &mut caches[i];
-            x = layer.forward(x, layer_cache, pos);
+            let cache_in = caches[i].clone();
+            let (y, cache_out) = layer.forward_infer(x, cache_in);
+            caches[i] = cache_out;
+            x = y;
         }
 
         // Final Norm
         x = self.norm.forward(x);
 
         // LM Head
+        self.lm_head.forward(x)
+    }
+
+    /// 训练（不使用 cache，支持 autograd）。
+    pub fn forward_train(&self, input_ids: Tensor) -> Tensor {
+        let mut x = self.embed_tokens.forward(&input_ids);
+        for layer in self.layers.iter() {
+            x = layer.forward_train(x);
+        }
+        x = self.norm.forward(x);
         self.lm_head.forward(x)
     }
 
@@ -397,10 +280,9 @@ impl LlamaModel {
 }
 
 impl Module for LlamaModel {
-    fn forward(&self, _input: Tensor) -> Tensor {
-        panic!(
-            "LlamaModel requires cache and pos arguments. Use forward_with_cache instead or refactor trait."
-        );
+    fn forward(&self, input: Tensor) -> Tensor {
+        // 训练/全序列前向：不使用 KV cache（可导）。
+        self.forward_train(input)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
