@@ -1,27 +1,40 @@
-use ndarray::{Array, Array1};
-use ndarray_rand::RandomExt;
-use rand_distr::Uniform;
+use mimalloc::MiMalloc;
 
 use lumen::autograd::{no_grad, Tensor};
 use lumen::loader::ModelLoader;
 use lumen::models::{LlamaConfig, LlamaModel};
 use lumen::tokenizer::LlamaTokenizer;
 
+use ndarray::{s, Array, Array1, Ix3};
+use ndarray_rand::RandomExt;
+use rand_distr::Uniform;
+
 use std::io::{self, Write};
-use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// 构建 Prompt（TinyLlama chat template）
-fn build_tinyllama_chat_prompt(system: &str, user: &str) -> String {
+// ------------------------------
+// Prompt template (TinyLlama-style)
+// ------------------------------
+
+fn build_first_turn_prompt(system: &str, user: &str) -> String {
     format!(
         "<|system|>\n{}\n</s>\n<|user|>\n{}\n</s>\n<|assistant|>\n",
         system, user
     )
 }
 
-// 回退到合法 UTF-8 边界（用于流式输出）
+fn build_next_turn_prompt(user: &str) -> String {
+    // Previous assistant reply is expected to end at generation stop.
+    // We explicitly add a </s> separator before the next user turn.
+    format!("</s>\n<|user|>\n{}\n</s>\n<|assistant|>\n", user)
+}
+
+// ------------------------------
+// Streaming-print helpers (UTF-8 safe)
+// ------------------------------
+
 fn lcp_char_boundary(prev: &str, cur: &str) -> usize {
     let pb = prev.as_bytes();
     let cb = cur.as_bytes();
@@ -48,7 +61,11 @@ fn print_new_suffix(prev_printed: &mut String, cur_full: String) {
     *prev_printed = cur_full;
 }
 
-// 采样函数：避免使用 rng.gen（在 Rust 2024 里 gen 是保留字）
+// ------------------------------
+// Sampling
+// ------------------------------
+
+// Avoid rng.gen (Rust 2024 reserved keyword)
 #[inline]
 fn rand01() -> f32 {
     Array1::<f32>::random(1, Uniform::new(0.0f32, 1.0f32))[0]
@@ -97,10 +114,11 @@ fn sample_top_p(
 
     let mut cumulative = 0.0f32;
     let mut cut = 0usize;
+    let target_p = top_p.clamp(0.0, 1.0).max(1e-6);
     for (rank, &i) in idxs.iter().enumerate() {
         cumulative += probs[i];
         cut = rank + 1;
-        if cumulative >= top_p {
+        if cumulative >= target_p {
             break;
         }
     }
@@ -118,8 +136,38 @@ fn sample_top_p(
     *idxs.last().unwrap()
 }
 
+// ------------------------------
+// Tensor helpers
+// ------------------------------
+
+fn tensor_from_token_ids(ids: &[usize]) -> Tensor {
+    Tensor::from_array_no_grad(
+        Array::from_shape_vec(
+            (1, ids.len()),
+            ids.iter().map(|&x| x as f32).collect(),
+        )
+        .unwrap()
+        .into_dyn(),
+    )
+}
+
+// logits: [1, S, V] -> take last step [V]
+fn last_step_logits_vec(logits: &Tensor) -> Vec<f32> {
+    let logits_ref = logits.data_ref();
+    let l3 = logits_ref
+        .view()
+        .into_dimensionality::<Ix3>()
+        .expect("logits must be 3D [B,S,V]");
+    let t = l3.shape()[1] - 1;
+    l3.slice(s![0, t, ..]).iter().copied().collect()
+}
+
+// ------------------------------
+// Main (chat with history memory)
+// ------------------------------
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化配置（TinyLlama-1.1B，需与你的权重一致）
+    // NOTE: Ensure this config matches your weights.
     let config = LlamaConfig {
         vocab_size: 32000,
         hidden_size: 2048,
@@ -148,18 +196,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("⚠️ Weights not found at {}, output will be random noise.", weight_path);
     }
 
-    println!("\n✨ System Ready. Type 'exit' to quit.");
+    println!("\n✨ System Ready. Commands: /reset  /exit");
 
     // Stop tokens
-    let stop_ids: Vec<usize> = [
-        tokenizer.token_to_id("</s>"),
-        tokenizer.token_to_id("<|system|>"),
-        tokenizer.token_to_id("<|user|>"),
-        tokenizer.token_to_id("<|assistant|>"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let mut stop_ids: Vec<usize> = Vec::new();
+    for t in ["</s>", "<|system|>", "<|user|>", "<|assistant|>"] {
+        if let Some(id) = tokenizer.token_to_id(t) {
+            stop_ids.push(id);
+        }
+    }
+    if let Some(id) = tokenizer.eos_id() {
+        stop_ids.push(id);
+    }
+    stop_ids.sort_unstable();
+    stop_ids.dedup();
+
+    // ✅ persistent conversation state (history memory)
+    let system = "You are a helpful AI assistant.";
+    let mut all_tokens: Vec<usize> = Vec::new(); // full history tokens
+    let mut first_turn = true;
+
+    // ✅ new llama.rs API: init caches once; keep them across turns
+    let mut kv_caches = model.init_kv_caches(1);
+    model.reset_kv_caches(&mut kv_caches);
+
+    // Sampling params
+    let temperature = 0.8;
+    let top_p = 0.9;
+    let repetition_penalty = 1.05;
+    let recent_window = 96usize;
+    let max_gen = 200usize;
 
     loop {
         print!("\n👤 User: ");
@@ -169,10 +235,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdin().read_line(&mut input)?;
         let user_msg = input.trim();
 
-        if user_msg == "exit" || user_msg == "quit" {
+        if user_msg.is_empty() {
+            continue;
+        }
+        if user_msg == "/exit" || user_msg == "exit" || user_msg == "quit" {
             break;
         }
-        if user_msg.is_empty() {
+        if user_msg == "/reset" || user_msg == "reset" {
+            all_tokens.clear();
+            model.reset_kv_caches(&mut kv_caches);
+            first_turn = true;
+            println!("🔄 reset done.");
             continue;
         }
 
@@ -180,62 +253,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().flush()?;
 
         no_grad(|| {
-            // 1) 构建 Prompt & Tokenize
-            let system = "You are a helpful AI assistant.";
-            let chat_prompt = build_tinyllama_chat_prompt(system, user_msg);
-            let mut tokens = tokenizer.encode(&chat_prompt, false);
-            let prompt_len = tokens.len();
+            // 1) Build this turn prompt (only the *incremental* chunk)
+            let turn_prompt = if first_turn {
+                build_first_turn_prompt(system, user_msg)
+            } else {
+                build_next_turn_prompt(user_msg)
+            };
 
-            // 2) 初始化 KV Cache（✅ 新 llama.rs API）
-            //   - 不再使用 LlamaKVCache
-            //   - 由 model 统一初始化，并在每轮对话前 reset
-            let mut kv_caches = model.init_kv_caches(1);
-            model.reset_kv_caches(&mut kv_caches);
+            let new_tokens = tokenizer.encode(&turn_prompt, false);
 
-            let max_gen = 200;
-            let mut prev_gen_text = String::new();
+            // context safety: if overflow is near, auto reset
+            let cur_len = kv_caches[0].borrow().len;
+            if cur_len + new_tokens.len() + 8 >= config.max_seq_len {
+                all_tokens.clear();
+                model.reset_kv_caches(&mut kv_caches);
+                first_turn = true;
 
-            // 采样参数
-            let temperature = 0.8;
-            let top_p = 0.9;
-            let repetition_penalty = 1.05;
-            let recent_window = 64usize;
+                // rebuild as first turn after reset
+                let prompt2 = build_first_turn_prompt(system, user_msg);
+                let new_tokens2 = tokenizer.encode(&prompt2, false);
+                all_tokens.extend_from_slice(&new_tokens2);
 
-            // 位置指针 pos（新实现里 pos 被忽略，但保留以兼容旧代码）
-            let mut pos = 0usize;
-
-            for _ in 0..max_gen {
-                // 3) Prefill vs Decoding
-                let input_ids: Vec<usize> = if pos == 0 {
-                    tokens.clone()
-                } else {
-                    vec![*tokens.last().unwrap()]
-                };
-
-                let input_tensor = Tensor::from_array_no_grad(
-                    Array::from_shape_vec(
-                        (1, input_ids.len()),
-                        input_ids.iter().map(|&x| x as f32).collect(),
-                    )
-                    .unwrap()
-                    .into_dyn(),
+                // prefill
+                let logits = model.forward(
+                    tensor_from_token_ids(&new_tokens2),
+                    &mut kv_caches,
+                    0,
                 );
+                let mut logits_vec = last_step_logits_vec(&logits);
 
-                // 4) Forward (传递 &mut caches 和 pos)
-                // logits: [Batch=1, Seq, Vocab]
-                let logits = model.forward(input_tensor, &mut kv_caches, pos);
+                let assistant_start = all_tokens.len();
+                let mut prev_gen_text = String::new();
 
-                // 更新 pos（虽然新实现忽略 pos，但留着无害）
-                pos += input_ids.len();
+                for _ in 0..max_gen {
+                    let start = all_tokens.len().saturating_sub(recent_window);
+                    let recent = &all_tokens[start..];
 
-                // 5) 取最后一步 logits + 采样
-                // 这里保持你原来的写法（不会触发 E0716）
-                let logits_ref = logits.data_ref();
-                let last_step_logits = logits_ref.slice(ndarray::s![0, -1, ..]);
-                let logits_vec: Vec<f32> = last_step_logits.iter().copied().collect();
+                    let next_token = sample_top_p(
+                        &logits_vec,
+                        temperature,
+                        top_p,
+                        repetition_penalty,
+                        recent,
+                    );
 
-                let start = tokens.len().saturating_sub(recent_window);
-                let recent = &tokens[start..];
+                    if stop_ids.contains(&next_token) {
+                        break;
+                    }
+
+                    all_tokens.push(next_token);
+
+                    let gen_tokens = &all_tokens[assistant_start..];
+                    let cur_gen_text = tokenizer.decode(gen_tokens, true);
+
+                    if cur_gen_text.contains("<|user|>")
+                        || cur_gen_text.contains("<|assistant|>")
+                    {
+                        break;
+                    }
+                    print_new_suffix(&mut prev_gen_text, cur_gen_text);
+
+                    let logits2 = model.forward(
+                        tensor_from_token_ids(&[next_token]),
+                        &mut kv_caches,
+                        0,
+                    );
+                    logits_vec = last_step_logits_vec(&logits2);
+                }
+
+                println!();
+                first_turn = false;
+                return;
+            }
+
+            // 2) Append to global history tokens
+            all_tokens.extend_from_slice(&new_tokens);
+            let assistant_start = all_tokens.len();
+
+            // 3) Prefill only incremental tokens into KV cache
+            let logits =
+                model.forward(tensor_from_token_ids(&new_tokens), &mut kv_caches, 0);
+            let mut logits_vec = last_step_logits_vec(&logits);
+
+            // 4) Generate
+            let mut prev_gen_text = String::new();
+            for _ in 0..max_gen {
+                let start = all_tokens.len().saturating_sub(recent_window);
+                let recent = &all_tokens[start..];
 
                 let next_token = sample_top_p(
                     &logits_vec,
@@ -249,19 +353,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
 
-                tokens.push(next_token);
+                all_tokens.push(next_token);
 
-                // 6) 流式输出
-                let gen_tokens = &tokens[prompt_len..];
+                let gen_tokens = &all_tokens[assistant_start..];
                 let cur_gen_text = tokenizer.decode(gen_tokens, true);
 
                 if cur_gen_text.contains("<|user|>") || cur_gen_text.contains("<|assistant|>") {
                     break;
                 }
                 print_new_suffix(&mut prev_gen_text, cur_gen_text);
+
+                // decode step: feed only last token
+                let logits2 = model.forward(
+                    tensor_from_token_ids(&[next_token]),
+                    &mut kv_caches,
+                    0,
+                );
+                logits_vec = last_step_logits_vec(&logits2);
+
+                // Hard stop if we hit max length
+                if kv_caches[0].borrow().len + 2 >= config.max_seq_len {
+                    break;
+                }
             }
 
             println!();
+            first_turn = false;
         });
     }
 
