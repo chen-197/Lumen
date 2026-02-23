@@ -10,7 +10,7 @@
 
 ### 🧠 核心引擎
 
-* **Dynamic Autograd**: 实现了基于 `Rc<RefCell>` 的动态自动微分引擎，支持标量与张量级别的反向传播（Define-by-Run）。
+* **Dynamic Autograd**: 实现了动态自动微分引擎，支持标量与张量级别的反向传播（Define-by-Run）。
 * **PyTorch-like API**: 采用 `Module` trait 设计，层（Layer）与模型（Model）的组合方式与 PyTorch 直觉一致。
 * **Optimizers & Loss**: 内置 SGD、Adam 等优化器及 CrossEntropy、MSE 等损失函数，支持完整的训练闭环。
 
