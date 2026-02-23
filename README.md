@@ -2,7 +2,7 @@
 
 **Lumen** 是一个轻量级、高性能的深度学习训练与推理框架，完全使用 Rust 编写。
 
-它的设计理念对标 PyTorch，提供动态计算图（Dynamic Computational Graph）和模块化的 API 设计。**Lumen** 不仅支持从零构建 CNN、RNN 和 MLP 进行训练，其内置的高性能算子和显存优化策略更使其能够高效运行现代 LLM（如 Llama 架构），在 CPU 上实现优秀的推理速度。
+它的设计理念借鉴 PyTorch，提供动态计算图（Dynamic Computational Graph）和模块化的 API 设计。**Lumen** 不仅支持从零构建 CNN、RNN 和 MLP 进行训练，其内置的高性能算子和显存优化策略更使其能够高效运行现代 LLM（如 Llama 架构），在 CPU 上实现优秀的推理速度。
 
 ---
 
