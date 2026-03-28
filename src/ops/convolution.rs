@@ -292,7 +292,7 @@ pub fn conv2d(
         } else {
             vec![input.clone(), weight.clone()]
         },
-        backward_op: Some(Box::new(move |grad_output| {
+        backward_op: Some(std::rc::Rc::new(move |grad_output| {
             run_backward_conv2d_gemm(
                 grad_output,
                 &input_clone,
@@ -519,7 +519,7 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
         data: output.into_shared(),
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad_output| {
+        backward_op: Some(std::rc::Rc::new(move |grad_output| {
             let grad_view = grad_output
                 .view()
                 .into_dimensionality::<ndarray::Ix4>()

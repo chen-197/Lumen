@@ -1,9 +1,10 @@
 use crate::autograd::{is_no_grad, Tensor};
+use crate::inference::{InferenceWeightStorage, WeightDType};
 use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};
 use crate::layers::attention::self_attention::KVCacheInner;
 use crate::module::Module;
-use crate::ops::fused::fused_gate_up_silu_infer_into;
-use crate::ops::matmul::matvec_argmax_rowmajor_parallel;
+use crate::ops::fused::{fused_gate_up_silu_infer_into, fused_gate_up_silu_infer_tmp_bf16_into, fused_gate_up_silu_infer_tmp_f32_into};
+use crate::ops::matmul::{matvec_argmax_rowmajor_parallel, matvec_argmax_rowmajor_parallel_bf16};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -76,7 +77,7 @@ impl LlamaMLP {
 
     fn forward(&self, x: Tensor) -> Tensor {
         if Self::should_use_fused_gate_up(&x) {
-            let inter_dim = self.down_proj.weight.data_ref().shape()[1];
+            let inter_dim = self.down_proj.in_features;
             return MLP_INTER_BUF.with(|buf| {
                 let mut buf = buf.borrow_mut();
                 if buf.len() < inter_dim {
@@ -84,7 +85,30 @@ impl LlamaMLP {
                 }
                 {
                     let inter = &mut buf[..inter_dim];
-                    fused_gate_up_silu_infer_into(&x, &self.gate_proj.weight, &self.up_proj.weight, inter);
+                    if let (Some(gw), Some(uw)) = (
+                        self.gate_proj.infer_weight.as_ref(),
+                        self.up_proj.infer_weight.as_ref(),
+                    ) {
+                        match (gw, uw) {
+                            (
+                                InferenceWeightStorage::F32 { data: gw, .. },
+                                InferenceWeightStorage::F32 { data: uw, .. },
+                            ) => {
+                                fused_gate_up_silu_infer_tmp_f32_into(&x, gw.as_slice(), uw.as_slice(), self.down_proj.in_features, self.gate_proj.in_features, inter);
+                            }
+                            (
+                                InferenceWeightStorage::BF16 { data: gw, .. },
+                                InferenceWeightStorage::BF16 { data: uw, .. },
+                            ) => {
+                                let gw = unsafe { std::slice::from_raw_parts(gw.as_ptr() as *const half::bf16, gw.len()) };
+                                let uw = unsafe { std::slice::from_raw_parts(uw.as_ptr() as *const half::bf16, uw.len()) };
+                                fused_gate_up_silu_infer_tmp_bf16_into(&x, gw, uw, self.down_proj.in_features, self.gate_proj.in_features, inter);
+                            }
+                            _ => panic!("temporary fused gate/up expects matching weight dtypes"),
+                        }
+                    } else {
+                        fused_gate_up_silu_infer_into(&x, &self.gate_proj.weight, &self.up_proj.weight, inter);
+                    }
                 }
                 self.down_proj.forward_decode_slice_no_bias(&buf[..inter_dim])
             });
@@ -106,6 +130,19 @@ impl LlamaMLP {
             self.down_proj.forward(fused)
         }
     }
+
+    fn prepare_infer_weights_tmp(&mut self, dtype: WeightDType, migrate_primary_weight: bool) {
+        self.gate_proj.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        self.up_proj.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        self.down_proj.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+    }
+
+    fn has_temporary_infer_migration(&self) -> bool {
+        self.gate_proj.has_temporary_infer_migration()
+            || self.up_proj.has_temporary_infer_migration()
+            || self.down_proj.has_temporary_infer_migration()
+    }
+
 }
 
 // NOTE:
@@ -167,6 +204,19 @@ impl LlamaDecoderLayer {
         let mlp_out = self.mlp.forward(norm_h);
         h + mlp_out
     }
+
+    fn prepare_infer_weights_tmp(&mut self, dtype: WeightDType, migrate_primary_weight: bool) {
+        self.self_attn.w_q.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        self.self_attn.w_k.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        self.self_attn.w_v.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        self.self_attn.w_o.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        self.mlp.prepare_infer_weights_tmp(dtype, migrate_primary_weight);
+    }
+
+    fn has_temporary_infer_migration(&self) -> bool {
+        self.self_attn.has_temporary_infer_migration() || self.mlp.has_temporary_infer_migration()
+    }
+
 }
 
 pub struct LlamaModel {
@@ -218,6 +268,22 @@ impl LlamaModel {
         }
     }
 
+    // 临时：推理压缩权重准备接口，后续由全链路 dtype 替代。
+    pub fn prepare_infer_weights_tmp(&mut self, dtype: WeightDType, migrate_primary_weight: bool) {
+        self.embed_tokens.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+        for layer in self.layers.iter_mut() {
+            layer.prepare_infer_weights_tmp(dtype, migrate_primary_weight);
+        }
+        self.lm_head.prepare_infer_weight_tmp(dtype, migrate_primary_weight);
+    }
+
+    pub fn has_temporary_infer_migration(&self) -> bool {
+        self.embed_tokens.has_temporary_infer_migration()
+            || self.layers.iter().any(|layer| layer.has_temporary_infer_migration())
+            || self.lm_head.has_temporary_infer_migration()
+    }
+
+
     fn forward_hidden_infer(&self, input_ids: Tensor, caches: &mut Vec<KVCache>) -> Tensor {
         assert_eq!(
             caches.len(),
@@ -255,6 +321,41 @@ impl LlamaModel {
         assert_eq!(b, 1, "lm_head_argmax currently expects batch size 1");
         assert!(s >= 1, "sequence length must be >= 1");
 
+        let hidden_owned;
+        let hidden_slice: &[f32] = if s == 1 {
+            if let Some(slice) = hidden_ref.as_slice() {
+                assert_eq!(slice.len(), h, "last hidden width mismatch");
+                slice
+            } else {
+                hidden_owned = hidden_ref.iter().copied().collect::<Vec<f32>>();
+                assert_eq!(hidden_owned.len(), h, "last hidden width mismatch");
+                hidden_owned.as_slice()
+            }
+        } else {
+            let hidden3 = hidden_ref
+                .view()
+                .into_dimensionality::<ndarray::Ix3>()
+                .expect("hidden states must be [B,S,H]");
+            let last = hidden3.slice(ndarray::s![0, s - 1, ..]);
+            hidden_owned = last.iter().copied().collect::<Vec<f32>>();
+            assert_eq!(hidden_owned.len(), h, "last hidden width mismatch");
+            hidden_owned.as_slice()
+        };
+
+        if let Some(infer) = self.lm_head.infer_weight.as_ref() {
+            let (vocab, in_features) = infer.rows_cols();
+            assert_eq!(in_features, h, "lm_head in_features mismatch");
+            return match infer {
+                InferenceWeightStorage::F32 { data, .. } => {
+                    matvec_argmax_rowmajor_parallel(hidden_slice, data.as_slice(), vocab, in_features)
+                }
+                InferenceWeightStorage::BF16 { data, .. } => {
+                    let weight = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len()) };
+                    matvec_argmax_rowmajor_parallel_bf16(hidden_slice, weight, vocab, in_features)
+                }
+            };
+        }
+
         let weight_arc = self.lm_head.weight.data_arc();
         let weight2 = weight_arc
             .view()
@@ -266,31 +367,7 @@ impl LlamaModel {
         let weight_slice = weight2
             .as_slice()
             .expect("lm_head weight must be contiguous row-major");
-
-        if s == 1 {
-            if let Some(hidden_slice) = hidden_ref.as_slice() {
-                assert_eq!(hidden_slice.len(), h, "last hidden width mismatch");
-                matvec_argmax_rowmajor_parallel(hidden_slice, weight_slice, weight2.nrows(), in_features)
-            } else {
-                let hidden_owned = hidden_ref.iter().copied().collect::<Vec<f32>>();
-                assert_eq!(hidden_owned.len(), h, "last hidden width mismatch");
-                matvec_argmax_rowmajor_parallel(hidden_owned.as_slice(), weight_slice, weight2.nrows(), in_features)
-            }
-        } else {
-            let hidden3 = hidden_ref
-                .view()
-                .into_dimensionality::<ndarray::Ix3>()
-                .expect("hidden states must be [B,S,H]");
-            let last = hidden3.slice(ndarray::s![0, s - 1, ..]);
-            if let Some(hidden_slice) = last.as_slice() {
-                assert_eq!(hidden_slice.len(), h, "last hidden width mismatch");
-                matvec_argmax_rowmajor_parallel(hidden_slice, weight_slice, weight2.nrows(), in_features)
-            } else {
-                let hidden_owned = last.iter().copied().collect::<Vec<f32>>();
-                assert_eq!(hidden_owned.len(), h, "last hidden width mismatch");
-                matvec_argmax_rowmajor_parallel(hidden_owned.as_slice(), weight_slice, weight2.nrows(), in_features)
-            }
-        }
+        matvec_argmax_rowmajor_parallel(hidden_slice, weight_slice, weight2.nrows(), in_features)
     }
 
     /// 推理/生成（需要 caches）。
@@ -359,6 +436,76 @@ impl LlamaModel {
         };
         {
             self.lm_head.forward(x)
+        }
+    }
+
+    pub fn load_named_bf16_infer_weight_direct(
+        &mut self,
+        name: &str,
+        shape: Vec<usize>,
+        data: Vec<u16>,
+    ) -> Result<(), String> {
+        match name {
+            "model.embed_tokens.weight" => {
+                self.embed_tokens.load_infer_weight_bf16_direct(shape, data);
+                Ok(())
+            }
+            "lm_head.weight" => {
+                self.lm_head.load_infer_weight_bf16_direct(shape, data);
+                Ok(())
+            }
+            _ => {
+                if let Some(rest) = name.strip_prefix("model.layers.") {
+                    let dot = rest.find('.').ok_or_else(|| format!("bad layer name: {name}"))?;
+                    let layer_idx: usize = rest[..dot]
+                        .parse()
+                        .map_err(|_| format!("bad layer idx in {name}"))?;
+                    let suffix = &rest[dot + 1..];
+                    let layer = self
+                        .layers
+                        .get_mut(layer_idx)
+                        .ok_or_else(|| format!("layer idx out of range in {name}"))?;
+
+                    match suffix {
+                        "self_attn.q_proj.weight" => {
+                            layer.self_attn.w_q.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "self_attn.k_proj.weight" => {
+                            layer.self_attn.w_k.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "self_attn.v_proj.weight" => {
+                            layer.self_attn.w_v.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "self_attn.o_proj.weight" => {
+                            layer.self_attn.w_o.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "mlp.gate_proj.weight" => {
+                            layer.mlp.gate_proj.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "mlp.up_proj.weight" => {
+                            layer.mlp.up_proj.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "mlp.down_proj.weight" => {
+                            layer.mlp.down_proj.load_infer_weight_bf16_direct(shape, data);
+                            Ok(())
+                        }
+                        "input_layernorm.weight" | "post_attention_layernorm.weight" => {
+                            Err(format!("norm weight should stay on normal tensor path: {name}"))
+                        }
+                        _ => Err(format!("unknown layer weight name: {name}")),
+                    }
+                } else if name == "model.norm.weight" {
+                    Err(format!("final norm weight should stay on normal tensor path: {name}"))
+                } else {
+                    Err(format!("unknown weight name: {name}"))
+                }
+            }
         }
     }
 
@@ -449,5 +596,9 @@ impl Module for LlamaModel {
         params.push(self.norm.weight.clone());
         params.push(self.lm_head.weight.clone());
         params
+    }
+
+    fn has_temporary_infer_migration(&self) -> bool {
+        LlamaModel::has_temporary_infer_migration(self)
     }
 }

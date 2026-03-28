@@ -1,8 +1,9 @@
 use crate::autograd::{Tensor, is_no_grad};
+use crate::inference::InferenceWeightStorage;
 use crate::layers::Linear;
 use crate::layers::attention::encoding::RotaryEmbedding;
 use crate::module::Module;
-use crate::ops::fused::{fused_qkv_decode_infer_into, fused_softmax};
+use crate::ops::fused::{fused_qkv_decode_infer_into, fused_qkv_decode_infer_tmp_bf16_into, fused_qkv_decode_infer_tmp_f32_into, fused_softmax};
 use crate::ops::matmul::{batch_matmul, dot_unrolled};
 use crate::ops::shape::{permute, reshape};
 
@@ -139,7 +140,40 @@ impl SelfAttention {
                                 let q_out = &mut qpb[..q_proj_dim];
                                 let k_out = &mut kpb[..kv_proj_dim];
                                 let v_out = &mut vpb[..kv_proj_dim];
-                                fused_qkv_decode_infer_into(&x, &self.w_q.weight, &self.w_k.weight, &self.w_v.weight, q_out, k_out, v_out);
+                                if let (Some(qw), Some(kw), Some(vw)) = (
+                                    self.w_q.infer_weight.as_ref(),
+                                    self.w_k.infer_weight.as_ref(),
+                                    self.w_v.infer_weight.as_ref(),
+                                ) {
+                                    let q_dims = qw.rows_cols();
+                                    let k_dims = kw.rows_cols();
+                                    let v_dims = vw.rows_cols();
+                                    match (qw, kw, vw) {
+                                        (
+                                            InferenceWeightStorage::F32 { data: qw, .. },
+                                            InferenceWeightStorage::F32 { data: kw, .. },
+                                            InferenceWeightStorage::F32 { data: vw, .. },
+                                        ) => {
+                                            fused_qkv_decode_infer_tmp_f32_into(&x, qw.as_slice(), kw.as_slice(), vw.as_slice(), q_dims.0, k_dims.0, q_dims.1, q_out, k_out, v_out);
+                                        }
+                                        (
+                                            InferenceWeightStorage::BF16 { data: qw, .. },
+                                            InferenceWeightStorage::BF16 { data: kw, .. },
+                                            InferenceWeightStorage::BF16 { data: vw, .. },
+                                        ) => {
+                                            let qw = unsafe { std::slice::from_raw_parts(qw.as_ptr() as *const half::bf16, qw.len()) };
+                                            let kw = unsafe { std::slice::from_raw_parts(kw.as_ptr() as *const half::bf16, kw.len()) };
+                                            let vw = unsafe { std::slice::from_raw_parts(vw.as_ptr() as *const half::bf16, vw.len()) };
+                                            fused_qkv_decode_infer_tmp_bf16_into(&x, qw, kw, vw, q_dims.0, k_dims.0, q_dims.1, q_out, k_out, v_out);
+                                        }
+                                        _ => panic!("temporary fused qkv expects matching weight dtypes"),
+                                    }
+                                    assert_eq!(k_dims.1, q_dims.1, "K weight K mismatch");
+                                    assert_eq!(v_dims.1, q_dims.1, "V weight K mismatch");
+                                    assert_eq!(v_dims.0, k_dims.0, "K/V dim mismatch");
+                                } else {
+                                    fused_qkv_decode_infer_into(&x, &self.w_q.weight, &self.w_k.weight, &self.w_v.weight, q_out, k_out, v_out);
+                                }
                             }
                             let q_all: &[f32] = &qpb[..q_proj_dim];
                             let k_new: &[f32] = &kpb[..kv_proj_dim];
@@ -468,6 +502,13 @@ impl SelfAttention {
         // 训练路径默认不返回 cache
         (output, None)
     }
+
+    pub fn has_temporary_infer_migration(&self) -> bool {
+        self.w_q.has_temporary_infer_migration()
+            || self.w_k.has_temporary_infer_migration()
+            || self.w_v.has_temporary_infer_migration()
+            || self.w_o.has_temporary_infer_migration()
+    }
 }
 
 impl Module for SelfAttention {
@@ -482,6 +523,10 @@ impl Module for SelfAttention {
         p.extend(self.w_v.parameters());
         p.extend(self.w_o.parameters());
         p
+    }
+
+    fn has_temporary_infer_migration(&self) -> bool {
+        SelfAttention::has_temporary_infer_migration(self)
     }
 }
 

@@ -35,7 +35,7 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
         data: reshaped,
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let old_shape = input_clone.data_ref().shape().to_vec();
             let grad_contig = grad.as_standard_layout().into_owned();
             let grad_reshaped = grad_contig
@@ -66,7 +66,7 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
         data: permuted,
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let grad_restored = grad.view().permuted_axes(rev_axes.clone()).to_owned();
             input_clone.add_grad(grad_restored);
         })),
@@ -102,7 +102,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
         data: result,
         grad: None,
         parents: tensors.to_vec(),
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let mut start_idx = 0;
             for (i, &len) in lengths.iter().enumerate() {
                 let slice_info = Slice::from(start_idx..start_idx + len);
@@ -146,7 +146,7 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
         data: sliced,
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let mut full_grad = ndarray::Array::zeros(full_shape.clone());
             full_grad
                 .slice_axis_mut(axis, ndarray::Slice::from(start..end))

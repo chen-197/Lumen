@@ -29,21 +29,22 @@ impl MSELoss {
             data: arr0(loss_val).into_dyn().into_shared(),
             grad: None,
             parents: vec![output.clone(), target.clone()],
-            backward_op: Some(Box::new(move |grad_output| {
+            backward_op: Some(std::rc::Rc::new(move |grad_output| {
                 let grad_val = grad_output.first().unwrap();
-                let out_d = output_clone.data_ref();
-                let tar_d = target_clone.data_ref();
-                let n = out_d.len() as f32;
-                let factor = 2.0 / n * grad_val;
+                let (grad_out, grad_target) = {
+                    let out_d = output_clone.data_ref();
+                    let tar_d = target_clone.data_ref();
+                    let n = out_d.len() as f32;
+                    let factor = 2.0 / n * grad_val;
 
-                // dL/dx = 2/N * (x - y) * g
-                // 直接并行生成梯度，不创建 diff 中间量
-                let grad = Zip::from(&*out_d)
-                    .and(&*tar_d)
-                    .par_map_collect(|&o, &t| (o - t) * factor);
+                    let grad = Zip::from(&*out_d)
+                        .and(&*tar_d)
+                        .par_map_collect(|&o, &t| (o - t) * factor);
+                    (grad.clone(), grad.mapv(|x| -x))
+                };
 
-                output_clone.add_grad(grad.clone());
-                target_clone.add_grad(grad.mapv(|x| -x));
+                output_clone.add_grad(grad_out);
+                target_clone.add_grad(grad_target);
             })),
             requires_grad: true
         })))
@@ -117,17 +118,17 @@ impl CrossEntropyLoss {
             data: arr0(loss_val).into_dyn().into_shared(),
             grad: None,
             parents: vec![input_logits.clone(), target_onehot.clone()],
-            backward_op: Some(Box::new(move |grad_output| {
+            backward_op: Some(std::rc::Rc::new(move |grad_output| {
                 let grad_val = grad_output.first().unwrap();
-                let targets_ref = target_clone.data_ref();
-                let batch_size = targets_ref.shape()[0] as f32;
-                let factor = grad_val / batch_size;
+                let grad = {
+                    let targets_ref = target_clone.data_ref();
+                    let batch_size = targets_ref.shape()[0] as f32;
+                    let factor = grad_val / batch_size;
 
-                // Backward: (Prob - Target) / N * grad
-                // Zip 并行计算
-                let grad = Zip::from(&softmax_cache)
-                    .and(&*targets_ref)
-                    .par_map_collect(|&p, &t| (p - t) * factor);
+                    Zip::from(&softmax_cache)
+                        .and(&*targets_ref)
+                        .par_map_collect(|&p, &t| (p - t) * factor)
+                };
 
                 input_clone.add_grad(grad);
             })),

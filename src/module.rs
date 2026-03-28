@@ -13,8 +13,15 @@ pub trait Module {
     fn forward(&self, input: Tensor) -> Tensor;
     fn parameters(&self) -> Vec<Tensor>;
 
+    fn has_temporary_infer_migration(&self) -> bool {
+        false
+    }
+
     // 训练模式：允许构图
     fn train_mode(&mut self) {
+        if self.has_temporary_infer_migration() {
+            panic!("temporary inference-only migrated weights do not support training");
+        }
         set_inference_mode(false);
     }
 
@@ -24,6 +31,12 @@ pub trait Module {
     }
 
     fn save(&self, path: &str) -> std::io::Result<()> {
+        if self.has_temporary_infer_migration() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "temporary inference-only migrated weights cannot be saved by normal save()",
+            ));
+        }
         let params = self.parameters();
         let mut data_list = Vec::new();
         for p in params {
@@ -81,6 +94,9 @@ impl Module for Sequential {
     }
 
     fn train_mode(&mut self) {
+        if self.has_temporary_infer_migration() {
+            panic!("temporary inference-only migrated weights do not support training");
+        }
         // 先设置全局模式，再递归
         set_inference_mode(false);
         for l in &mut self.layers {
@@ -94,6 +110,10 @@ impl Module for Sequential {
         for l in &mut self.layers {
             l.eval_mode();
         }
+    }
+
+    fn has_temporary_infer_migration(&self) -> bool {
+        self.layers.iter().any(|l| l.has_temporary_infer_migration())
     }
 }
 

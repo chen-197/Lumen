@@ -132,7 +132,7 @@ impl RotaryEmbedding {
             data: out.into_dyn().into_shared(),
             grad: None,
             parents: vec![x.clone()],
-            backward_op: Some(Box::new(move |grad| {
+            backward_op: Some(std::rc::Rc::new(move |grad| {
                 let grad_view = grad.view().into_dimensionality::<ndarray::Ix4>().unwrap();
                 let mut d_x = Array::zeros((b, h, seq_len, d));
 

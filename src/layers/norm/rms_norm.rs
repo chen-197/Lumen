@@ -68,71 +68,77 @@ impl Module for RMSNorm {
             data: output_data.into_shared(),
             grad: None,
             parents: vec![input.clone(), self.weight.clone()],
-            backward_op: Some(Box::new(move |grad_output| {
-                let x_ref = input_clone.data_ref();
-                let x_cow = x_ref.as_standard_layout();
-                let x_2d = x_cow.view().into_shape((rows, dim)).unwrap();
+            backward_op: Some(std::rc::Rc::new(move |grad_output| {
+                let (d_input, d_weight) = {
+                    let x_ref = input_clone.data_ref();
+                    let x_cow = x_ref.as_standard_layout();
+                    let x_2d = x_cow.view().into_shape((rows, dim)).unwrap();
 
-                let w_ref = weight_clone.data_ref();
-                let w_slice = w_ref.as_slice().unwrap();
+                    let w_ref = weight_clone.data_ref();
+                    let w_slice = w_ref.as_slice().unwrap();
 
-                let g_cow = grad_output.as_standard_layout();
-                let g_2d = g_cow.view().into_shape((rows, dim)).unwrap();
+                    let g_cow = grad_output.as_standard_layout();
+                    let g_2d = g_cow.view().into_shape((rows, dim)).unwrap();
 
-                let mut d_input_flat = Array2::<f32>::zeros((rows, dim));
-                Zip::from(d_input_flat.outer_iter_mut())
-                    .and(x_2d.outer_iter())
-                    .and(g_2d.outer_iter())
-                    .par_for_each(|mut dx_row, x_row, g_row| {
-                        let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
-                        let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
-                        let inv_dim = 1.0 / dim as f32;
-
-                        let mut dot = 0.0f32;
-                        for (&gi, (&wi, &xi)) in g_row.iter().zip(w_slice.iter().zip(x_row.iter())) {
-                            dot += (gi * wi) * (xi * inv_rms);
-                        }
-
-                        let mean_dot = dot * inv_dim;
-
-                        for (dxi, (&gi, (&wi, &xi))) in dx_row
-                            .iter_mut()
-                            .zip(g_row.iter().zip(w_slice.iter().zip(x_row.iter())))
-                        {
-                            let term1 = gi * wi;
-                            let x_norm = xi * inv_rms;
-                            *dxi = inv_rms * (term1 - x_norm * mean_dot);
-                        }
-                    });
-
-                input_clone.add_grad(d_input_flat.into_shape(shape.clone()).unwrap().into_dyn());
-
-                let dw_accum = (0..rows)
-                    .into_par_iter()
-                    .fold(
-                        || Array1::<f32>::zeros(dim),
-                        |mut acc, r| {
-                            let x_row = x_2d.row(r);
-                            let g_row = g_2d.row(r);
-
-                            let sum_sq = x_row.fold(0.0f32, |a, &v| a + v * v);
+                    let mut d_input_flat = Array2::<f32>::zeros((rows, dim));
+                    Zip::from(d_input_flat.outer_iter_mut())
+                        .and(x_2d.outer_iter())
+                        .and(g_2d.outer_iter())
+                        .par_for_each(|mut dx_row, x_row, g_row| {
+                            let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
                             let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+                            let inv_dim = 1.0 / dim as f32;
 
-                            for (a, (&gi, &xi)) in acc.iter_mut().zip(g_row.iter().zip(x_row.iter())) {
-                                *a += gi * xi * inv_rms;
+                            let mut dot = 0.0f32;
+                            for (&gi, (&wi, &xi)) in g_row.iter().zip(w_slice.iter().zip(x_row.iter())) {
+                                dot += (gi * wi) * (xi * inv_rms);
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || Array1::<f32>::zeros(dim),
-                        |mut a, b| {
-                            a += &b;
-                            a
-                        },
-                    );
 
-                weight_clone.add_grad(dw_accum.into_dyn());
+                            let mean_dot = dot * inv_dim;
+
+                            for (dxi, (&gi, (&wi, &xi))) in dx_row
+                                .iter_mut()
+                                .zip(g_row.iter().zip(w_slice.iter().zip(x_row.iter())))
+                            {
+                                let term1 = gi * wi;
+                                let x_norm = xi * inv_rms;
+                                *dxi = inv_rms * (term1 - x_norm * mean_dot);
+                            }
+                        });
+
+                    let dw_accum = (0..rows)
+                        .into_par_iter()
+                        .fold(
+                            || Array1::<f32>::zeros(dim),
+                            |mut acc, r| {
+                                let x_row = x_2d.row(r);
+                                let g_row = g_2d.row(r);
+
+                                let sum_sq = x_row.fold(0.0f32, |a, &v| a + v * v);
+                                let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+
+                                for (a, (&gi, &xi)) in acc.iter_mut().zip(g_row.iter().zip(x_row.iter())) {
+                                    *a += gi * xi * inv_rms;
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || Array1::<f32>::zeros(dim),
+                            |mut a, b| {
+                                a += &b;
+                                a
+                            },
+                        );
+
+                    (
+                        d_input_flat.into_shape(shape.clone()).unwrap().into_dyn(),
+                        dw_accum.into_dyn(),
+                    )
+                };
+
+                input_clone.add_grad(d_input);
+                weight_clone.add_grad(d_weight);
             })),
             requires_grad: true,
         })))

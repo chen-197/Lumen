@@ -11,3 +11,6 @@ pub mod tokenizer;
 pub mod models;
 pub mod loader;
 pub mod kv_cache;
+pub mod inference;
+
+pub mod infer_mode;

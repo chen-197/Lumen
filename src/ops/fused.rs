@@ -1,5 +1,12 @@
 use crate::autograd::{is_no_grad, Tensor, TensorData};
-use crate::ops::matmul::{dual_matvec_rowmajor_parallel, dual_matvec_silu_mul_rowmajor_parallel, matvec_rowmajor_parallel};
+use crate::ops::matmul::{
+    dual_matvec_rowmajor_parallel,
+    dual_matvec_rowmajor_parallel_bf16,
+    dual_matvec_silu_mul_rowmajor_parallel,
+    dual_matvec_silu_mul_rowmajor_parallel_bf16,
+    matvec_rowmajor_parallel,
+    matvec_rowmajor_parallel_bf16,
+};
 use ndarray::{Array, Array2, Array3, Axis, Ix2, Zip};
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -77,7 +84,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
         data: output.into_shared(),
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let y = &output_data;
             let y_grad = y * grad;
             let sum_y_grad = y_grad.sum_axis(Axis(3)).insert_axis(Axis(3));
@@ -429,3 +436,149 @@ pub fn fused_qkv_decode_infer(
             .expect("V output reshape failed"),
     )
 }
+
+
+// 临时：推理压缩权重路径，后续由全链路 dtype 替代。
+pub fn fused_gate_up_silu_infer_tmp_f32_into(
+    input: &Tensor,
+    gate_weight: &[f32],
+    up_weight: &[f32],
+    gate_n: usize,
+    k_dim: usize,
+    out: &mut [f32],
+) {
+    assert!(is_no_grad(), "fused_gate_up_silu_infer_tmp_f32_into is inference-only");
+
+    let x_data = input.data_arc();
+    let x_shape = x_data.shape().to_vec();
+    let x_k_dim = *x_shape.last().expect("input must have last dim");
+    let m_dim = x_data.len() / x_k_dim;
+    assert_eq!(m_dim, 1, "fused_gate_up_silu_infer_tmp_f32_into currently expects single-token decode input");
+    assert_eq!(x_k_dim, k_dim, "input width mismatch");
+    assert_eq!(out.len(), gate_n, "output size mismatch");
+
+    let x_2d = x_data.view().into_shape((m_dim, k_dim)).expect("input reshape failed");
+    let x_row = x_2d.row(0);
+    let x_owned;
+    let x_slice: &[f32] = if let Some(s) = x_row.as_slice() {
+        s
+    } else {
+        x_owned = x_row.iter().copied().collect::<Vec<f32>>();
+        x_owned.as_slice()
+    };
+
+    dual_matvec_silu_mul_rowmajor_parallel(x_slice, gate_weight, up_weight, gate_n, k_dim, out);
+}
+
+// 临时：推理压缩权重路径，后续由全链路 dtype 替代。
+pub fn fused_gate_up_silu_infer_tmp_bf16_into(
+    input: &Tensor,
+    gate_weight: &[half::bf16],
+    up_weight: &[half::bf16],
+    gate_n: usize,
+    k_dim: usize,
+    out: &mut [f32],
+) {
+    assert!(is_no_grad(), "fused_gate_up_silu_infer_tmp_bf16_into is inference-only");
+
+    let x_data = input.data_arc();
+    let x_shape = x_data.shape().to_vec();
+    let x_k_dim = *x_shape.last().expect("input must have last dim");
+    let m_dim = x_data.len() / x_k_dim;
+    assert_eq!(m_dim, 1, "fused_gate_up_silu_infer_tmp_bf16_into currently expects single-token decode input");
+    assert_eq!(x_k_dim, k_dim, "input width mismatch");
+    assert_eq!(out.len(), gate_n, "output size mismatch");
+
+    let x_2d = x_data.view().into_shape((m_dim, k_dim)).expect("input reshape failed");
+    let x_row = x_2d.row(0);
+    let x_owned;
+    let x_slice: &[f32] = if let Some(s) = x_row.as_slice() {
+        s
+    } else {
+        x_owned = x_row.iter().copied().collect::<Vec<f32>>();
+        x_owned.as_slice()
+    };
+
+    dual_matvec_silu_mul_rowmajor_parallel_bf16(x_slice, gate_weight, up_weight, gate_n, k_dim, out);
+}
+
+// 临时：推理压缩权重路径，后续由全链路 dtype 替代。
+pub fn fused_qkv_decode_infer_tmp_f32_into(
+    input: &Tensor,
+    q_weight: &[f32],
+    k_weight: &[f32],
+    v_weight: &[f32],
+    q_n: usize,
+    k_n: usize,
+    k_dim: usize,
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) {
+    assert!(is_no_grad(), "fused_qkv_decode_infer_tmp_f32_into is inference-only");
+
+    let x_data = input.data_arc();
+    let x_shape = x_data.shape().to_vec();
+    assert_eq!(x_shape.len(), 3, "decode input must be [B, S, K]");
+    let (b, s, x_k_dim) = (x_shape[0], x_shape[1], x_shape[2]);
+    assert_eq!(b, 1, "fused_qkv_decode_infer_tmp_f32_into currently expects batch size 1");
+    assert_eq!(s, 1, "fused_qkv_decode_infer_tmp_f32_into only supports S=1 decode");
+    assert_eq!(x_k_dim, k_dim, "input width mismatch");
+    assert_eq!(q_out.len(), q_n, "Q output size mismatch");
+    assert_eq!(k_out.len(), k_n, "K output size mismatch");
+    assert_eq!(v_out.len(), k_n, "V output size mismatch");
+
+    let x_2d = x_data.view().into_shape((b, k_dim)).expect("decode input reshape failed");
+    let x_row = x_2d.row(0);
+    let x_owned;
+    let x_slice: &[f32] = if let Some(slc) = x_row.as_slice() {
+        slc
+    } else {
+        x_owned = x_row.iter().copied().collect::<Vec<f32>>();
+        x_owned.as_slice()
+    };
+
+    matvec_rowmajor_parallel(x_slice, q_weight, q_n, k_dim, q_out);
+    dual_matvec_rowmajor_parallel(x_slice, k_weight, v_weight, k_n, k_dim, k_out, v_out);
+}
+
+// 临时：推理压缩权重路径，后续由全链路 dtype 替代。
+pub fn fused_qkv_decode_infer_tmp_bf16_into(
+    input: &Tensor,
+    q_weight: &[half::bf16],
+    k_weight: &[half::bf16],
+    v_weight: &[half::bf16],
+    q_n: usize,
+    k_n: usize,
+    k_dim: usize,
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) {
+    assert!(is_no_grad(), "fused_qkv_decode_infer_tmp_bf16_into is inference-only");
+
+    let x_data = input.data_arc();
+    let x_shape = x_data.shape().to_vec();
+    assert_eq!(x_shape.len(), 3, "decode input must be [B, S, K]");
+    let (b, s, x_k_dim) = (x_shape[0], x_shape[1], x_shape[2]);
+    assert_eq!(b, 1, "fused_qkv_decode_infer_tmp_bf16_into currently expects batch size 1");
+    assert_eq!(s, 1, "fused_qkv_decode_infer_tmp_bf16_into only supports S=1 decode");
+    assert_eq!(x_k_dim, k_dim, "input width mismatch");
+    assert_eq!(q_out.len(), q_n, "Q output size mismatch");
+    assert_eq!(k_out.len(), k_n, "K output size mismatch");
+    assert_eq!(v_out.len(), k_n, "V output size mismatch");
+
+    let x_2d = x_data.view().into_shape((b, k_dim)).expect("decode input reshape failed");
+    let x_row = x_2d.row(0);
+    let x_owned;
+    let x_slice: &[f32] = if let Some(slc) = x_row.as_slice() {
+        slc
+    } else {
+        x_owned = x_row.iter().copied().collect::<Vec<f32>>();
+        x_owned.as_slice()
+    };
+
+    matvec_rowmajor_parallel_bf16(x_slice, q_weight, q_n, k_dim, q_out);
+    dual_matvec_rowmajor_parallel_bf16(x_slice, k_weight, v_weight, k_n, k_dim, k_out, v_out);
+}
+

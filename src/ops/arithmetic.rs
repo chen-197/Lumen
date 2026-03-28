@@ -60,7 +60,7 @@ impl Add for Tensor {
             data: data.into_shared(),
             grad: None,
             parents: vec![self.clone(), rhs.clone()],
-            backward_op: Some(Box::new(move |grad| {
+            backward_op: Some(std::rc::Rc::new(move |grad| {
                 let l_shape = lhs.data_ref().shape().to_vec();
                 let r_shape = rhs.data_ref().shape().to_vec();
                 lhs.add_grad(reduce_gradient(grad.view(), &l_shape));
@@ -94,7 +94,7 @@ impl Sub for Tensor {
             data: data.into_shared(),
             grad: None,
             parents: vec![self.clone(), rhs.clone()],
-            backward_op: Some(Box::new(move |grad| {
+            backward_op: Some(std::rc::Rc::new(move |grad| {
                 let l_shape = lhs.data_ref().shape().to_vec();
                 let r_shape = rhs.data_ref().shape().to_vec();
                 lhs.add_grad(reduce_gradient(grad.view(), &l_shape));
@@ -130,20 +130,21 @@ impl Mul for Tensor {
             data: data.into_shared(),
             grad: None,
             parents: vec![self.clone(), rhs.clone()],
-            backward_op: Some(Box::new(move |grad| {
-                let a_data = lhs.data_ref();
-                let b_data = rhs.data_ref();
+            backward_op: Some(std::rc::Rc::new(move |grad| {
+                let (g_lhs, g_rhs, l_shape, r_shape) = {
+                    let a_data = lhs.data_ref();
+                    let b_data = rhs.data_ref();
 
-                let (g_lhs, g_rhs) = if grad.shape() == a_data.shape() && grad.shape() == b_data.shape() {
-                    let gl = Zip::from(grad).and(&*b_data).par_map_collect(|&g, &b| g * b);
-                    let gr = Zip::from(grad).and(&*a_data).par_map_collect(|&g, &a| g * a);
-                    (gl, gr)
-                } else {
-                    (grad * &*b_data, grad * &*a_data)
+                    let (g_lhs, g_rhs) = if grad.shape() == a_data.shape() && grad.shape() == b_data.shape() {
+                        let gl = Zip::from(grad).and(&*b_data).par_map_collect(|&g, &b| g * b);
+                        let gr = Zip::from(grad).and(&*a_data).par_map_collect(|&g, &a| g * a);
+                        (gl, gr)
+                    } else {
+                        (grad * &*b_data, grad * &*a_data)
+                    };
+
+                    (g_lhs, g_rhs, a_data.shape().to_vec(), b_data.shape().to_vec())
                 };
-
-                let l_shape = a_data.shape().to_vec();
-                let r_shape = b_data.shape().to_vec();
                 lhs.add_grad(reduce_gradient(g_lhs.view(), &l_shape));
                 rhs.add_grad(reduce_gradient(g_rhs.view(), &r_shape));
             })),
@@ -173,7 +174,7 @@ pub fn sum(input: &Tensor) -> Tensor {
         data: result.into_shared(),
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let g = grad.first().copied().unwrap_or(0.0);
             let input_shape = input_clone.data_ref().shape().to_vec();
             let grad_input = ndarray::ArrayD::from_elem(input_shape, g);

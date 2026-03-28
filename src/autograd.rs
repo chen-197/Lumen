@@ -56,7 +56,7 @@ pub struct TensorData {
     pub grad: Option<ArcArray<f32, IxDyn>>,
     pub parents: Vec<Tensor>,
     // backward_op 接收 grad 的 view，避免在反传遍历时额外 to_owned
-    pub backward_op: Option<Box<dyn Fn(&ArrayViewD<f32>)>>,
+    pub backward_op: Option<Rc<dyn Fn(&ArrayViewD<f32>)>>,
     pub requires_grad: bool,
 }
 
@@ -238,12 +238,17 @@ impl Tensor {
         self.add_grad(ArrayD::ones(shape));
 
         for node in topo.iter().rev() {
-            let inner = node.0.borrow();
-            if let Some(grad) = &inner.grad {
-                if let Some(op) = &inner.backward_op {
-                    let gv = grad.view();
-                    op(&gv.into_dyn());
+            let (grad_arc, op_rc) = {
+                let inner = node.0.borrow();
+                match (&inner.grad, &inner.backward_op) {
+                    (Some(grad), Some(op)) => (Some(grad.clone()), Some(op.clone())),
+                    _ => (None, None),
                 }
+            };
+
+            if let (Some(grad), Some(op)) = (grad_arc, op_rc) {
+                let gv = grad.view();
+                op(&gv.into_dyn());
             }
         }
     }
@@ -254,6 +259,18 @@ impl Tensor {
             inner.data.shape().to_vec(),
             inner.data.iter().cloned().collect(),
         )
+    }
+
+    pub fn take_raw_data(&self) -> (Vec<usize>, Vec<f32>) {
+        let mut inner = self.0.borrow_mut();
+        let shape = inner.data.shape().to_vec();
+        let raw_data = if inner.data.is_standard_layout() {
+            std::mem::take(&mut inner.data).into_owned().into_raw_vec()
+        } else {
+            inner.data.iter().cloned().collect()
+        };
+        inner.data = ArrayD::<f32>::zeros(IxDyn(&[0])).into_shared();
+        (shape, raw_data)
     }
 
     pub fn set_raw_data(&self, shape: Vec<usize>, raw_data: Vec<f32>) {

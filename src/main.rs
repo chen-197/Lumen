@@ -1,8 +1,10 @@
 use mimalloc::MiMalloc;
 
 use lumen::autograd::{no_grad, Tensor};
+use lumen::infer_mode::set_pure_bf16_infer_loading;
 use lumen::loader::ModelLoader;
 use lumen::models::{LlamaConfig, LlamaModel};
+use lumen::module::Module;
 use lumen::tokenizer::LlamaTokenizer;
 
 use ndarray::{s, Array, Array1, Ix3};
@@ -297,6 +299,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("🦀 Loading Rusty Llama...");
+    println!("⚙️  Pure BF16 infer loading: ON");
+
     let tokenizer = LlamaTokenizer::from_file(&args.tokenizer)?;
     if tokenizer.vocab_size() != config.vocab_size {
         return Err(format!(
@@ -307,10 +311,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let model = LlamaModel::new(config.clone());
-    println!("📦 Loading weights from: {}", args.weights);
-    ModelLoader::load_llama_weights(&args.weights, &model.named_parameters())?;
+    set_pure_bf16_infer_loading(true);
 
+    let mut model = LlamaModel::new(config.clone());
+
+    println!("📦 Loading weights from: {}", args.weights);
+    ModelLoader::load_llama_weights_direct(&args.weights, &mut model)?;
+
+    model.eval_mode();
+
+    println!("🚀 Direct BF16 infer weights loaded.");
     println!("\n✨ System Ready. Commands: /reset  /exit");
 
     let mut stop_ids: Vec<usize> = Vec::new();
@@ -392,14 +402,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             all_tokens.extend_from_slice(&new_tokens);
             let assistant_start = all_tokens.len();
 
-            let prefill_logits = model.forward_last_logits(
-                tensor_from_token_ids(&new_tokens),
-                &mut kv_caches,
-                0,
-            );
+            let prefill_logits =
+                model.forward_last_logits(tensor_from_token_ids(&new_tokens), &mut kv_caches, 0);
             let mut logits_vec = last_step_logits_vec(&prefill_logits);
 
             let mut prev_gen_text = String::new();
+
             for _ in 0..args.max_gen {
                 let start = all_tokens.len().saturating_sub(args.recent_window);
                 let recent = &all_tokens[start..];

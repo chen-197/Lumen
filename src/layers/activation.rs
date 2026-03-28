@@ -28,16 +28,19 @@ impl Module for ReLU {
             data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
-            backward_op: Some(Box::new(move |grad| {
-                let input_d = input_clone.data_ref();
-                let mut grad_input = grad.to_owned().into_dyn();
-                Zip::from(grad_input.view_mut())
-                    .and(&*input_d)
-                    .par_for_each(|g, &x| {
-                        if x <= 0.0 {
-                            *g = 0.0;
-                        }
-                    });
+            backward_op: Some(std::rc::Rc::new(move |grad| {
+                let grad_input = {
+                    let input_d = input_clone.data_ref();
+                    let mut grad_input = grad.to_owned().into_dyn();
+                    Zip::from(grad_input.view_mut())
+                        .and(&*input_d)
+                        .par_for_each(|g, &x| {
+                            if x <= 0.0 {
+                                *g = 0.0;
+                            }
+                        });
+                    grad_input
+                };
                 input_clone.add_grad(grad_input);
             })),
             requires_grad: true,
@@ -74,7 +77,7 @@ impl Module for Sigmoid {
             data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
-            backward_op: Some(Box::new(move |grad| {
+            backward_op: Some(std::rc::Rc::new(move |grad| {
                 let mut grad_input = grad.to_owned().into_dyn();
                 Zip::from(grad_input.view_mut())
                     .and(&output_data)
@@ -117,7 +120,7 @@ impl Module for Tanh {
             data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
-            backward_op: Some(Box::new(move |grad| {
+            backward_op: Some(std::rc::Rc::new(move |grad| {
                 let mut grad_input = grad.to_owned().into_dyn();
                 Zip::from(grad_input.view_mut())
                     .and(&output_data)
@@ -162,13 +165,16 @@ impl Module for SiLU {
             data: data.into_shared(),
             grad: None,
             parents: vec![input.clone()],
-            backward_op: Some(Box::new(move |grad| {
-                let x_ref = input_clone.data_ref();
-                let dx = Zip::from(&*x_ref).par_map_collect(|&x| {
-                    let sig = 1.0 / (1.0 + (-x).exp());
-                    sig + x * sig * (1.0 - sig)
-                });
-                input_clone.add_grad((&dx * grad).into_dyn());
+            backward_op: Some(std::rc::Rc::new(move |grad| {
+                let grad_input = {
+                    let x_ref = input_clone.data_ref();
+                    let dx = Zip::from(&*x_ref).par_map_collect(|&x| {
+                        let sig = 1.0 / (1.0 + (-x).exp());
+                        sig + x * sig * (1.0 - sig)
+                    });
+                    (&dx * grad).into_dyn()
+                };
+                input_clone.add_grad(grad_input);
             })),
             requires_grad: true,
         })))
@@ -241,7 +247,7 @@ impl Module for Softmax {
             data: y.into_shared(),
             grad: None,
             parents: vec![input.clone()],
-            backward_op: Some(Box::new(move |grad_output| {
+            backward_op: Some(std::rc::Rc::new(move |grad_output| {
                 let grad_shape = grad_output.shape();
                 let dim = grad_shape[axis_idx];
                 let outer = grad_output.len() / dim;
@@ -305,16 +311,19 @@ impl Module for Gelu {
             data: output.into_shared(),
             grad: None,
             parents: vec![input.clone()],
-            backward_op: Some(Box::new(move |grad| {
-                let x_ref = input_clone.data_ref();
-                let dx = Zip::from(&*x_ref).par_map_collect(|&x| {
-                    let x3 = x * x * x;
-                    let inner = C * (x + K * x3);
-                    let tanh_i = inner.tanh();
-                    let sech2 = 1.0 - tanh_i * tanh_i;
-                    0.5 * (1.0 + tanh_i) + 0.5 * x * sech2 * C * (1.0 + 3.0 * K * x * x)
-                });
-                input_clone.add_grad((&dx * grad).into_dyn());
+            backward_op: Some(std::rc::Rc::new(move |grad| {
+                let grad_input = {
+                    let x_ref = input_clone.data_ref();
+                    let dx = Zip::from(&*x_ref).par_map_collect(|&x| {
+                        let x3 = x * x * x;
+                        let inner = C * (x + K * x3);
+                        let tanh_i = inner.tanh();
+                        let sech2 = 1.0 - tanh_i * tanh_i;
+                        0.5 * (1.0 + tanh_i) + 0.5 * x * sech2 * C * (1.0 + 3.0 * K * x * x)
+                    });
+                    (&dx * grad).into_dyn()
+                };
+                input_clone.add_grad(grad_input);
             })),
             requires_grad: true,
         })))
