@@ -15,6 +15,8 @@ The repository is useful in two roles:
 - as a **learning-oriented DL core** for understanding tensors, autograd, layers, modules, and optimizers in Rust;
 - as a **small LLM inference skeleton** centered on a Llama-style architecture, safetensors loading, tokenization, and KV cache based incremental decoding.
 
+This patched branch also includes an **experimental pure-BF16 inference-loading path**. It is currently best understood as a **pragmatic test build / temporary solution** rather than a finalized design, but it is already integrated into the runnable example and documented here on purpose.
+
 > `src/main.rs` is intentionally a **simple example program**. It demonstrates how to wire the library together for local inference, but it is **not** intended to represent a complete production CLI, serving stack, or general model runner.
 
 ---
@@ -34,12 +36,32 @@ The repository is useful in two roles:
 - **CPU-oriented inference hot path optimizations**, including:
   - Rayon-backed parallel computation
   - row-major parallel matvec path for decode
+  - optimized BF16-prefill path for multi-token prefill (experimental)
   - fused infer-time gate/up/SiLU path in MLP
   - release profile tuned with `lto`, `panic = "abort"`, and `strip`
 - **Efficient weight loading** from `safetensors` via `memmap2`
+- **Experimental pure-BF16 direct infer loading** for large Llama projection / embedding matrices
+- **Interactive example chat entry** with KV-cache reuse, reset support, and sampling controls
 - **Tokenizer integration** through Hugging Face `tokenizers`
 
 ---
+
+## Experimental Pure-BF16 Inference Path
+
+This repository currently ships with an **experimental pure-BF16 inference path** intended for local testing and iteration. The key idea is:
+
+- keep the project architecture lightweight;
+- load selected large matrices through a BF16-oriented infer-time path;
+- preserve the existing CPU-first design while reducing memory traffic in practical inference scenarios.
+
+In the current patched build, the BF16 path is especially tied to the following pieces:
+
+- `set_pure_bf16_infer_loading(true)` in the example entry;
+- `ModelLoader::load_llama_weights_direct(...)` for direct weight loading;
+- loader-side identification of large matrices such as embeddings, LM head, attention projections, and MLP projections;
+- dedicated prefill-side optimization work aimed at improving multi-token BF16 prefill behavior on CPU.
+
+This is **not yet presented as a stable, final, or universally optimal implementation**. It should be treated as a **testing / transitional solution** with real practical value, but still subject to further kernel, layout, and loader evolution.
 
 ## Repository Layout
 
@@ -103,6 +125,13 @@ Optional arguments:
 - `--recent-window`
 - `--max-gen`
 
+The current example entry enables the experimental BF16 loading path before model loading:
+
+```rust
+set_pure_bf16_infer_loading(true);
+ModelLoader::load_llama_weights_direct(&args.weights, &mut model)?;
+```
+
 Interactive commands in the example chat loop:
 
 - `/reset` — clear conversation state and KV cache
@@ -118,7 +147,8 @@ But it also means:
 
 - the model architecture in `model_config()` must match the loaded weights;
 - tokenizer vocabulary must be compatible with the configured `vocab_size` and prompt format;
-- adapting to other checkpoints may require updating dimensions, layer counts, attention layout, special tokens, or prompt template logic.
+- the current BF16 loading path is patch-oriented and depends on the loader recognizing the intended large matrices correctly;
+- adapting to other checkpoints may require updating dimensions, layer counts, attention layout, special tokens, prompt template logic, or BF16-loader matching rules.
 
 In other words, **`main.rs` is a simple integration example, not a universal launcher**.
 
