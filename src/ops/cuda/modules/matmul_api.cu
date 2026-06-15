@@ -476,6 +476,108 @@ __global__ void matmul_i8_kernel(
         out[idx] = static_cast<float>(acc) * scale;
     }
 }
+
+__global__ void scale_i32_to_f32_kernel(
+    const int32_t* input,
+    float* output,
+    size_t len,
+    float scale) {
+    const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t idx = start; idx < len; idx += stride) {
+        output[idx] = static_cast<float>(input[idx]) * scale;
+    }
+}
+
+__global__ void scale_i32_rows_to_f32_kernel(
+    const int32_t* input,
+    float* output,
+    size_t total,
+    size_t cols,
+    const float* row_scales,
+    float rhs_scale) {
+    const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t idx = start; idx < total; idx += stride) {
+        output[idx] =
+            static_cast<float>(input[idx]) * row_scales[idx / cols] * rhs_scale;
+    }
+}
+
+static bool try_launch_matmul_i8_cublas_i32(
+    const int8_t* a,
+    const int8_t* b,
+    int32_t* out,
+    size_t m,
+    size_t n,
+    size_t k) {
+    // cuBLAS INT8 GEMM needs four-byte-aligned leading dimensions. The output-row
+    // count may be arbitrary, which is important for prompt-length prefill.
+    if ((n & 3) != 0 || (k & 3) != 0 ||
+        m > static_cast<size_t>(INT_MAX) ||
+        n > static_cast<size_t>(INT_MAX) ||
+        k > static_cast<size_t>(INT_MAX)) {
+        return false;
+    }
+
+    CublasHandle handle;
+    if (!init_cublas(handle)) {
+        return false;
+    }
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    cublasStatus_t cublas_status = cublasGemmEx(
+        handle.handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        static_cast<int>(n),
+        static_cast<int>(m),
+        static_cast<int>(k),
+        &alpha,
+        b,
+        CUDA_R_8I,
+        static_cast<int>(k),
+        a,
+        CUDA_R_8I,
+        static_cast<int>(k),
+        &beta,
+        out,
+        CUDA_R_32I,
+        static_cast<int>(n),
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return cublas_status == CUBLAS_STATUS_SUCCESS;
+}
+
+static bool try_launch_matmul_i8_cublas_compute(
+    const int8_t* a,
+    const int8_t* b,
+    float* out,
+    size_t m,
+    size_t n,
+    size_t k,
+    float scale) {
+    const size_t max_size = static_cast<size_t>(-1);
+    if (m > max_size / n || m * n > max_size / sizeof(int32_t)) {
+        return false;
+    }
+    const size_t total = m * n;
+    thread_local ReusableCudaWorkspace i32_output_tmp;
+    if (!i32_output_tmp.ensure(
+            total * sizeof(int32_t),
+            "failed to allocate CUDA I8 cuBLAS i32 output buffer") ||
+        !try_launch_matmul_i8_cublas_i32(
+            a, b, static_cast<int32_t*>(i32_output_tmp.ptr), m, n, k)) {
+        return false;
+    }
+
+    constexpr unsigned int block_size = 256;
+    const unsigned int grid = linear_grid_size(total, block_size);
+    scale_i32_to_f32_kernel<<<grid, block_size>>>(
+        static_cast<const int32_t*>(i32_output_tmp.ptr), out, total, scale);
+    return check_cuda_launch("CUDA I8 cuBLAS output scaling kernel launch failed");
+}
+
 static bool can_launch_matmul_tiled(size_t m, size_t n) {
     constexpr size_t max_grid_x = 2147483647;
     constexpr size_t max_grid_y = 65535;
@@ -551,6 +653,9 @@ static bool launch_matmul_i8_compute(
         set_error("CUDA I8 matmul output length overflow");
         return false;
     }
+    if (try_launch_matmul_i8_cublas_compute(a, b, out, m, n, k, scale)) {
+        return true;
+    }
     if (can_launch_matmul_tiled(m, n)) {
         dim3 block(16, 8);
         dim3 grid(
@@ -576,6 +681,155 @@ __device__ inline float load_floatlike_value(const __half* ptr, size_t idx) {
 
 __device__ inline float load_floatlike_value(const __nv_bfloat16* ptr, size_t idx) {
     return __bfloat162float(ptr[idx]);
+}
+
+template <typename LhsT>
+__global__ void quantize_floatlike_rows_to_i8_kernel(
+    const LhsT* input,
+    int8_t* output,
+    float* row_scales,
+    size_t rows,
+    size_t cols) {
+    extern __shared__ float shared[];
+    const size_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    float max_abs = 0.0f;
+    for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = load_floatlike_value(input, row * cols + col);
+        max_abs = isfinite(value) ? fmaxf(max_abs, fabsf(value)) : INFINITY;
+    }
+    shared[threadIdx.x] = max_abs;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float row_max = shared[0];
+        shared[0] = !isfinite(row_max)
+                        ? NAN
+                        : (row_max > 0.0f ? fmaxf(row_max / 127.0f, FLT_MIN) : 1.0f);
+        row_scales[row] = shared[0];
+    }
+    __syncthreads();
+
+    const float scale = shared[0];
+    for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        if (isfinite(scale)) {
+            float q = nearbyintf(load_floatlike_value(input, row * cols + col) / scale);
+            q = fminf(127.0f, fmaxf(-127.0f, q));
+            output[row * cols + col] = static_cast<int8_t>(q);
+        } else {
+            output[row * cols + col] = 0;
+        }
+    }
+}
+
+template <typename LhsT>
+static bool prepare_floatlike_rows_i8(
+    const LhsT* a,
+    int8_t* quantized,
+    float* row_scales,
+    size_t m,
+    size_t k) {
+    if (m > static_cast<size_t>(UINT_MAX)) {
+        return false;
+    }
+
+    constexpr unsigned int block_size = 256;
+    quantize_floatlike_rows_to_i8_kernel<<<
+        static_cast<unsigned int>(m),
+        block_size,
+        block_size * sizeof(float)>>>(
+        a,
+        quantized,
+        row_scales,
+        m,
+        k);
+    return check_cuda_launch("CUDA dynamic rowwise I8 quantize kernel launch failed");
+}
+
+static bool try_launch_quantized_rows_i8_cublas_compute(
+    const int8_t* quantized_a,
+    const float* row_scales,
+    const int8_t* b,
+    int32_t* i32_output,
+    float* out,
+    size_t m,
+    size_t n,
+    size_t k,
+    float b_scale) {
+    if (!try_launch_matmul_i8_cublas_i32(quantized_a, b, i32_output, m, n, k)) {
+        return false;
+    }
+
+    const size_t output_total = m * n;
+    constexpr unsigned int block_size = 256;
+    scale_i32_rows_to_f32_kernel<<<linear_grid_size(output_total, block_size), block_size>>>(
+        i32_output,
+        out,
+        output_total,
+        n,
+        row_scales,
+        b_scale);
+    return check_cuda_launch("CUDA dynamic I8 matmul output scaling kernel launch failed");
+}
+
+template <typename LhsT>
+static bool try_launch_matmul_floatlike_i8_dynamic_cublas_compute(
+    const LhsT* a,
+    const int8_t* b,
+    float* out,
+    size_t m,
+    size_t n,
+    size_t k,
+    float b_scale) {
+    if (m < 8 || (n & 3) != 0 || (k & 3) != 0) {
+        return false;
+    }
+    const size_t max_size = static_cast<size_t>(-1);
+    if (m > max_size / k || m > max_size / n ||
+        m * k > max_size / sizeof(int8_t) ||
+        m > max_size / sizeof(float) ||
+        m * n > max_size / sizeof(int32_t)) {
+        return false;
+    }
+
+    thread_local ReusableCudaWorkspace quantized_input_tmp;
+    thread_local ReusableCudaWorkspace row_scales_tmp;
+    thread_local ReusableCudaWorkspace i32_output_tmp;
+    if (!quantized_input_tmp.ensure(
+            m * k * sizeof(int8_t),
+            "failed to allocate CUDA dynamic I8 matmul input buffer") ||
+        !row_scales_tmp.ensure(
+            m * sizeof(float),
+            "failed to allocate CUDA dynamic I8 matmul row scales") ||
+        !i32_output_tmp.ensure(
+            m * n * sizeof(int32_t),
+            "failed to allocate CUDA dynamic I8 matmul i32 output buffer") ||
+        !prepare_floatlike_rows_i8(
+            a,
+            static_cast<int8_t*>(quantized_input_tmp.ptr),
+            static_cast<float*>(row_scales_tmp.ptr),
+            m,
+            k)) {
+        return false;
+    }
+    return try_launch_quantized_rows_i8_cublas_compute(
+        static_cast<const int8_t*>(quantized_input_tmp.ptr),
+        static_cast<const float*>(row_scales_tmp.ptr),
+        b,
+        static_cast<int32_t*>(i32_output_tmp.ptr),
+        out,
+        m,
+        n,
+        k,
+        b_scale);
 }
 
 template <typename LhsT>
@@ -1783,6 +2037,79 @@ __global__ void batch_matmul_i8_tiled_kernel(
     }
 }
 
+static bool try_launch_batch_matmul_i8_cublas_compute(
+    const int8_t* lhs,
+    const int8_t* rhs,
+    float* out,
+    size_t batch_count,
+    size_t m,
+    size_t n,
+    size_t k,
+    float scale) {
+    // Keep small batches on the custom kernel; cuBLAS setup dominates below this point.
+    constexpr size_t min_multiply_adds = 1u << 20;
+    const size_t max_size = static_cast<size_t>(-1);
+    if ((n & 3) != 0 || (k & 3) != 0 ||
+        batch_count > static_cast<size_t>(INT_MAX) ||
+        m > static_cast<size_t>(INT_MAX) ||
+        n > static_cast<size_t>(INT_MAX) ||
+        k > static_cast<size_t>(INT_MAX) ||
+        batch_count > max_size / m ||
+        batch_count * m > max_size / n ||
+        batch_count * m * n > max_size / sizeof(int32_t) ||
+        m > max_size / n ||
+        m * n > max_size / k ||
+        batch_count > max_size / (m * n * k) ||
+        batch_count * m * n * k < min_multiply_adds) {
+        return false;
+    }
+
+    const size_t total = batch_count * m * n;
+    thread_local ReusableCudaWorkspace i32_output_tmp;
+    if (!i32_output_tmp.ensure(
+            total * sizeof(int32_t),
+            "failed to allocate CUDA batched I8 cuBLAS i32 output buffer")) {
+        return false;
+    }
+    CublasHandle handle;
+    if (!init_cublas(handle)) {
+        return false;
+    }
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    cublasStatus_t cublas_status = cublasGemmStridedBatchedEx(
+        handle.handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        static_cast<int>(n),
+        static_cast<int>(m),
+        static_cast<int>(k),
+        &alpha,
+        rhs,
+        CUDA_R_8I,
+        static_cast<int>(n),
+        static_cast<long long>(n * k),
+        lhs,
+        CUDA_R_8I,
+        static_cast<int>(k),
+        static_cast<long long>(m * k),
+        &beta,
+        static_cast<int32_t*>(i32_output_tmp.ptr),
+        CUDA_R_32I,
+        static_cast<int>(n),
+        static_cast<long long>(m * n),
+        static_cast<int>(batch_count),
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+    constexpr unsigned int block_size = 256;
+    scale_i32_to_f32_kernel<<<linear_grid_size(total, block_size), block_size>>>(
+        static_cast<const int32_t*>(i32_output_tmp.ptr), out, total, scale);
+    return check_cuda_launch("CUDA batched I8 cuBLAS output scaling kernel launch failed");
+}
+
 static bool launch_batch_matmul_i8_compute(
     const int8_t* lhs,
     const int8_t* rhs,
@@ -1793,6 +2120,10 @@ static bool launch_batch_matmul_i8_compute(
     size_t k,
     float scale,
     const char* error_message) {
+    if (try_launch_batch_matmul_i8_cublas_compute(
+            lhs, rhs, out, batch_count, m, n, k, scale)) {
+        return true;
+    }
     if (can_launch_batch_matmul_tiled(batch_count, m, n)) {
         dim3 block(16, 8);
         dim3 grid(
@@ -2016,7 +2347,7 @@ static bool launch_batch_matmul_floatlike_i8_compute(
         batch_matmul_floatlike_i8_kernel<<<linear_grid_size(total, block_size), block_size>>>(
             lhs, rhs, out, total, m, n, k, rhs_scale);
     }
-    return sync_cuda(error_message);
+    return check_cuda_launch(error_message);
 }
 
 template <typename RhsT>
@@ -2044,7 +2375,7 @@ static bool launch_batch_matmul_i8_floatlike_compute(
         batch_matmul_i8_floatlike_kernel<<<linear_grid_size(total, block_size), block_size>>>(
             lhs, rhs, out, total, m, n, k, lhs_scale);
     }
-    return sync_cuda(error_message);
+    return check_cuda_launch(error_message);
 }
 
 __global__ void batch_matmul_i8_backward_kernel(
@@ -2393,7 +2724,7 @@ extern "C" int lumen_cuda_matmul_i8_device(
         "CUDA I8 resident matmul kernel launch failed")) {
         return 1;
     }
-    if (!sync_cuda("CUDA I8 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA I8 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -2440,7 +2771,7 @@ extern "C" int lumen_cuda_matmul_bf16_i8_device(
             return 1;
         }
     }
-    if (!sync_cuda("CUDA BF16xI8 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA BF16xI8 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -2487,10 +2818,72 @@ extern "C" int lumen_cuda_matmul_f16_i8_device(
             return 1;
         }
     }
-    if (!sync_cuda("CUDA F16xI8 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA F16xI8 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;
+}
+
+extern "C" int lumen_cuda_matmul_bf16_i8_dynamic_device(
+    uint64_t a_handle,
+    uint64_t b_handle,
+    float b_scale,
+    uint64_t out_handle,
+    size_t m,
+    size_t n,
+    size_t k) {
+    if (!validate_handle(a_handle, "CUDA dynamic BF16xI8 matmul A handle") ||
+        !validate_handle(b_handle, "CUDA dynamic BF16xI8 matmul B handle") ||
+        !validate_handle(out_handle, "CUDA dynamic BF16xI8 matmul output handle") ||
+        !validate_dims(m, n, k)) {
+        return 1;
+    }
+    if (!std::isfinite(b_scale) || b_scale <= 0.0f) {
+        set_error("CUDA dynamic BF16xI8 matmul scale must be finite and > 0");
+        return 1;
+    }
+    if (try_launch_matmul_floatlike_i8_dynamic_cublas_compute(
+            reinterpret_cast<const __nv_bfloat16*>(handle_to_ptr(a_handle)),
+            reinterpret_cast<const int8_t*>(handle_to_ptr(b_handle)),
+            handle_to_ptr(out_handle),
+            m,
+            n,
+            k,
+            b_scale)) {
+        return 0;
+    }
+    return lumen_cuda_matmul_bf16_i8_device(a_handle, b_handle, b_scale, out_handle, m, n, k);
+}
+
+extern "C" int lumen_cuda_matmul_f16_i8_dynamic_device(
+    uint64_t a_handle,
+    uint64_t b_handle,
+    float b_scale,
+    uint64_t out_handle,
+    size_t m,
+    size_t n,
+    size_t k) {
+    if (!validate_handle(a_handle, "CUDA dynamic F16xI8 matmul A handle") ||
+        !validate_handle(b_handle, "CUDA dynamic F16xI8 matmul B handle") ||
+        !validate_handle(out_handle, "CUDA dynamic F16xI8 matmul output handle") ||
+        !validate_dims(m, n, k)) {
+        return 1;
+    }
+    if (!std::isfinite(b_scale) || b_scale <= 0.0f) {
+        set_error("CUDA dynamic F16xI8 matmul scale must be finite and > 0");
+        return 1;
+    }
+    if (try_launch_matmul_floatlike_i8_dynamic_cublas_compute(
+            reinterpret_cast<const __half*>(handle_to_ptr(a_handle)),
+            reinterpret_cast<const int8_t*>(handle_to_ptr(b_handle)),
+            handle_to_ptr(out_handle),
+            m,
+            n,
+            k,
+            b_scale)) {
+        return 0;
+    }
+    return lumen_cuda_matmul_f16_i8_device(a_handle, b_handle, b_scale, out_handle, m, n, k);
 }
 
 extern "C" int lumen_cuda_matmul_f32_i8_device(
@@ -2534,7 +2927,7 @@ extern "C" int lumen_cuda_matmul_f32_i8_device(
             return 1;
         }
     }
-    if (!sync_cuda("CUDA F32xI8 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA F32xI8 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -2581,7 +2974,7 @@ extern "C" int lumen_cuda_matmul_i8_bf16_device(
             return 1;
         }
     }
-    if (!sync_cuda("CUDA I8xBF16 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA I8xBF16 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -2628,7 +3021,7 @@ extern "C" int lumen_cuda_matmul_i8_f16_device(
             return 1;
         }
     }
-    if (!sync_cuda("CUDA I8xF16 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA I8xF16 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -2675,7 +3068,7 @@ extern "C" int lumen_cuda_matmul_i8_f32_device(
             return 1;
         }
     }
-    if (!sync_cuda("CUDA I8xF32 resident matmul kernel failed")) {
+    if (!check_cuda_launch("CUDA I8xF32 resident matmul kernel launch failed")) {
         return 1;
     }
     return 0;

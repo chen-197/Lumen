@@ -540,12 +540,12 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 | F16 | CPU | 135.83 tok/s | 14.30 tok/s | 13.34 tok/s | 4796.53 ms |
 | BF16 | CPU | 146.23 tok/s | 15.48 tok/s | 14.44 tok/s | 4432.81 ms |
 | I8 weights + BF16 runtime | CPU | 143.73 tok/s | 24.28 tok/s | 21.79 tok/s | 2937.74 ms |
-| F32 | CUDA | 931.77 tok/s | 41.51 tok/s | 40.19 tok/s | 1592.42 ms |
-| F16 | CUDA | 382.31 tok/s | 29.13 tok/s | 27.62 tok/s | 2317.07 ms |
-| BF16 | CUDA | 386.51 tok/s | 29.12 tok/s | 27.67 tok/s | 2313.08 ms |
-| I8 weights + BF16 runtime | CUDA | 204.85 tok/s | 30.44 tok/s | 27.57 tok/s | 2320.99 ms |
+| F32 | CUDA | 998.25 tok/s | 41.72 tok/s | 40.45 tok/s | 1582.36 ms |
+| F16 | CUDA | 944.64 tok/s | 48.16 tok/s | 46.38 tok/s | 1379.94 ms |
+| BF16 | CUDA | 990.78 tok/s | 48.59 tok/s | 46.88 tok/s | 1365.20 ms |
+| I8 weights + BF16 runtime | CUDA | 310.71 tok/s | 64.92 tok/s | 56.69 tok/s | 1129.04 ms |
 
-单独运行的真实模型 F32 path checker 在 CPU/CUDA 上生成了完全一致且流畅的 32-token 文本，`replacement=0`、`control=0`；测得 CPU 推理吞吐为 7.16 tok/s，CUDA 为 36.20 tok/s。本轮性能结果表明真实生成仍明显 decode-bound：CUDA decode-forward 占测量时间约 91-97%。在本机上 CUDA F32 端到端最快，而 CPU I8+BF16 的 CPU decode 吞吐最高。
+单独运行的真实模型 F32 path checker 在 CPU/CUDA 上生成了完全一致且流畅的 32-token 文本，`replacement=0`、`control=0`；测得 CPU 推理吞吐为 7.16 tok/s，CUDA 为 36.20 tok/s。本轮性能结果表明真实生成仍明显 decode-bound：CUDA decode-forward 占测量时间约 85-97%。Device-only CUDA 热路径现在依靠默认 stream 保序，只在显式 Host 观察边界同步；同 dtype F16/BF16 decode QKV 和 GateUp 使用 cuBLAS `GemmEx` 计算并保持低精度存储。对齐且计算量足够大的 batched I8×I8 使用 signed-I8 cuBLAS GEMM 并精确累加到 I32；仅推理使用的 F16/BF16×I8 prefill 在设备端逐行动态量化激活后执行 INT8 GEMM，fused QKV/GateUp 会复用量化后的激活。训练路径保留直接 F16/BF16×I8 前向，使 F32 backward 对应同一个前向函数。该路径将 I8+BF16 prefill 从 258.52 提升到 310.71 tok/s，同时保持流畅输出，且 `replacement=0`、`control=0`；但 mixed-I8 prefill 仍明显慢于原生 F16/BF16 GEMM。
 
 ---
 

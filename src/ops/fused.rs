@@ -115,6 +115,40 @@ fn try_cuda_fused_gate_up_silu_typed(
     ))
 }
 
+fn try_cuda_same_lowp_gate_up_silu_matmul(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    up_weight: &Tensor,
+    rows: usize,
+    n_dim: usize,
+    k_dim: usize,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    let dtype = input.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16)
+        || gate_weight.dtype() != dtype
+        || up_weight.dtype() != dtype
+    {
+        return None;
+    }
+    let (_, input_buffer, _) = input.cloned_cuda_native_lowp_buffer()?;
+    let (_, gate_buffer, _) = gate_weight.cloned_cuda_native_lowp_buffer()?;
+    let (_, up_buffer, _) = up_weight.cloned_cuda_native_lowp_buffer()?;
+    Some((|| {
+        let (gate, up) = match dtype {
+            DType::F16 => (
+                cuda::matmul_f16_buffer_no_host(&input_buffer, &gate_buffer, rows, n_dim, k_dim)?,
+                cuda::matmul_f16_buffer_no_host(&input_buffer, &up_buffer, rows, n_dim, k_dim)?,
+            ),
+            DType::BF16 => (
+                cuda::matmul_bf16_buffer_no_host(&input_buffer, &gate_buffer, rows, n_dim, k_dim)?,
+                cuda::matmul_bf16_buffer_no_host(&input_buffer, &up_buffer, rows, n_dim, k_dim)?,
+            ),
+            DType::F32 | DType::I8 => unreachable!("checked same low-precision dtype above"),
+        };
+        cuda::silu_mul_f32_buffer_no_host(&gate, &up)
+    })())
+}
+
 fn try_cuda_fused_gate_up_silu_mixed_i8_matmul(
     input: &Tensor,
     gate_weight: &Tensor,
@@ -123,7 +157,7 @@ fn try_cuda_fused_gate_up_silu_mixed_i8_matmul(
     n_dim: usize,
     k_dim: usize,
 ) -> Option<Result<cuda::CudaBuffer, String>> {
-    if rows <= 1 {
+    if !is_no_grad() || rows <= 1 {
         return None;
     }
     let (gate_dtype, gate_buffer, gate_scale) = gate_weight.cloned_cuda_native_lowp_buffer()?;
@@ -135,47 +169,35 @@ fn try_cuda_fused_gate_up_silu_mixed_i8_matmul(
     let up_scale = up_scale?;
 
     if let Some((DType::BF16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
-        return Some((|| {
-            let gate = cuda::matmul_bf16_i8_buffer_no_host(
-                &input_buffer,
-                &gate_buffer,
-                gate_scale,
-                rows,
-                n_dim,
-                k_dim,
-            )?;
-            let up = cuda::matmul_bf16_i8_buffer_no_host(
-                &input_buffer,
-                &up_buffer,
-                up_scale,
-                rows,
-                n_dim,
-                k_dim,
-            )?;
-            cuda::silu_mul_f32_buffer_no_host(&gate, &up)
-        })());
+        return Some(cuda::fused_gate_up_silu_typed_buffer(
+            &input_buffer,
+            DType::BF16,
+            None,
+            &gate_buffer,
+            DType::I8,
+            Some(gate_scale),
+            &up_buffer,
+            Some(up_scale),
+            rows,
+            n_dim,
+            k_dim,
+        ));
     }
 
     if let Some((DType::F16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
-        return Some((|| {
-            let gate = cuda::matmul_f16_i8_buffer_no_host(
-                &input_buffer,
-                &gate_buffer,
-                gate_scale,
-                rows,
-                n_dim,
-                k_dim,
-            )?;
-            let up = cuda::matmul_f16_i8_buffer_no_host(
-                &input_buffer,
-                &up_buffer,
-                up_scale,
-                rows,
-                n_dim,
-                k_dim,
-            )?;
-            cuda::silu_mul_f32_buffer_no_host(&gate, &up)
-        })());
+        return Some(cuda::fused_gate_up_silu_typed_buffer(
+            &input_buffer,
+            DType::F16,
+            None,
+            &gate_buffer,
+            DType::I8,
+            Some(gate_scale),
+            &up_buffer,
+            Some(up_scale),
+            rows,
+            n_dim,
+            k_dim,
+        ));
     }
 
     if input.dtype() == DType::F32
@@ -342,63 +364,101 @@ fn try_cuda_fused_qkv_mixed_i8_matmul_buffer(
     let v_scale = v_scale?;
 
     if let Some((DType::BF16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
-        return Some((|| {
-            let q = cuda::matmul_bf16_i8_buffer_no_host(
-                &input_buffer,
-                &q_buffer,
-                q_scale,
-                rows,
-                q_n,
-                k_dim,
-            )?;
-            let k = cuda::matmul_bf16_i8_buffer_no_host(
-                &input_buffer,
-                &k_buffer,
-                k_scale,
-                rows,
-                k_n,
-                k_dim,
-            )?;
-            let v = cuda::matmul_bf16_i8_buffer_no_host(
-                &input_buffer,
-                &v_buffer,
-                v_scale,
-                rows,
-                k_n,
-                k_dim,
-            )?;
-            Ok((q, k, v))
-        })());
+        if !is_no_grad() {
+            return Some((|| {
+                Ok((
+                    cuda::matmul_bf16_i8_buffer_no_host(
+                        &input_buffer,
+                        &q_buffer,
+                        q_scale,
+                        rows,
+                        q_n,
+                        k_dim,
+                    )?,
+                    cuda::matmul_bf16_i8_buffer_no_host(
+                        &input_buffer,
+                        &k_buffer,
+                        k_scale,
+                        rows,
+                        k_n,
+                        k_dim,
+                    )?,
+                    cuda::matmul_bf16_i8_buffer_no_host(
+                        &input_buffer,
+                        &v_buffer,
+                        v_scale,
+                        rows,
+                        k_n,
+                        k_dim,
+                    )?,
+                ))
+            })());
+        }
+        return Some(cuda::fused_qkv_typed_buffer(
+            &input_buffer,
+            DType::BF16,
+            None,
+            &q_buffer,
+            &k_buffer,
+            &v_buffer,
+            DType::I8,
+            Some(q_scale),
+            Some(k_scale),
+            Some(v_scale),
+            rows,
+            q_n,
+            k_n,
+            k_dim,
+        ));
     }
 
     if let Some((DType::F16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
-        return Some((|| {
-            let q = cuda::matmul_f16_i8_buffer_no_host(
-                &input_buffer,
-                &q_buffer,
-                q_scale,
-                rows,
-                q_n,
-                k_dim,
-            )?;
-            let k = cuda::matmul_f16_i8_buffer_no_host(
-                &input_buffer,
-                &k_buffer,
-                k_scale,
-                rows,
-                k_n,
-                k_dim,
-            )?;
-            let v = cuda::matmul_f16_i8_buffer_no_host(
-                &input_buffer,
-                &v_buffer,
-                v_scale,
-                rows,
-                k_n,
-                k_dim,
-            )?;
-            Ok((q, k, v))
-        })());
+        if !is_no_grad() {
+            return Some((|| {
+                Ok((
+                    cuda::matmul_f16_i8_buffer_no_host(
+                        &input_buffer,
+                        &q_buffer,
+                        q_scale,
+                        rows,
+                        q_n,
+                        k_dim,
+                    )?,
+                    cuda::matmul_f16_i8_buffer_no_host(
+                        &input_buffer,
+                        &k_buffer,
+                        k_scale,
+                        rows,
+                        k_n,
+                        k_dim,
+                    )?,
+                    cuda::matmul_f16_i8_buffer_no_host(
+                        &input_buffer,
+                        &v_buffer,
+                        v_scale,
+                        rows,
+                        k_n,
+                        k_dim,
+                    )?,
+                ))
+            })());
+        }
+        return Some(cuda::fused_qkv_typed_buffer(
+            &input_buffer,
+            DType::F16,
+            None,
+            &q_buffer,
+            &k_buffer,
+            &v_buffer,
+            DType::I8,
+            Some(q_scale),
+            Some(k_scale),
+            Some(v_scale),
+            rows,
+            q_n,
+            k_n,
+            k_dim,
+        ));
     }
 
     if input.dtype() == DType::F32
@@ -452,6 +512,64 @@ fn try_cuda_fused_qkv_typed_output_buffer(
     }
     if q_weight.dtype() != k_weight.dtype() || q_weight.dtype() != v_weight.dtype() {
         return None;
+    }
+    if input.dtype() == output_dtype
+        && q_weight.dtype() == output_dtype
+        && matches!(output_dtype, DType::F16 | DType::BF16)
+    {
+        let (_, input_buffer, _) = input.cloned_cuda_native_lowp_buffer()?;
+        let (_, q_buffer, _) = q_weight.cloned_cuda_native_lowp_buffer()?;
+        let (_, k_buffer, _) = k_weight.cloned_cuda_native_lowp_buffer()?;
+        let (_, v_buffer, _) = v_weight.cloned_cuda_native_lowp_buffer()?;
+        return Some((|| match output_dtype {
+            DType::F16 => Ok((
+                cuda::matmul_f16_typed_output_buffer_no_host(
+                    &input_buffer,
+                    &q_buffer,
+                    rows,
+                    q_n,
+                    k_dim,
+                )?,
+                cuda::matmul_f16_typed_output_buffer_no_host(
+                    &input_buffer,
+                    &k_buffer,
+                    rows,
+                    k_n,
+                    k_dim,
+                )?,
+                cuda::matmul_f16_typed_output_buffer_no_host(
+                    &input_buffer,
+                    &v_buffer,
+                    rows,
+                    k_n,
+                    k_dim,
+                )?,
+            )),
+            DType::BF16 => Ok((
+                cuda::matmul_bf16_typed_output_buffer_no_host(
+                    &input_buffer,
+                    &q_buffer,
+                    rows,
+                    q_n,
+                    k_dim,
+                )?,
+                cuda::matmul_bf16_typed_output_buffer_no_host(
+                    &input_buffer,
+                    &k_buffer,
+                    rows,
+                    k_n,
+                    k_dim,
+                )?,
+                cuda::matmul_bf16_typed_output_buffer_no_host(
+                    &input_buffer,
+                    &v_buffer,
+                    rows,
+                    k_n,
+                    k_dim,
+                )?,
+            )),
+            DType::F32 | DType::I8 => unreachable!("checked low-precision output dtype above"),
+        })());
     }
     let (input_dtype, input_buffer, input_scale) = cuda_fused_storage_buffer(input)?;
     let (q_dtype, q_buffer, q_scale) = cuda_fused_storage_buffer(q_weight)?;
@@ -2060,19 +2178,28 @@ pub(crate) fn fused_gate_up_silu_decode_f32(
     );
 
     if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
-        let cuda_out =
+        let cuda_out = try_cuda_same_lowp_gate_up_silu_matmul(
+            input,
+            gate_weight,
+            up_weight,
+            m_dim,
+            n_dim,
+            k_dim,
+        )
+        .or_else(|| {
             try_cuda_fused_gate_up_silu_typed(input, gate_weight, up_weight, m_dim, n_dim, k_dim)
-                .unwrap_or_else(|| {
-                    input.with_cuda_f32_buffer(|input_buf| {
-                        gate_weight.with_cuda_f32_buffer(|gate_buf| {
-                            up_weight.with_cuda_f32_buffer(|up_buf| {
-                                cuda::fused_gate_up_silu_f32_buffer(
-                                    input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim,
-                                )
-                            })
-                        })
+        })
+        .unwrap_or_else(|| {
+            input.with_cuda_f32_buffer(|input_buf| {
+                gate_weight.with_cuda_f32_buffer(|gate_buf| {
+                    up_weight.with_cuda_f32_buffer(|up_buf| {
+                        cuda::fused_gate_up_silu_f32_buffer(
+                            input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim,
+                        )
                     })
-                });
+                })
+            })
+        });
         if let Ok(buffer) = cuda_out {
             let mut out_shape = x_shape;
             let last = out_shape.len() - 1;

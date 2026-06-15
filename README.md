@@ -540,12 +540,12 @@ The TinyLlama rerun used `prompt_tokens=43`, `max_gen=64`, greedy decode, 3 meas
 | F16 | CPU | 135.83 tok/s | 14.30 tok/s | 13.34 tok/s | 4796.53 ms |
 | BF16 | CPU | 146.23 tok/s | 15.48 tok/s | 14.44 tok/s | 4432.81 ms |
 | I8 weights + BF16 runtime | CPU | 143.73 tok/s | 24.28 tok/s | 21.79 tok/s | 2937.74 ms |
-| F32 | CUDA | 931.77 tok/s | 41.51 tok/s | 40.19 tok/s | 1592.42 ms |
-| F16 | CUDA | 382.31 tok/s | 29.13 tok/s | 27.62 tok/s | 2317.07 ms |
-| BF16 | CUDA | 386.51 tok/s | 29.12 tok/s | 27.67 tok/s | 2313.08 ms |
-| I8 weights + BF16 runtime | CUDA | 204.85 tok/s | 30.44 tok/s | 27.57 tok/s | 2320.99 ms |
+| F32 | CUDA | 998.25 tok/s | 41.72 tok/s | 40.45 tok/s | 1582.36 ms |
+| F16 | CUDA | 944.64 tok/s | 48.16 tok/s | 46.38 tok/s | 1379.94 ms |
+| BF16 | CUDA | 990.78 tok/s | 48.59 tok/s | 46.88 tok/s | 1365.20 ms |
+| I8 weights + BF16 runtime | CUDA | 310.71 tok/s | 64.92 tok/s | 56.69 tok/s | 1129.04 ms |
 
-The separate real-model F32 path checker generated identical fluent CPU/CUDA text for 32 tokens, with `replacement=0` and `control=0`; measured inference throughput was 7.16 tok/s on CPU and 36.20 tok/s on CUDA. The performance rerun shows that real generation is still decode-bound: CUDA decode-forward accounts for roughly 91-97% of measured time. CUDA F32 is fastest end to end on this machine, while CPU I8+BF16 has the strongest CPU decode throughput.
+The separate real-model F32 path checker generated identical fluent CPU/CUDA text for 32 tokens, with `replacement=0` and `control=0`; measured inference throughput was 7.16 tok/s on CPU and 36.20 tok/s on CUDA. The performance rerun shows that real generation is still decode-bound: CUDA decode-forward accounts for roughly 85-97% of measured time. Device-only CUDA hot paths now rely on default-stream ordering and synchronize only at explicit host-observation boundaries. Same-dtype F16/BF16 decode QKV and GateUp use cuBLAS `GemmEx` while preserving low-precision storage. Aligned and sufficiently large batched I8×I8 use signed-I8 cuBLAS GEMM with exact I32 accumulation. Inference-only F16/BF16×I8 prefill uses device-resident row-wise activation quantization before INT8 GEMM, and fused QKV/GateUp reuse the quantized activation. Training keeps direct F16/BF16×I8 forward computation so its F32 backward differentiates the same function. This raised I8+BF16 prefill from 258.52 to 310.71 tok/s while preserving fluent output with `replacement=0` and `control=0`; mixed-I8 prefill is still materially slower than native F16/BF16 GEMM.
 
 ---
 

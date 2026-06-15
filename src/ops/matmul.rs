@@ -6258,18 +6258,26 @@ fn try_cuda_matmul_native_low_precision_buffer(
     if let (Some((DType::BF16, a_buffer, _)), Some((DType::I8, b_buffer, Some(b_scale)))) =
         (&a_native, &b_native)
     {
-        return cuda::matmul_bf16_i8_buffer_no_host(
-            a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
-        )
+        return if is_no_grad() {
+            cuda::matmul_bf16_i8_dynamic_buffer_no_host(
+                a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
+            )
+        } else {
+            cuda::matmul_bf16_i8_buffer_no_host(a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim)
+        }
         .ok();
     }
 
     if let (Some((DType::F16, a_buffer, _)), Some((DType::I8, b_buffer, Some(b_scale)))) =
         (&a_native, &b_native)
     {
-        return cuda::matmul_f16_i8_buffer_no_host(
-            a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
-        )
+        return if is_no_grad() {
+            cuda::matmul_f16_i8_dynamic_buffer_no_host(
+                a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
+            )
+        } else {
+            cuda::matmul_f16_i8_buffer_no_host(a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim)
+        }
         .ok();
     }
 
@@ -10064,6 +10072,207 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_resident_aligned_i8_matmul_matches_i32_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let (m, n, k) = (11, 20, 36);
+        let a_scale = 0.03125f32;
+        let b_scale = 0.0625f32;
+        let a = (0..m * k)
+            .map(|i| ((((i * 17 + 3) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let b = (0..n * k)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let a_buf = crate::ops::cuda::upload_i8_storage(&a).expect("upload aligned i8 matmul a");
+        let b_buf = crate::ops::cuda::upload_i8_storage(&b).expect("upload aligned i8 matmul b");
+        let out =
+            crate::ops::cuda::matmul_i8_buffer_no_host(&a_buf, a_scale, &b_buf, b_scale, m, n, k)
+                .expect("CUDA aligned resident i8 matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download aligned i8 matmul");
+
+        for row in 0..m {
+            for col in 0..n {
+                let acc = (0..k)
+                    .map(|kk| (a[row * k + kk] as i32) * (b[col * k + kk] as i32))
+                    .sum::<i32>();
+                let expected = (acc as f32) * (a_scale * b_scale);
+                assert_eq!(
+                    got[row * n + col],
+                    expected,
+                    "aligned cuBLAS i8 matmul drifted at row={row}, col={col}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_bf16_i8_dynamic_matmul_stays_within_quantization_bound() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let (m, n, k) = (8, 12, 32);
+        let b_scale = 0.03125f32;
+        let a = (0..m * k)
+            .map(|i| bf16::from_f32(((i * 37 % 257) as f32 - 128.0) / 31.0))
+            .collect::<Vec<_>>();
+        let b = (0..n * k)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let a_bits = a.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let a_buf =
+            crate::ops::cuda::upload_u16_storage(&a_bits).expect("upload dynamic bf16 matmul a");
+        let b_buf = crate::ops::cuda::upload_i8_storage(&b).expect("upload dynamic i8 matmul b");
+        let out = crate::ops::cuda::matmul_bf16_i8_dynamic_buffer_no_host(
+            &a_buf, &b_buf, b_scale, m, n, k,
+        )
+        .expect("CUDA dynamic BF16xI8 matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download dynamic BF16xI8 matmul");
+
+        for row in 0..m {
+            let row_max = a[row * k..(row + 1) * k]
+                .iter()
+                .map(|value| value.to_f32().abs())
+                .fold(0.0f32, f32::max);
+            let activation_scale = (row_max / 127.0).max(f32::MIN_POSITIVE);
+            for col in 0..n {
+                let mut expected = 0.0f32;
+                let mut weight_l1 = 0.0f32;
+                for kk in 0..k {
+                    let weight = (b[col * k + kk] as f32) * b_scale;
+                    expected += a[row * k + kk].to_f32() * weight;
+                    weight_l1 += weight.abs();
+                }
+                let error_bound = 0.5 * activation_scale * weight_l1 + 2.0e-4;
+                let error = (got[row * n + col] - expected).abs();
+                assert!(
+                    error <= error_bound,
+                    "dynamic BF16xI8 error {error} exceeded bound {error_bound} at row={row}, col={col}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_f16_i8_dynamic_matmul_stays_within_quantization_bound() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let (m, n, k) = (8, 12, 32);
+        let b_scale = 0.03125f32;
+        let a = (0..m * k)
+            .map(|i| f16::from_f32(((i * 37 % 257) as f32 - 128.0) / 31.0))
+            .collect::<Vec<_>>();
+        let b = (0..n * k)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let a_bits = a.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let a_buf =
+            crate::ops::cuda::upload_u16_storage(&a_bits).expect("upload dynamic f16 matmul a");
+        let b_buf = crate::ops::cuda::upload_i8_storage(&b).expect("upload dynamic i8 matmul b");
+        let out = crate::ops::cuda::matmul_f16_i8_dynamic_buffer_no_host(
+            &a_buf, &b_buf, b_scale, m, n, k,
+        )
+        .expect("CUDA dynamic F16xI8 matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download dynamic F16xI8 matmul");
+
+        for row in 0..m {
+            let row_max = a[row * k..(row + 1) * k]
+                .iter()
+                .map(|value| value.to_f32().abs())
+                .fold(0.0f32, f32::max);
+            let activation_scale = (row_max / 127.0).max(f32::MIN_POSITIVE);
+            for col in 0..n {
+                let mut expected = 0.0f32;
+                let mut weight_l1 = 0.0f32;
+                for kk in 0..k {
+                    let weight = (b[col * k + kk] as f32) * b_scale;
+                    expected += a[row * k + kk].to_f32() * weight;
+                    weight_l1 += weight.abs();
+                }
+                let error_bound = 0.5 * activation_scale * weight_l1 + 2.0e-4;
+                let error = (got[row * n + col] - expected).abs();
+                assert!(
+                    error <= error_bound,
+                    "dynamic F16xI8 error {error} exceeded bound {error_bound} at row={row}, col={col}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_dynamic_floatlike_i8_matmul_preserves_non_finite_failure_signal() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let (m, n, k) = (8, 12, 32);
+        let mut a = vec![bf16::from_f32(0.5); m * k];
+        a[7] = bf16::INFINITY;
+        let b = vec![1i8; n * k];
+        let a_bits = a.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let a_buf =
+            crate::ops::cuda::upload_u16_storage(&a_bits).expect("upload non-finite bf16 matmul a");
+        let b_buf = crate::ops::cuda::upload_i8_storage(&b).expect("upload non-finite i8 matmul b");
+        let out = crate::ops::cuda::matmul_bf16_i8_dynamic_buffer_no_host(
+            &a_buf, &b_buf, 0.03125, m, n, k,
+        )
+        .expect("CUDA dynamic non-finite BF16xI8 matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download non-finite BF16xI8 matmul");
+
+        assert!(
+            got[..n].iter().all(|value| !value.is_finite()),
+            "dynamic quantization must not hide a non-finite activation row"
+        );
+        assert!(
+            got[n..].iter().all(|value| value.is_finite()),
+            "finite activation rows should remain finite"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_training_bf16_i8_matmul_uses_direct_forward_for_f32_backward_consistency() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let (m, n, k) = (8, 12, 32);
+        let a_values = (0..m * k)
+            .map(|i| ((i * 37 % 257) as f32 - 128.0) / 31.0)
+            .collect::<Vec<_>>();
+        let b_values = (0..n * k)
+            .map(|i| ((i * 29 % 251) as f32 - 125.0) / 29.0)
+            .collect::<Vec<_>>();
+        let a_cpu = make_training_tensor(&[m, k], a_values, DType::BF16);
+        let b_cpu = make_training_tensor(&[n, k], b_values, DType::I8);
+        let a_cuda = a_cpu.to_cuda();
+        let b_cuda = b_cpu.to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out_cuda = matmul(&a_cuda, &b_cuda);
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+        let out_cpu = matmul(&a_cpu, &b_cpu);
+
+        for (got, expected) in out_cuda.data_ref().iter().zip(out_cpu.data_ref().iter()) {
+            assert!(
+                (got - expected).abs() < 3e-2,
+                "training BF16xI8 forward drifted from direct CPU function: got={got}, expected={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_resident_bf16_i8_matmul_matches_cpu_reference_without_host_f32() {
         if !crate::ops::cuda::is_available() {
             return;
@@ -10673,6 +10882,59 @@ mod tests {
                     assert_eq!(
                         got[idx], expected,
                         "tiled i8 batch_matmul drifted at batch={batch}, row={row}, col={col}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_aligned_i8_batch_matmul_matches_i32_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let (batch_count, m, n, k) = (2, 32, 64, 256);
+        let lhs_scale = 0.03125f32;
+        let rhs_scale = 0.0625f32;
+        let lhs = (0..batch_count * m * k)
+            .map(|i| ((((i * 17 + 3) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let rhs = (0..batch_count * k * n)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let lhs_buf =
+            crate::ops::cuda::upload_i8_storage(&lhs).expect("upload aligned i8 batch lhs");
+        let rhs_buf =
+            crate::ops::cuda::upload_i8_storage(&rhs).expect("upload aligned i8 batch rhs");
+        let out = crate::ops::cuda::batch_matmul_i8_buffer_no_host(
+            &lhs_buf,
+            lhs_scale,
+            &rhs_buf,
+            rhs_scale,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .expect("CUDA aligned resident i8 batch matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download aligned i8 batch matmul");
+
+        for batch in 0..batch_count {
+            for row in 0..m {
+                for col in 0..n {
+                    let acc = (0..k)
+                        .map(|kk| {
+                            (lhs[batch * m * k + row * k + kk] as i32)
+                                * (rhs[batch * k * n + kk * n + col] as i32)
+                        })
+                        .sum::<i32>();
+                    let idx = batch * m * n + row * n + col;
+                    assert_eq!(
+                        got[idx],
+                        (acc as f32) * (lhs_scale * rhs_scale),
+                        "aligned cuBLAS i8 batch_matmul drifted at batch={batch}, row={row}, col={col}"
                     );
                 }
             }
@@ -11558,22 +11820,29 @@ mod tests {
             max_err(&i8_vals)
         );
 
-        let f16_i8_out =
-            crate::ops::cuda::matmul_f16_i8_buffer_no_host(&a_f16_buf, &b_i8_buf, 0.05, m, n, k)
-                .expect("CUDA F16xI8 matmul perf path");
+        let f16_i8_out = crate::ops::cuda::matmul_f16_i8_dynamic_buffer_no_host(
+            &a_f16_buf, &b_i8_buf, 0.05, m, n, k,
+        )
+        .expect("CUDA dynamic F16xI8 matmul perf path");
         let f16_i8_us = median_cuda_us(|| {
-            let _ = crate::ops::cuda::matmul_f16_i8_buffer_no_host(
+            let _ = crate::ops::cuda::matmul_f16_i8_dynamic_buffer_no_host(
                 &a_f16_buf, &b_i8_buf, 0.05, m, n, k,
             )
-            .expect("CUDA F16xI8 matmul performance sample");
+            .expect("CUDA dynamic F16xI8 matmul performance sample");
         });
         let f16_i8_vals =
             crate::ops::cuda::download_f32(&f16_i8_out).expect("download F16xI8 matmul");
-        let bf16_i8_out =
-            crate::ops::cuda::matmul_bf16_i8_buffer_no_host(&a_bf16_buf, &b_i8_buf, 0.05, m, n, k)
-                .expect("CUDA BF16xI8 matmul perf path");
+        let bf16_i8_out = crate::ops::cuda::matmul_bf16_i8_dynamic_buffer_no_host(
+            &a_bf16_buf,
+            &b_i8_buf,
+            0.05,
+            m,
+            n,
+            k,
+        )
+        .expect("CUDA dynamic BF16xI8 matmul perf path");
         let bf16_i8_us = median_cuda_us(|| {
-            let _ = crate::ops::cuda::matmul_bf16_i8_buffer_no_host(
+            let _ = crate::ops::cuda::matmul_bf16_i8_dynamic_buffer_no_host(
                 &a_bf16_buf,
                 &b_i8_buf,
                 0.05,
@@ -11581,7 +11850,7 @@ mod tests {
                 n,
                 k,
             )
-            .expect("CUDA BF16xI8 matmul performance sample");
+            .expect("CUDA dynamic BF16xI8 matmul performance sample");
         });
         let bf16_i8_vals =
             crate::ops::cuda::download_f32(&bf16_i8_out).expect("download BF16xI8 matmul");

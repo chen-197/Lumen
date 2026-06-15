@@ -205,7 +205,7 @@ extern "C" int lumen_cuda_append_kv_cache_f32_device(
         dst_seq_len,
         dim,
         dst_start);
-    if (!sync_cuda("CUDA KV cache append kernel failed")) {
+    if (!check_cuda_launch("CUDA KV cache append kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -250,7 +250,7 @@ extern "C" int lumen_cuda_kv_cache_prefix_f32_device(
         active_seq_len,
         src_seq_len,
         dim);
-    if (!sync_cuda("CUDA KV cache prefix kernel failed")) {
+    if (!check_cuda_launch("CUDA KV cache prefix kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -324,7 +324,7 @@ extern "C" int lumen_cuda_kv_cache_prefix_typed_device(
             set_error("unsupported dtype for CUDA typed KV cache prefix");
             return 1;
     }
-    if (!sync_cuda("CUDA typed KV cache prefix kernel failed")) {
+    if (!check_cuda_launch("CUDA typed KV cache prefix kernel launch failed")) {
         return 1;
     }
     return 0;

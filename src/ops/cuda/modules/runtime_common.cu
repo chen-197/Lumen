@@ -907,6 +907,8 @@ bool sync_cuda(const char* context) {
 }
 
 bool check_cuda_launch(const char* context) {
+    // Device-only operations run on the default stream and remain ordered without
+    // blocking the host. Synchronize only at explicit host-observation boundaries.
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         set_cuda_error(context, status);

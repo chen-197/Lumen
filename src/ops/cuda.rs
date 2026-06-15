@@ -537,6 +537,24 @@ mod imp {
             n: usize,
             k: usize,
         ) -> c_int;
+        fn lumen_cuda_matmul_bf16_i8_dynamic_device(
+            a_handle: u64,
+            b_handle: u64,
+            b_scale: f32,
+            out_handle: u64,
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> c_int;
+        fn lumen_cuda_matmul_f16_i8_dynamic_device(
+            a_handle: u64,
+            b_handle: u64,
+            b_scale: f32,
+            out_handle: u64,
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> c_int;
         fn lumen_cuda_matmul_f32_i8_device(
             a_handle: u64,
             b_handle: u64,
@@ -3531,6 +3549,64 @@ mod imp {
         let out = alloc_f32(m * n)?;
         let status = unsafe {
             lumen_cuda_matmul_f16_i8_device(a.handle(), b.handle(), b_scale, out.handle(), m, n, k)
+        };
+        if status != 0 {
+            return Err(last_error_message());
+        }
+        Ok(out)
+    }
+
+    pub fn matmul_bf16_i8_dynamic_buffer_no_host(
+        a: &CudaBuffer,
+        b: &CudaBuffer,
+        b_scale: f32,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<CudaBuffer, String> {
+        if a.len() != m * k || b.len() != n * k {
+            return Err("CUDA dynamic BF16xI8 matmul input length mismatch".to_string());
+        }
+        let out = alloc_f32(m * n)?;
+        let status = unsafe {
+            lumen_cuda_matmul_bf16_i8_dynamic_device(
+                a.handle(),
+                b.handle(),
+                b_scale,
+                out.handle(),
+                m,
+                n,
+                k,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_message());
+        }
+        Ok(out)
+    }
+
+    pub fn matmul_f16_i8_dynamic_buffer_no_host(
+        a: &CudaBuffer,
+        b: &CudaBuffer,
+        b_scale: f32,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<CudaBuffer, String> {
+        if a.len() != m * k || b.len() != n * k {
+            return Err("CUDA dynamic F16xI8 matmul input length mismatch".to_string());
+        }
+        let out = alloc_f32(m * n)?;
+        let status = unsafe {
+            lumen_cuda_matmul_f16_i8_dynamic_device(
+                a.handle(),
+                b.handle(),
+                b_scale,
+                out.handle(),
+                m,
+                n,
+                k,
+            )
         };
         if status != 0 {
             return Err(last_error_message());
@@ -15157,6 +15233,28 @@ pub fn matmul_f16_i8_buffer_no_host(
     k: usize,
 ) -> Result<CudaBuffer, String> {
     imp::matmul_f16_i8_buffer_no_host(a, b, b_scale, m, n, k)
+}
+
+pub fn matmul_bf16_i8_dynamic_buffer_no_host(
+    a: &CudaBuffer,
+    b: &CudaBuffer,
+    b_scale: f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaBuffer, String> {
+    imp::matmul_bf16_i8_dynamic_buffer_no_host(a, b, b_scale, m, n, k)
+}
+
+pub fn matmul_f16_i8_dynamic_buffer_no_host(
+    a: &CudaBuffer,
+    b: &CudaBuffer,
+    b_scale: f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaBuffer, String> {
+    imp::matmul_f16_i8_dynamic_buffer_no_host(a, b, b_scale, m, n, k)
 }
 
 pub fn matmul_f32_i8_buffer_no_host(

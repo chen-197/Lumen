@@ -1006,7 +1006,7 @@ extern "C" int lumen_cuda_decode_attention_f32_device(
         n_rep,
         rows,
         scale);
-    if (!sync_cuda("CUDA decode attention kernel failed")) {
+    if (!check_cuda_launch("CUDA decode attention kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -1085,7 +1085,7 @@ extern "C" int lumen_cuda_prefill_attention_f32_device(
         rows,
         scale,
         is_causal);
-    if (!sync_cuda("CUDA prefill attention kernel failed")) {
+    if (!check_cuda_launch("CUDA prefill attention kernel launch failed")) {
         return 1;
     }
     return 0;

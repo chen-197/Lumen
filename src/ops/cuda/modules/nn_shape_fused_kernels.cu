@@ -1982,7 +1982,7 @@ int launch_fused_gate_up_silu_typed(
                 out,
                 n_dim,
                 k_dim);
-        return sync_cuda("CUDA typed fused gate/up matvec kernel failed") ? 0 : 1;
+        return check_cuda_launch("CUDA typed fused gate/up matvec kernel launch failed") ? 0 : 1;
     }
     const unsigned int grid_size = linear_grid_size(len, block_size);
     fused_gate_up_silu_typed_kernel<InputT, WeightT><<<grid_size, block_size>>>(
@@ -1996,7 +1996,7 @@ int launch_fused_gate_up_silu_typed(
         rows,
         n_dim,
         k_dim);
-    return sync_cuda("CUDA typed fused gate/up kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed fused gate/up kernel launch failed") ? 0 : 1;
 }
 
 template <typename InputT, typename WeightT, typename OutputT>
@@ -2025,7 +2025,7 @@ int launch_fused_gate_up_silu_typed_out(
         rows,
         n_dim,
         k_dim);
-    return sync_cuda("CUDA typed fused gate/up output kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed fused gate/up output kernel launch failed") ? 0 : 1;
 }
 
 template <typename InputT, typename WeightT>
@@ -2144,7 +2144,7 @@ int launch_fused_qkv_matvec_typed(
             q_n,
             k_n,
             k_dim);
-    return sync_cuda("CUDA typed fused qkv matvec kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed fused qkv matvec kernel launch failed") ? 0 : 1;
 }
 
 template <typename InputT, typename WeightT, typename OutputT>
@@ -2364,7 +2364,7 @@ int dispatch_fused_qkv_weight_typed(
             "CUDA typed fused v projection launch failed") != 0) {
         return 1;
     }
-    return sync_cuda("CUDA typed fused qkv kernels failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed fused qkv kernels launch failed") ? 0 : 1;
 }
 
 template <typename InputT, typename OutputT>
@@ -2487,7 +2487,7 @@ int dispatch_fused_qkv_weight_typed_out(
             "CUDA typed fused v projection output launch failed") != 0) {
         return 1;
     }
-    return sync_cuda("CUDA typed fused qkv output kernels failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed fused qkv output kernels launch failed") ? 0 : 1;
 }
 
 template <typename InputT>

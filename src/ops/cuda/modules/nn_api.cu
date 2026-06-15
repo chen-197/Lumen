@@ -408,7 +408,7 @@ extern "C" int lumen_cuda_embedding_f32_device(
         vocab_size,
         embed_dim,
         d_status);
-    if (!sync_cuda("CUDA embedding kernel failed")) {
+    if (!check_cuda_launch("CUDA embedding kernel launch failed")) {
         return 1;
     }
     if (!read_embedding_status(
@@ -502,7 +502,7 @@ extern "C" int lumen_cuda_embedding_typed_device(
             set_error("CUDA typed embedding received unsupported weight dtype");
             return 1;
     }
-    if (!sync_cuda("CUDA typed embedding kernel failed")) {
+    if (!check_cuda_launch("CUDA typed embedding kernel launch failed")) {
         return 1;
     }
     if (!read_embedding_status(
@@ -581,7 +581,7 @@ extern "C" int lumen_cuda_embedding_typed_same_dtype_device(
             set_error("CUDA native embedding received unsupported weight dtype");
             return 1;
     }
-    if (!sync_cuda("CUDA native embedding kernel failed")) {
+    if (!check_cuda_launch("CUDA native embedding kernel launch failed")) {
         return 1;
     }
     if (!read_embedding_status(

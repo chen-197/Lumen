@@ -30,7 +30,23 @@ impl CudaBuffer {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
+
+pub type CudaHostBuffer = (CudaBuffer, Vec<f32>);
+pub type CudaTwoHostBuffers = (CudaHostBuffer, CudaHostBuffer);
+pub type CudaThreeHostBuffers = (CudaHostBuffer, CudaHostBuffer, CudaHostBuffer);
+pub type CudaAdamHostState = (Vec<f32>, Vec<f32>, Vec<f32>);
+pub type CudaConv2dBackwardHostBuffers = (
+    CudaBuffer,
+    Vec<f32>,
+    CudaBuffer,
+    Vec<f32>,
+    Option<CudaHostBuffer>,
+);
 
 pub fn set_enabled(_enabled: bool) {}
 
@@ -398,6 +414,28 @@ pub fn matmul_bf16_i8_buffer_no_host(
 }
 
 pub fn matmul_f16_i8_buffer_no_host(
+    _a: &CudaBuffer,
+    _b: &CudaBuffer,
+    _b_scale: f32,
+    _m: usize,
+    _n: usize,
+    _k: usize,
+) -> Result<CudaBuffer, String> {
+    Err("CUDA feature is disabled".to_string())
+}
+
+pub fn matmul_bf16_i8_dynamic_buffer_no_host(
+    _a: &CudaBuffer,
+    _b: &CudaBuffer,
+    _b_scale: f32,
+    _m: usize,
+    _n: usize,
+    _k: usize,
+) -> Result<CudaBuffer, String> {
+    Err("CUDA feature is disabled".to_string())
+}
+
+pub fn matmul_f16_i8_dynamic_buffer_no_host(
     _a: &CudaBuffer,
     _b: &CudaBuffer,
     _b_scale: f32,
@@ -1477,7 +1515,7 @@ pub fn binary_backward_f32(
     _rhs: &CudaBuffer,
     _grad: &CudaBuffer,
     _op: BinaryOp,
-) -> Result<((CudaBuffer, Vec<f32>), (CudaBuffer, Vec<f32>)), String> {
+) -> Result<CudaTwoHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -1520,7 +1558,7 @@ pub fn binary_broadcast_backward_f32(
     _rhs_shape: &[usize],
     _out_shape: &[usize],
     _op: BinaryOp,
-) -> Result<((CudaBuffer, Vec<f32>), (CudaBuffer, Vec<f32>)), String> {
+) -> Result<CudaTwoHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -1663,10 +1701,7 @@ pub fn mse_forward_typed(
     Err("CUDA feature is disabled".to_string())
 }
 
-pub fn mse_backward_f32(
-    _diff: &CudaBuffer,
-    _factor: f32,
-) -> Result<((CudaBuffer, Vec<f32>), (CudaBuffer, Vec<f32>)), String> {
+pub fn mse_backward_f32(_diff: &CudaBuffer, _factor: f32) -> Result<CudaTwoHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -1818,7 +1853,7 @@ pub fn adam_update_f32(
     _bias_correction1: f32,
     _bias_correction2: f32,
     _eps: f32,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+) -> Result<CudaAdamHostState, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -2123,7 +2158,7 @@ pub fn rms_norm_backward_f32(
     _rows: usize,
     _dim: usize,
     _eps: f32,
-) -> Result<((CudaBuffer, Vec<f32>), (CudaBuffer, Vec<f32>)), String> {
+) -> Result<CudaTwoHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -2150,7 +2185,7 @@ pub fn rms_norm_backward_typed(
     _rows: usize,
     _dim: usize,
     _eps: f32,
-) -> Result<((CudaBuffer, Vec<f32>), (CudaBuffer, Vec<f32>)), String> {
+) -> Result<CudaTwoHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -2477,14 +2512,7 @@ pub fn fused_qkv_f32(
     _q_n: usize,
     _k_n: usize,
     _k_dim: usize,
-) -> Result<
-    (
-        (CudaBuffer, Vec<f32>),
-        (CudaBuffer, Vec<f32>),
-        (CudaBuffer, Vec<f32>),
-    ),
-    String,
-> {
+) -> Result<CudaThreeHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
@@ -2747,16 +2775,7 @@ pub fn conv2d_backward_f32(
     _pad_w: usize,
     _stride_h: usize,
     _stride_w: usize,
-) -> Result<
-    (
-        CudaBuffer,
-        Vec<f32>,
-        CudaBuffer,
-        Vec<f32>,
-        Option<(CudaBuffer, Vec<f32>)>,
-    ),
-    String,
-> {
+) -> Result<CudaConv2dBackwardHostBuffers, String> {
     Err("CUDA feature is disabled".to_string())
 }
 
