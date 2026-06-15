@@ -15,7 +15,7 @@ use lumen::tokenizer::LlamaTokenizer;
 
 use ndarray::{Array, Array1, Ix3, s};
 use ndarray_rand::RandomExt;
-use rand_distr::Uniform;
+use ndarray_rand::rand_distr::Uniform;
 
 use std::env;
 use std::io::{self, Write};
@@ -274,10 +274,10 @@ fn parse_args() -> Result<Args, String> {
     if max_seq_len == 0 {
         return Err("--max-seq-len 必须 > 0".to_string());
     }
-    if let Some(scale) = quant_scale {
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err("--quant-scale 必须是有限且 > 0 的 f32".to_string());
-        }
+    if let Some(scale) = quant_scale
+        && (!scale.is_finite() || scale <= 0.0)
+    {
+        return Err("--quant-scale 必须是有限且 > 0 的 f32".to_string());
     }
     if let Some(dtype) = quantize_dtype {
         if !dtype.is_integer() {

@@ -104,4 +104,47 @@ mod tests {
             );
         }
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_dropout_bf16_input_keeps_native_storage_and_f32_grad_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let dropout = Dropout::new(0.5);
+        let input_cuda = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 4]), (0..8).map(|i| i as f32 - 3.0).collect())
+                .expect("input shape mismatch")
+                .into_dyn(),
+            crate::precision::DType::BF16,
+        )
+        .to_cuda();
+        let coeff_cuda = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(
+                IxDyn(&[2, 4]),
+                vec![0.25, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0],
+            )
+            .expect("coeff shape mismatch")
+            .into_dyn(),
+            false,
+        )
+        .to_cuda();
+        assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(input_cuda.0.borrow().cuda_bf16_data.is_some());
+
+        crate::ops::cuda::set_enabled(true);
+        set_strict_device_execution(true);
+        let out = dropout.forward(input_cuda.clone());
+        assert!(out.is_cuda());
+        assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
+        let loss = crate::ops::arithmetic::sum(&(&out * &coeff_cuda));
+        loss.backward();
+        assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(input_cuda.0.borrow().cuda_bf16_data.is_some());
+        assert!(input_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(!input_cuda.has_host_grad());
+        set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
 }

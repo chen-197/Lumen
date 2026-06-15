@@ -250,6 +250,60 @@ impl Linear {
     }
 }
 
+impl Module for Linear {
+    fn forward(&self, input: Tensor) -> Tensor {
+        let y = matmul(&input, &self.weight);
+
+        if let Some(bias) = &self.bias {
+            if is_no_grad() {
+                let bias_vals = bias.with_storage_view(|bias_view| match bias_view {
+                    TensorStorageView::F32(bias_view) => {
+                        let bias_1d = bias_view
+                            .into_dimensionality::<Ix1>()
+                            .expect("Linear bias must be 1D [out]");
+                        bias_1d.iter().copied().collect::<Vec<f32>>()
+                    }
+                    TensorStorageView::F16(bias_view) => {
+                        let bias_1d = bias_view
+                            .into_dimensionality::<Ix1>()
+                            .expect("Linear bias must be 1D [out]");
+                        bias_1d.iter().map(|v| v.to_f32()).collect::<Vec<f32>>()
+                    }
+                    TensorStorageView::BF16(bias_view) => {
+                        let bias_1d = bias_view
+                            .into_dimensionality::<Ix1>()
+                            .expect("Linear bias must be 1D [out]");
+                        bias_1d.iter().map(|v| v.to_f32()).collect::<Vec<f32>>()
+                    }
+                });
+
+                {
+                    let mut y_data = y.data_mut();
+                    let last_axis = Axis(y_data.ndim() - 1);
+                    for mut lane in y_data.lanes_mut(last_axis) {
+                        for (dst, &b) in lane.iter_mut().zip(bias_vals.iter()) {
+                            *dst += b;
+                        }
+                    }
+                }
+                y
+            } else {
+                y + bias.clone()
+            }
+        } else {
+            y
+        }
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = vec![self.weight.clone()];
+        if let Some(b) = &self.bias {
+            params.push(b.clone());
+        }
+        params
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,59 +430,5 @@ mod tests {
                 });
             },
         );
-    }
-}
-
-impl Module for Linear {
-    fn forward(&self, input: Tensor) -> Tensor {
-        let y = matmul(&input, &self.weight);
-
-        if let Some(bias) = &self.bias {
-            if is_no_grad() {
-                let bias_vals = bias.with_storage_view(|bias_view| match bias_view {
-                    TensorStorageView::F32(bias_view) => {
-                        let bias_1d = bias_view
-                            .into_dimensionality::<Ix1>()
-                            .expect("Linear bias must be 1D [out]");
-                        bias_1d.iter().copied().collect::<Vec<f32>>()
-                    }
-                    TensorStorageView::F16(bias_view) => {
-                        let bias_1d = bias_view
-                            .into_dimensionality::<Ix1>()
-                            .expect("Linear bias must be 1D [out]");
-                        bias_1d.iter().map(|v| v.to_f32()).collect::<Vec<f32>>()
-                    }
-                    TensorStorageView::BF16(bias_view) => {
-                        let bias_1d = bias_view
-                            .into_dimensionality::<Ix1>()
-                            .expect("Linear bias must be 1D [out]");
-                        bias_1d.iter().map(|v| v.to_f32()).collect::<Vec<f32>>()
-                    }
-                });
-
-                {
-                    let mut y_data = y.data_mut();
-                    let last_axis = Axis(y_data.ndim() - 1);
-                    for mut lane in y_data.lanes_mut(last_axis) {
-                        for (dst, &b) in lane.iter_mut().zip(bias_vals.iter()) {
-                            *dst += b;
-                        }
-                    }
-                }
-                y
-            } else {
-                y + bias.clone()
-            }
-        } else {
-            y
-        }
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = vec![self.weight.clone()];
-        if let Some(b) = &self.bias {
-            params.push(b.clone());
-        }
-        params
     }
 }

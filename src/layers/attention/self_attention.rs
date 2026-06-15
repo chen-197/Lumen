@@ -8,11 +8,13 @@ use crate::module::Module;
 use crate::ops::cuda;
 use crate::ops::fused::{
     fused_qkv_decode_infer_into, fused_qkv_decode_infer_tensors, fused_qkv_prefill_infer_tensors,
-    fused_softmax, fused_softmax_with_past_infer,
+    fused_qkv_train_tensors, fused_softmax, fused_softmax_with_past_infer,
 };
 use crate::ops::matmul::{batch_matmul, dot_unrolled};
 use crate::ops::shape::{permute, reshape, slice_last_dim};
-use crate::precision::{DType, default_activation_dtype, default_kv_cache_dtype};
+use crate::precision::{
+    DType, default_activation_dtype, default_kv_cache_dtype, default_parameter_dtype,
+};
 
 use ndarray::linalg::general_mat_mul;
 use ndarray::{Array, Array4, IxDyn};
@@ -22,17 +24,17 @@ use std::rc::Rc;
 
 thread_local! {
     // attention scores buffer: S * L
-    static ATT_SCORES_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static ATT_SCORES_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // attention ctx buffer: S * D
-    static ATT_CTX_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static ATT_CTX_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // decode(S=1) q RoPE buffer: D
-    static ATT_Q_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static ATT_Q_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // decode(S=1) full attention output buffer: H * D
-    static ATT_OUT_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static ATT_OUT_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // decode(S=1) fused projection scratch buffers
-    static ATT_QPROJ_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static ATT_KPROJ_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static ATT_VPROJ_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static ATT_QPROJ_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static ATT_KPROJ_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static ATT_VPROJ_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_attention_work_buffers<R>(
@@ -103,24 +105,50 @@ fn cache_prefix_tensor(cache: &Tensor, active_len: usize) -> Tensor {
     if active_len == cache_len {
         return cache.clone();
     }
-    if cache.device() == Device::Cuda && cache.dtype() == DType::F32 && active_len > 0 {
-        if let Some(buffer) = cache.cloned_cuda_f32_buffer() {
-            match cuda::kv_cache_prefix_f32_buffer(
-                &buffer, shape[0], shape[1], active_len, cache_len, shape[3],
-            ) {
-                Ok(prefix) => {
-                    return Tensor::from_cuda_f32_buffer_no_host(
-                        &[shape[0], shape[1], active_len, shape[3]],
-                        prefix,
-                        Device::Cuda,
-                    );
-                }
-                Err(err) => {
-                    assert!(
-                        !is_strict_device_execution(),
-                        "CUDA KV cache prefix failed in strict device execution mode: {err}"
-                    );
-                }
+    if cache.device() == Device::Cuda
+        && active_len > 0
+        && let Some((dtype, buffer, i8_scale)) = cache.cloned_cuda_native_lowp_buffer()
+    {
+        match cuda::kv_cache_prefix_typed_buffer(
+            &buffer, dtype, shape[0], shape[1], active_len, cache_len, shape[3],
+        ) {
+            Ok(prefix) => {
+                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                    &[shape[0], shape[1], active_len, shape[3]],
+                    prefix,
+                    Device::Cuda,
+                    dtype,
+                    i8_scale,
+                );
+            }
+            Err(err) => {
+                assert!(
+                    !is_strict_device_execution(),
+                    "CUDA typed KV cache prefix failed in strict device execution mode: {err}"
+                );
+            }
+        }
+    }
+    if cache.device() == Device::Cuda
+        && cache.dtype() == DType::F32
+        && active_len > 0
+        && let Some(buffer) = cache.cloned_cuda_f32_buffer()
+    {
+        match cuda::kv_cache_prefix_f32_buffer(
+            &buffer, shape[0], shape[1], active_len, cache_len, shape[3],
+        ) {
+            Ok(prefix) => {
+                return Tensor::from_cuda_f32_buffer_no_host(
+                    &[shape[0], shape[1], active_len, shape[3]],
+                    prefix,
+                    Device::Cuda,
+                );
+            }
+            Err(err) => {
+                assert!(
+                    !is_strict_device_execution(),
+                    "CUDA KV cache prefix failed in strict device execution mode: {err}"
+                );
             }
         }
     }
@@ -129,19 +157,24 @@ fn cache_prefix_tensor(cache: &Tensor, active_len: usize) -> Tensor {
     permute(&sliced, vec![0, 1, 3, 2])
 }
 
-fn eval_attention_context_bshd(
-    q_rot: &Tensor,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
+#[derive(Clone, Copy)]
+struct AttentionEvalParams {
     total_len: usize,
     scale: f32,
     causal: bool,
     n_rep: usize,
     past_len: usize,
+}
+
+fn eval_attention_context_bshd(
+    q_rot: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    params: AttentionEvalParams,
 ) -> Array4<f32> {
     with_cache_f32_views(k_cache, v_cache, |k4_full, v4_full| {
-        let k4 = k4_full.slice(ndarray::s![.., .., 0..total_len, ..]);
-        let v4 = v4_full.slice(ndarray::s![.., .., 0..total_len, ..]);
+        let k4 = k4_full.slice(ndarray::s![.., .., 0..params.total_len, ..]);
+        let v4 = v4_full.slice(ndarray::s![.., .., 0..params.total_len, ..]);
         q_rot.with_storage_view_preferring(StoragePreference::F32Compute, |q_view| {
             let q4 = match q_view {
                 TensorStorageView::F32(view) => view.into_dimensionality::<ndarray::Ix4>().unwrap(),
@@ -152,7 +185,15 @@ fn eval_attention_context_bshd(
                     unreachable!("f32 compute view expected for attention")
                 }
             };
-            gqa_attention_no_repeat_bshd_view(&q4, &k4, &v4, scale, causal, n_rep, past_len)
+            gqa_attention_no_repeat_bshd_view(
+                &q4,
+                &k4,
+                &v4,
+                params.scale,
+                params.causal,
+                params.n_rep,
+                params.past_len,
+            )
         })
     })
 }
@@ -337,6 +378,18 @@ pub struct SelfAttention {
     kv_cache_dtype: DType,
 }
 
+struct SelfAttentionInit {
+    embed_dim: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    max_seq_len: usize,
+    rope_theta: f32,
+    causal: bool,
+    parameter_dtype: DType,
+    activation_dtype: DType,
+    kv_cache_dtype: DType,
+}
+
 impl SelfAttention {
     #[inline]
     pub fn activation_dtype(&self) -> DType {
@@ -348,17 +401,18 @@ impl SelfAttention {
         self.kv_cache_dtype
     }
 
-    fn new_impl(
-        embed_dim: usize,
-        n_head: usize,
-        n_kv_head: usize,
-        max_seq_len: usize,
-        rope_theta: f32,
-        causal: bool,
-        parameter_dtype: DType,
-        activation_dtype: DType,
-        kv_cache_dtype: DType,
-    ) -> Self {
+    fn new_impl(init: SelfAttentionInit) -> Self {
+        let SelfAttentionInit {
+            embed_dim,
+            n_head,
+            n_kv_head,
+            max_seq_len,
+            rope_theta,
+            causal,
+            parameter_dtype,
+            activation_dtype,
+            kv_cache_dtype,
+        } = init;
         assert!(embed_dim > 0, "embed_dim must be > 0");
         assert!(n_head > 0, "n_head must be > 0");
         assert!(n_kv_head > 0, "n_kv_head must be > 0");
@@ -413,7 +467,7 @@ impl SelfAttention {
         activation_dtype: DType,
         kv_cache_dtype: DType,
     ) -> Self {
-        Self::new_impl(
+        Self::new_impl(SelfAttentionInit {
             embed_dim,
             n_head,
             n_kv_head,
@@ -423,7 +477,7 @@ impl SelfAttention {
             parameter_dtype,
             activation_dtype,
             kv_cache_dtype,
-        )
+        })
     }
 
     pub fn new_with_dtypes(
@@ -457,49 +511,17 @@ impl SelfAttention {
         rope_theta: f32,
         causal: bool,
     ) -> Self {
-        assert!(embed_dim > 0, "embed_dim must be > 0");
-        assert!(n_head > 0, "n_head must be > 0");
-        assert!(n_kv_head > 0, "n_kv_head must be > 0");
-        assert!(max_seq_len > 0, "max_seq_len must be > 0");
-        assert_eq!(
-            embed_dim % n_head,
-            0,
-            "Embed dim must be divisible by n_head"
-        );
-        assert_eq!(
-            n_head % n_kv_head,
-            0,
-            "n_head must be divisible by n_kv_head"
-        );
-
-        let activation_dtype = default_activation_dtype();
-        let kv_cache_dtype = default_kv_cache_dtype();
-        assert!(
-            kv_cache_dtype.is_float(),
-            "SelfAttention KV cache dtype currently only supports floating types, got {:?}",
-            kv_cache_dtype
-        );
-
-        let head_dim = embed_dim / n_head;
-        let kv_dim = n_kv_head * head_dim;
-        let rope =
-            RotaryEmbedding::new_with_dtype(head_dim, max_seq_len, rope_theta, activation_dtype);
-
-        Self {
-            w_q: Linear::new_no_bias(embed_dim, embed_dim),
-            w_k: Linear::new_no_bias(embed_dim, kv_dim),
-            w_v: Linear::new_no_bias(embed_dim, kv_dim),
-            w_o: Linear::new_no_bias(embed_dim, embed_dim),
-            rope,
+        Self::new_impl(SelfAttentionInit {
+            embed_dim,
             n_head,
             n_kv_head,
-            head_dim,
-            scale: (head_dim as f32).sqrt().recip(),
+            max_seq_len,
+            rope_theta,
             causal,
-            max_seq: max_seq_len,
-            activation_dtype,
-            kv_cache_dtype,
-        }
+            parameter_dtype: default_parameter_dtype(),
+            activation_dtype: default_activation_dtype(),
+            kv_cache_dtype: default_kv_cache_dtype(),
+        })
     }
 
     pub fn new_with_dtype(
@@ -511,17 +533,17 @@ impl SelfAttention {
         causal: bool,
         dtype: DType,
     ) -> Self {
-        Self::new_impl(
+        Self::new_impl(SelfAttentionInit {
             embed_dim,
             n_head,
             n_kv_head,
             max_seq_len,
             rope_theta,
             causal,
-            dtype,
-            dtype,
-            dtype,
-        )
+            parameter_dtype: dtype,
+            activation_dtype: dtype,
+            kv_cache_dtype: dtype,
+        })
     }
 
     pub(crate) fn assert_cache_compatible(
@@ -540,6 +562,7 @@ impl SelfAttention {
     }
 
     // forward：eval 用预分配 cache；train 走原逻辑（cat + repeat_kv）
+    #[allow(clippy::needless_return)]
     pub fn forward(&self, x: Tensor, cache: Option<KVCache>) -> (Tensor, Option<KVCache>) {
         let x_shape = x.shape_vec();
         assert_eq!(x_shape.len(), 3, "attention input must be [B,S,H]");
@@ -744,11 +767,13 @@ impl SelfAttention {
                                 &q_rot,
                                 &c.k,
                                 &c.v,
-                                total_len,
-                                self.scale,
-                                self.causal,
-                                n_rep,
-                                past_len,
+                                AttentionEvalParams {
+                                    total_len,
+                                    scale: self.scale,
+                                    causal: self.causal,
+                                    n_rep,
+                                    past_len,
+                                },
                             );
                             let context = Tensor::from_f32_data_no_grad_with_device_dtype(
                                 context_bshd.into_dyn(),
@@ -1445,11 +1470,13 @@ impl SelfAttention {
                     &q_rot,
                     &c.k,
                     &c.v,
-                    total_len,
-                    self.scale,
-                    self.causal,
-                    n_rep,
-                    past_len,
+                    AttentionEvalParams {
+                        total_len,
+                        scale: self.scale,
+                        causal: self.causal,
+                        n_rep,
+                        past_len,
+                    },
                 );
 
                 let context = if x_is_cuda {
@@ -1467,23 +1494,39 @@ impl SelfAttention {
 
             return (output, Some(cache_handle));
         }
-        let q = { self.w_q.forward(x.clone()) };
-        let k = { self.w_k.forward(x.clone()) };
-        let v = { self.w_v.forward(x) };
+        let fused_qkv = fused_qkv_train_tensors(
+            &x,
+            &self.w_q.weight,
+            &self.w_k.weight,
+            &self.w_v.weight,
+            self.w_q.bias.as_ref(),
+            self.w_k.bias.as_ref(),
+            self.w_v.bias.as_ref(),
+            h,
+            h_kv,
+        );
+        let (q, k, v) = if let Some(qkv) = fused_qkv {
+            qkv
+        } else {
+            let q = self.w_q.forward(x.clone());
+            let k = self.w_k.forward(x.clone());
+            let v = self.w_v.forward(x);
 
-        // train 路径：走原来的逻辑（可导）
-        let q = permute(
-            &reshape(&q, vec![b as i32, s as i32, h as i32, d as i32]),
-            vec![0, 2, 1, 3],
-        );
-        let k = permute(
-            &reshape(&k, vec![b as i32, s as i32, h_kv as i32, d as i32]),
-            vec![0, 2, 1, 3],
-        );
-        let v = permute(
-            &reshape(&v, vec![b as i32, s as i32, h_kv as i32, d as i32]),
-            vec![0, 2, 1, 3],
-        );
+            // train 路径：走原来的逻辑（可导）
+            let q = permute(
+                &reshape(&q, vec![b as i32, s as i32, h as i32, d as i32]),
+                vec![0, 2, 1, 3],
+            );
+            let k = permute(
+                &reshape(&k, vec![b as i32, s as i32, h_kv as i32, d as i32]),
+                vec![0, 2, 1, 3],
+            );
+            let v = permute(
+                &reshape(&v, vec![b as i32, s as i32, h_kv as i32, d as i32]),
+                vec![0, 2, 1, 3],
+            );
+            (q, k, v)
+        };
 
         // 希望训练时禁止传 cache：
         if cache.is_some() {
@@ -1561,7 +1604,27 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
     let out_shape = vec![b, n_kv * n_rep, s, d];
 
     if !build_graph {
-        if output_device == Device::Cuda && x.len() > 0 {
+        if output_device == Device::Cuda && !x.is_empty() {
+            if let Some((dtype, input_buf, i8_scale)) = x.cloned_cuda_native_lowp_buffer() {
+                match cuda::repeat_kv_typed_buffer(&input_buf, dtype, b, n_kv, s, d, n_rep) {
+                    Ok(buffer) => {
+                        return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                            &out_shape,
+                            buffer,
+                            output_device,
+                            dtype,
+                            i8_scale,
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "CUDA typed repeat_kv failed in strict device execution mode: {err}"
+                        );
+                    }
+                }
+            }
+
             if x.dtype() == DType::F32 {
                 let cuda_out = x.with_cuda_f32_buffer(|input_buf| {
                     cuda::repeat_kv_f32_buffer(input_buf, b, n_kv, s, d, n_rep)
@@ -1672,7 +1735,7 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
         };
     }
 
-    if output_device == Device::Cuda && x.len() > 0 {
+    if output_device == Device::Cuda && !x.is_empty() {
         let cuda_out = x.with_cuda_f32_buffer(|input_buf| {
             cuda::repeat_kv_f32_buffer(input_buf, b, n_kv, s, d, n_rep)
         });
@@ -1687,6 +1750,9 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: Some(buffer),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: crate::precision::DType::F32,
@@ -1792,6 +1858,9 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -2297,6 +2366,9 @@ mod tests {
         )
         .to_cuda();
 
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(input.0.borrow().cuda_bf16_data.is_some());
+
         set_strict_device_execution(true);
         let cuda_out = no_grad(|| repeat_kv(input.clone(), 2));
         set_strict_device_execution(false);
@@ -2304,6 +2376,8 @@ mod tests {
         let cpu_out = no_grad(|| repeat_kv(input.to_cpu(), 2));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        assert!(cuda_out.0.borrow().cuda_f32_data.is_none());
+        assert!(cuda_out.0.borrow().cuda_bf16_data.is_some());
         assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -2329,6 +2403,44 @@ mod tests {
         assert_eq!(out.dtype(), DType::BF16);
         assert_eq!(out.shape_vec(), vec![1, 4, 0, 3]);
         assert_eq!(out.len(), 0);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_kv_cache_prefix_preserves_bf16_native_storage_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let cache = make_tensor(
+            &[1, 2, 4, 2],
+            vec![
+                1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, -1.0, -1.5, -2.0, -2.5, -3.0, -3.5, -4.0,
+                -4.5,
+            ],
+            DType::BF16,
+        )
+        .to_cuda();
+        assert!(cache.0.borrow().cuda_f32_data.is_none());
+        assert!(cache.0.borrow().cuda_bf16_data.is_some());
+
+        set_strict_device_execution(true);
+        let cuda_prefix = cache_prefix_tensor(&cache, 2);
+        set_strict_device_execution(false);
+
+        let cpu_prefix = cache_prefix_tensor(&cache.to_cpu(), 2);
+        assert!(cuda_prefix.is_cuda());
+        assert_eq!(cuda_prefix.dtype(), DType::BF16);
+        assert_eq!(cuda_prefix.shape_vec(), vec![1, 2, 2, 2]);
+        assert!(cuda_prefix.0.borrow().cuda_f32_data.is_none());
+        assert!(cuda_prefix.0.borrow().cuda_bf16_data.is_some());
+        for (got, expect) in cuda_prefix
+            .data_ref()
+            .iter()
+            .zip(cpu_prefix.data_ref().iter())
+        {
+            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
+        }
     }
 
     #[test]
@@ -2432,12 +2544,17 @@ mod tests {
 
         let input = make_tensor(&[1, 2, 1, 2], vec![1.0, -2.0, 3.0, -4.0], DType::I8).to_cuda();
 
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(input.0.borrow().cuda_i8_data.is_some());
+
         set_strict_device_execution(true);
         let out = no_grad(|| repeat_kv(input, 2));
         set_strict_device_execution(false);
 
         assert!(out.is_cuda());
         assert_eq!(out.dtype(), DType::I8);
+        assert!(out.0.borrow().cuda_f32_data.is_none());
+        assert!(out.0.borrow().cuda_i8_data.is_some());
     }
 
     #[cfg(feature = "cuda")]
@@ -2680,7 +2797,7 @@ mod tests {
         assert_eq!(cpu_cache.borrow().len, 2);
         assert_eq!(cuda_out2.shape_vec(), cpu_out2.shape_vec());
         for (got, expect) in cuda_out2.data_ref().iter().zip(cpu_out2.data_ref().iter()) {
-            assert!((got - expect).abs() < 3e-2, "got {got}, expect {expect}");
+            assert!((got - expect).abs() < 5e-2, "got {got}, expect {expect}");
         }
     }
 

@@ -9,6 +9,21 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc; // 引入并行迭代
 
+fn cuda_loss_storage(tensor: &Tensor) -> Option<(cuda::CudaBuffer, DType, Option<f32>)> {
+    tensor
+        .cloned_cuda_native_lowp_buffer()
+        .map(|(dtype, buffer, scale)| (buffer, dtype, scale))
+        .or_else(|| {
+            if tensor.dtype() == DType::F32 && tensor.is_cuda() {
+                tensor
+                    .cloned_cuda_f32_buffer()
+                    .map(|buffer| (buffer, DType::F32, None))
+            } else {
+                None
+            }
+        })
+}
+
 // --- MSE Loss ---
 pub struct MSELoss;
 impl MSELoss {
@@ -19,29 +34,33 @@ impl MSELoss {
             target.shape_vec(),
             "mse_loss expects output and target to have the same shape"
         );
-        assert!(output.len() > 0, "mse_loss expects at least one element");
+        assert!(!output.is_empty(), "mse_loss expects at least one element");
         let build_graph = !is_no_grad() && (output.requires_grad() || target.requires_grad());
         let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
         assert_native_device_support(output_device, "mse_loss", cuda_native_supported);
 
         if output_device == crate::autograd::Device::Cuda {
-            let cuda_forward = output.with_cuda_f32_buffer(|out_buf| {
-                target.with_cuda_f32_buffer(|tar_buf| {
-                    let diff_buf = cuda::binary_f32_buffer(out_buf, tar_buf, cuda::BinaryOp::Sub)?;
-                    let sq_buf =
-                        cuda::binary_f32_buffer(&diff_buf, &diff_buf, cuda::BinaryOp::Mul)?;
-                    let sq_host = cuda::download_f32(&sq_buf)?;
-                    Ok::<_, String>((diff_buf, sq_host))
-                })
-            });
-            if let Ok((diff_buf, sq_host)) = cuda_forward {
-                let n = sq_host.len() as f32;
-                let loss_val = sq_host.iter().sum::<f32>() / n;
+            let cuda_forward = (|| {
+                let (out_buf, out_dtype, out_scale) = cuda_loss_storage(output)
+                    .ok_or_else(|| "CUDA mse_loss output missing resident buffer".to_string())?;
+                let (tar_buf, tar_dtype, tar_scale) = cuda_loss_storage(target)
+                    .ok_or_else(|| "CUDA mse_loss target missing resident buffer".to_string())?;
+                let (diff_buf, loss_buf, loss_host) = cuda::mse_forward_typed(
+                    &out_buf, out_dtype, out_scale, &tar_buf, tar_dtype, tar_scale,
+                )?;
+                let loss_val = loss_host
+                    .first()
+                    .copied()
+                    .ok_or_else(|| "CUDA mse_loss returned empty host scalar".to_string())?;
+                Ok::<_, String>((diff_buf, loss_buf, loss_val))
+            })();
+            if let Ok((diff_buf, loss_buf, loss_val)) = cuda_forward {
                 if !build_graph {
-                    return Tensor::from_f32_data_no_grad_with_device_dtype(
+                    return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
                         arr0(loss_val).into_dyn(),
                         DType::F32,
                         output_device,
+                        Some(loss_buf),
                     );
                 }
 
@@ -52,7 +71,10 @@ impl MSELoss {
                     f16_data: None,
                     bf16_data: None,
                     i8_data: None,
-                    cuda_f32_data: None,
+                    cuda_f32_data: Some(loss_buf),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: true,
                     storage_dtype: crate::precision::DType::F32,
@@ -147,6 +169,9 @@ impl MSELoss {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: crate::precision::DType::F32,
@@ -212,16 +237,38 @@ impl CrossEntropyLoss {
             "cross_entropy class dimension must be greater than zero"
         );
         if output_device == crate::autograd::Device::Cuda {
-            let cuda_forward = input_logits.with_cuda_f32_buffer(|logits_buf| {
-                let softmax_buf = cuda::softmax_lastdim_f32_no_host(logits_buf, batch_size, dim)?;
-                let (loss_buf, loss_host) = target_onehot.with_cuda_f32_buffer(|target_buf| {
-                    cuda::cross_entropy_loss_f32(&softmax_buf, target_buf, batch_size)
-                })?;
+            let cuda_forward = (|| {
+                let (logits_buf, logits_dtype, logits_scale) = cuda_loss_storage(input_logits)
+                    .ok_or_else(|| {
+                        "CUDA cross_entropy logits missing resident buffer".to_string()
+                    })?;
+                let (target_buf, target_dtype, target_scale) = cuda_loss_storage(target_onehot)
+                    .ok_or_else(|| {
+                        "CUDA cross_entropy target missing resident buffer".to_string()
+                    })?;
+                let softmax_buf = if logits_dtype == DType::F32 {
+                    cuda::softmax_lastdim_f32_no_host(&logits_buf, batch_size, dim)?
+                } else {
+                    cuda::softmax_lastdim_typed_no_host(
+                        &logits_buf,
+                        logits_dtype,
+                        logits_scale,
+                        batch_size,
+                        dim,
+                    )?
+                };
+                let (loss_buf, loss_host) = cuda::cross_entropy_loss_typed_target(
+                    &softmax_buf,
+                    &target_buf,
+                    target_dtype,
+                    target_scale,
+                    batch_size,
+                )?;
                 let loss_val = loss_host.first().copied().ok_or_else(|| {
                     "CUDA cross_entropy loss returned empty host scalar".to_string()
                 })?;
                 Ok::<_, String>((softmax_buf, loss_buf, loss_val))
-            });
+            })();
             if let Ok((softmax_buf, loss_buf, loss_val)) = cuda_forward {
                 if !build_graph {
                     return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
@@ -242,6 +289,9 @@ impl CrossEntropyLoss {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: Some(loss_buf),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: true,
                     storage_dtype: crate::precision::DType::F32,
@@ -254,28 +304,45 @@ impl CrossEntropyLoss {
                         let grad_val = *grad_output.first().unwrap();
                         let factor = grad_val / batch_size as f32;
                         if is_strict_device_execution() {
-                            let grad_buffer = target_clone
-                                .with_cuda_f32_buffer(|target_buf| {
-                                    cuda::cross_entropy_backward_f32_buffer(
+                            let (target_buffer, target_dtype, target_scale) =
+                                cuda_loss_storage(&target_clone).unwrap_or_else(|| {
+                                    panic!(
+                                        "CUDA cross_entropy backward target missing resident buffer"
+                                    )
+                                });
+                            let grad_buffer = cuda::cross_entropy_backward_typed_target_buffer(
+                                &softmax_buffer,
+                                &target_buffer,
+                                target_dtype,
+                                target_scale,
+                                factor,
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!("CUDA cross_entropy backward failed: {}", err)
+                            });
+                            input_clone.add_cuda_grad_buffer_only(grad_buffer);
+                            return;
+                        }
+                        let (grad_buffer, grad_host) =
+                            if let Some((target_buffer, target_dtype, target_scale)) =
+                                cuda_loss_storage(&target_clone)
+                            {
+                                cuda::cross_entropy_backward_typed_target(
+                                    &softmax_buffer,
+                                    &target_buffer,
+                                    target_dtype,
+                                    target_scale,
+                                    factor,
+                                )
+                            } else {
+                                target_clone.with_cuda_f32_buffer(|target_buf| {
+                                    cuda::cross_entropy_backward_f32(
                                         &softmax_buffer,
                                         target_buf,
                                         factor,
                                     )
                                 })
-                                .unwrap_or_else(|err| {
-                                    panic!("CUDA cross_entropy backward failed: {}", err)
-                                });
-                            input_clone.add_cuda_grad_buffer_only(grad_buffer);
-                            return;
-                        }
-                        let (grad_buffer, grad_host) = target_clone
-                            .with_cuda_f32_buffer(|target_buf| {
-                                cuda::cross_entropy_backward_f32(
-                                    &softmax_buffer,
-                                    target_buf,
-                                    factor,
-                                )
-                            })
+                            }
                             .unwrap_or_else(|err| {
                                 panic!("CUDA cross_entropy backward failed: {}", err)
                             });
@@ -375,6 +442,9 @@ impl CrossEntropyLoss {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: crate::precision::DType::F32,
@@ -526,6 +596,88 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_mse_loss_lowp_inputs_read_resident_buffers_and_write_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let output_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let target_data = vec![0.5, -1.5, 0.25, 2.5, -0.5, 1.0];
+        let output_cpu = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 3]), output_data.clone())
+                .unwrap()
+                .into_dyn(),
+            DType::BF16,
+        );
+        let target_cpu = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 3]), target_data.clone())
+                .unwrap()
+                .into_dyn(),
+            DType::I8,
+        );
+        let output_cuda = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 3]), output_data)
+                .unwrap()
+                .into_dyn(),
+            DType::BF16,
+        )
+        .to_cuda();
+        let target_cuda = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 3]), target_data)
+                .unwrap()
+                .into_dyn(),
+            DType::I8,
+        )
+        .to_cuda();
+        assert!(output_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(target_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(output_cuda.0.borrow().cuda_bf16_data.is_some());
+        assert!(target_cuda.0.borrow().cuda_i8_data.is_some());
+
+        crate::ops::cuda::set_enabled(true);
+        set_strict_device_execution(true);
+        let loss_cuda = MSELoss::apply(&output_cuda, &target_cuda);
+        loss_cuda.backward();
+        assert!(output_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(target_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(output_cuda.0.borrow().cuda_bf16_data.is_some());
+        assert!(target_cuda.0.borrow().cuda_i8_data.is_some());
+        assert!(output_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(target_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(!output_cuda.has_host_grad());
+        assert!(!target_cuda.has_host_grad());
+        set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let loss_cpu = MSELoss::apply(&output_cpu, &target_cpu);
+        loss_cpu.backward();
+        let got_loss = loss_cuda.data_ref().first().copied().unwrap_or_default();
+        let expect_loss = loss_cpu.data_ref().first().copied().unwrap_or_default();
+        assert!(
+            (got_loss - expect_loss).abs() < 3e-2,
+            "loss got {got_loss}, expect {expect_loss}"
+        );
+
+        let got_output_grad = output_cuda.grad().expect("cuda lowp output grad");
+        let expect_output_grad = output_cpu.grad().expect("cpu lowp output grad");
+        for (got, expect) in got_output_grad.iter().zip(expect_output_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "output grad got {got}, expect {expect}"
+            );
+        }
+        let got_target_grad = target_cuda.grad().expect("cuda lowp target grad");
+        let expect_target_grad = target_cpu.grad().expect("cpu lowp target grad");
+        for (got, expect) in got_target_grad.iter().zip(expect_target_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "target grad got {got}, expect {expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_cross_entropy_backward_matches_cpu_reference_in_strict_mode() {
         if !crate::ops::cuda::is_available() {
             return;
@@ -564,6 +716,67 @@ mod tests {
             assert!(
                 (got - expect).abs() < 1e-5,
                 "logits grad got {got}, expect {expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_cross_entropy_lowp_logits_and_target_read_resident_buffers() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let logits_data = vec![2.0, 0.0, -1.0, -1.0, 0.0, 2.0];
+        let target_data = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let logits_cpu = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 3]), logits_data.clone())
+                .unwrap()
+                .into_dyn(),
+            DType::BF16,
+        );
+        let targets_cpu = make_tensor(&[2, 3], target_data.clone(), DType::I8);
+        let logits_cuda = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[2, 3]), logits_data)
+                .unwrap()
+                .into_dyn(),
+            DType::BF16,
+        )
+        .to_cuda();
+        let targets_cuda = make_tensor(&[2, 3], target_data, DType::I8).to_cuda();
+        assert!(logits_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(targets_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(logits_cuda.0.borrow().cuda_bf16_data.is_some());
+        assert!(targets_cuda.0.borrow().cuda_i8_data.is_some());
+
+        crate::ops::cuda::set_enabled(true);
+        set_strict_device_execution(true);
+        let loss_cuda = CrossEntropyLoss::apply(&logits_cuda, &targets_cuda);
+        loss_cuda.backward();
+        assert!(logits_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(targets_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(logits_cuda.0.borrow().cuda_bf16_data.is_some());
+        assert!(targets_cuda.0.borrow().cuda_i8_data.is_some());
+        assert!(logits_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(!logits_cuda.has_host_grad());
+        set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let loss_cpu = CrossEntropyLoss::apply(&logits_cpu, &targets_cpu);
+        loss_cpu.backward();
+        let got_loss = loss_cuda.data_ref().first().copied().unwrap_or_default();
+        let expect_loss = loss_cpu.data_ref().first().copied().unwrap_or_default();
+        assert!(
+            (got_loss - expect_loss).abs() < 3e-2,
+            "loss got {got_loss}, expect {expect_loss}"
+        );
+
+        let got_grad = logits_cuda.grad().expect("cuda lowp logits grad");
+        let expect_grad = logits_cpu.grad().expect("cpu lowp logits grad");
+        for (got, expect) in got_grad.iter().zip(expect_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "grad got {got}, expect {expect}"
             );
         }
     }

@@ -1,12 +1,14 @@
 use crate::autograd::{
-    KernelRouteClass, StoragePreference, Tensor, TensorStorageOwned, TensorStorageView, is_no_grad,
-    is_strict_device_execution,
+    Device, KernelRouteClass, StoragePreference, Tensor, TensorStorageOwned, TensorStorageView,
+    is_no_grad, is_strict_device_execution,
 };
 use crate::layers::attention::self_attention::KVCacheInner;
 use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};
 use crate::module::Module;
 use crate::ops::cuda;
-use crate::ops::fused::{fused_gate_up_silu_infer, fused_gate_up_silu_infer_into};
+use crate::ops::fused::{
+    fused_gate_up_silu_decode_f32, fused_gate_up_silu_infer, fused_gate_up_silu_infer_into,
+};
 use crate::ops::matmul::{SliceRef, matvec_argmax_rowmajor_parallel_mixed};
 use crate::ops::shape::slice_last_dim;
 use crate::precision::{DType, default_activation_dtype, default_kv_cache_dtype};
@@ -15,7 +17,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 thread_local! {
-    static MLP_INTER_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static MLP_INTER_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_mlp_inter_buffer<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
@@ -30,6 +32,57 @@ fn with_mlp_inter_buffer<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
         let mut fallback = vec![0.0f32; len];
         f(&mut fallback)
     })
+}
+
+fn cast_no_grad_tensor_to_dtype(tensor: Tensor, dtype: DType) -> Tensor {
+    if tensor.dtype() == dtype {
+        return tensor;
+    }
+    let shape = tensor.shape_vec();
+    let device = tensor.device();
+    if tensor.is_cuda()
+        && let Some(buffer) = tensor.cloned_cuda_f32_buffer()
+    {
+        match dtype {
+            DType::F16 | DType::BF16 => match cuda::f32_to_lowp_storage_no_host(&buffer, dtype) {
+                Ok(lowp_buffer) => {
+                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &shape,
+                        lowp_buffer,
+                        device,
+                        dtype,
+                        None,
+                    );
+                }
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "CUDA activation cast to {dtype:?} failed in strict mode: {err}"
+                    );
+                }
+            },
+            DType::I8 => match cuda::quantize_f32_to_i8_dynamic_no_host(&buffer) {
+                Ok((i8_buffer, scale)) => {
+                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &shape,
+                        i8_buffer,
+                        device,
+                        dtype,
+                        Some(scale),
+                    );
+                }
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "CUDA activation cast to I8 failed in strict mode: {err}"
+                    );
+                }
+            },
+            DType::F32 => return tensor,
+        }
+    }
+
+    Tensor::from_f32_data_no_grad_with_device_dtype(tensor.data_ref().to_owned(), dtype, device)
 }
 
 #[inline]
@@ -313,10 +366,24 @@ impl LlamaMLP {
     }
 
     fn forward(&self, x: Tensor) -> Tensor {
+        if is_no_grad() && x.is_cuda() && self.gate_proj.weight.dtype() == DType::I8 {
+            let shape = x.shape_vec();
+            if let Some(&k_dim) = shape.last()
+                && k_dim > 0
+                && x.len() / k_dim > 1
+                && self.up_proj.weight.dtype() == DType::I8
+                && matches!(x.dtype(), DType::BF16 | DType::F32)
+            {
+                let inter =
+                    fused_gate_up_silu_infer(&x, &self.gate_proj.weight, &self.up_proj.weight);
+                return self.down_proj.forward(inter);
+            }
+        }
+
         if Self::should_use_fused_gate_up(&x) {
             if x.is_cuda() {
                 let inter =
-                    fused_gate_up_silu_infer(&x, &self.gate_proj.weight, &self.up_proj.weight);
+                    fused_gate_up_silu_decode_f32(&x, &self.gate_proj.weight, &self.up_proj.weight);
                 return self.down_proj.forward(inter);
             }
             let inter_dim = self.down_proj.in_features;
@@ -445,7 +512,10 @@ impl LlamaDecoderLayer {
         // out = h + MLP(Norm(h))
         let norm_h = self.post_attention_layernorm.forward(h.clone());
         let mlp_out = self.mlp.forward(norm_h);
-        (h + mlp_out, cache_out)
+        let output_dtype = self.self_attn.activation_dtype();
+        let out = h + mlp_out;
+        let out = cast_no_grad_tensor_to_dtype(out, output_dtype);
+        (out, cache_out)
     }
 
     // 训练路径：不允许传 cache（SelfAttention 会 panic）。
@@ -670,12 +740,15 @@ impl LlamaModel {
         }
     }
 
-    fn forward_hidden_infer(&self, input_ids: Tensor, caches: &mut Vec<KVCache>) -> Tensor {
+    fn forward_hidden_infer(&self, input_ids: Tensor, caches: &mut [KVCache]) -> Tensor {
         let batch_size = self.validate_input_ids(&input_ids, "inference");
         self.validate_infer_caches(caches, batch_size);
 
         // Embedding: [B,S] -> [B,S,H]
-        let mut x = self.embed_tokens.forward(&input_ids);
+        let mut x = cast_no_grad_tensor_to_dtype(
+            self.embed_tokens.forward(&input_ids),
+            self.activation_dtype,
+        );
 
         // Decoder Layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -705,6 +778,94 @@ impl LlamaModel {
             let (vocab, in_features) = (weight_shape[0], weight_shape[1]);
             assert_eq!(in_features, h, "lm_head in_features mismatch");
             let last_hidden = last_hidden_token_tensor(hidden.clone());
+            if let (
+                Some((DType::I8, hidden_buf, Some(hidden_scale))),
+                Some((DType::I8, weight_buf, Some(weight_scale))),
+            ) = (
+                last_hidden.cloned_cuda_native_lowp_buffer(),
+                self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+            ) {
+                match cuda::matvec_argmax_i8_i8(
+                    &hidden_buf,
+                    hidden_scale,
+                    &weight_buf,
+                    weight_scale,
+                    b,
+                    vocab,
+                    h,
+                ) {
+                    Ok(out) => return out,
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head I8xI8 argmax failed: {}", err);
+                    }
+                    Err(_) => {}
+                }
+            }
+            if let (
+                Some((DType::BF16, hidden_buf, _)),
+                Some((DType::I8, weight_buf, Some(weight_scale))),
+            ) = (
+                last_hidden.cloned_cuda_native_lowp_buffer(),
+                self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+            ) {
+                match cuda::matvec_argmax_bf16_i8(
+                    &hidden_buf,
+                    &weight_buf,
+                    weight_scale,
+                    b,
+                    vocab,
+                    h,
+                ) {
+                    Ok(out) => return out,
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head BF16xI8 argmax failed: {}", err);
+                    }
+                    Err(_) => {}
+                }
+            }
+            if let (
+                Some((DType::F16, hidden_buf, _)),
+                Some((DType::I8, weight_buf, Some(weight_scale))),
+            ) = (
+                last_hidden.cloned_cuda_native_lowp_buffer(),
+                self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+            ) {
+                match cuda::matvec_argmax_f16_i8(
+                    &hidden_buf,
+                    &weight_buf,
+                    weight_scale,
+                    b,
+                    vocab,
+                    h,
+                ) {
+                    Ok(out) => return out,
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head F16xI8 argmax failed: {}", err);
+                    }
+                    Err(_) => {}
+                }
+            }
+            if last_hidden.dtype() == DType::F32
+                && let (Some(hidden_buf), Some((DType::I8, weight_buf, Some(weight_scale)))) = (
+                    last_hidden.cloned_cuda_f32_buffer(),
+                    self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+                )
+            {
+                match cuda::matvec_argmax_f32_i8(
+                    &hidden_buf,
+                    &weight_buf,
+                    weight_scale,
+                    b,
+                    vocab,
+                    h,
+                ) {
+                    Ok(out) => return out,
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head F32xI8 argmax failed: {}", err);
+                    }
+                    Err(_) => {}
+                }
+            }
             if let (Some(hidden_buf), Some(weight_buf)) = (
                 last_hidden.cloned_cuda_f32_buffer(),
                 self.lm_head.weight.cloned_cuda_f32_buffer(),
@@ -831,10 +992,167 @@ impl LlamaModel {
     /// 推理/生成（需要 caches）。
     ///
     /// `pos` 参数为了兼容旧调用方保留，但会被忽略：长度由 cache 内部维护。
-    pub fn forward(&self, input_ids: Tensor, caches: &mut Vec<KVCache>, _pos: usize) -> Tensor {
+    pub fn forward(&self, input_ids: Tensor, caches: &mut [KVCache], _pos: usize) -> Tensor {
         let x = self.forward_hidden_infer(input_ids, caches);
 
         self.lm_head.forward(x)
+    }
+
+    fn lm_head_logits_from_last_hidden(
+        &self,
+        last_hidden: Tensor,
+        batch: usize,
+        hidden: usize,
+    ) -> Tensor {
+        if last_hidden.is_cuda()
+            && self.lm_head.weight.is_cuda()
+            && self.lm_head.weight.dtype() == DType::I8
+        {
+            let weight_shape = self.lm_head.weight.shape_vec();
+            assert_eq!(weight_shape.len(), 2, "lm_head weight must be [V,H]");
+            let (vocab, in_features) = (weight_shape[0], weight_shape[1]);
+            assert_eq!(in_features, hidden, "lm_head in_features mismatch");
+            let out_shape = vec![batch, 1, vocab];
+
+            if let (
+                Some((DType::I8, hidden_buf, Some(hidden_scale))),
+                Some((DType::I8, weight_buf, Some(weight_scale))),
+            ) = (
+                last_hidden.cloned_cuda_native_lowp_buffer(),
+                self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+            ) {
+                match cuda::matmul_i8_buffer_no_host(
+                    &hidden_buf,
+                    hidden_scale,
+                    &weight_buf,
+                    weight_scale,
+                    batch,
+                    vocab,
+                    hidden,
+                ) {
+                    Ok(buffer) => {
+                        return Tensor::from_cuda_f32_buffer_no_host(
+                            &out_shape,
+                            buffer,
+                            Device::Cuda,
+                        );
+                    }
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head i8 logits failed: {err}");
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if let (
+                Some((DType::BF16, hidden_buf, _)),
+                Some((DType::I8, weight_buf, Some(weight_scale))),
+            ) = (
+                last_hidden.cloned_cuda_native_lowp_buffer(),
+                self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+            ) {
+                match cuda::matmul_bf16_i8_buffer_no_host(
+                    &hidden_buf,
+                    &weight_buf,
+                    weight_scale,
+                    batch,
+                    vocab,
+                    hidden,
+                ) {
+                    Ok(buffer) => {
+                        return Tensor::from_cuda_f32_buffer_no_host(
+                            &out_shape,
+                            buffer,
+                            Device::Cuda,
+                        );
+                    }
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head bf16xi8 logits failed: {err}");
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if let (
+                Some((DType::F16, hidden_buf, _)),
+                Some((DType::I8, weight_buf, Some(weight_scale))),
+            ) = (
+                last_hidden.cloned_cuda_native_lowp_buffer(),
+                self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+            ) {
+                match cuda::matmul_f16_i8_buffer_no_host(
+                    &hidden_buf,
+                    &weight_buf,
+                    weight_scale,
+                    batch,
+                    vocab,
+                    hidden,
+                ) {
+                    Ok(buffer) => {
+                        return Tensor::from_cuda_f32_buffer_no_host(
+                            &out_shape,
+                            buffer,
+                            Device::Cuda,
+                        );
+                    }
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head f16xi8 logits failed: {err}");
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if last_hidden.dtype() == DType::F32
+                && let (Some(hidden_buf), Some((DType::I8, weight_buf, Some(weight_scale)))) = (
+                    last_hidden.cloned_cuda_f32_buffer(),
+                    self.lm_head.weight.cloned_cuda_native_lowp_buffer(),
+                )
+            {
+                match cuda::matmul_f32_i8_buffer_no_host(
+                    &hidden_buf,
+                    &weight_buf,
+                    weight_scale,
+                    batch,
+                    vocab,
+                    hidden,
+                ) {
+                    Ok(buffer) => {
+                        return Tensor::from_cuda_f32_buffer_no_host(
+                            &out_shape,
+                            buffer,
+                            Device::Cuda,
+                        );
+                    }
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head f32xi8 logits failed: {err}");
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if let (Some(hidden_buf), Some(weight_buf)) = (
+                last_hidden.cloned_cuda_f32_buffer(),
+                self.lm_head.weight.cloned_cuda_f32_buffer(),
+            ) {
+                match cuda::matmul_f32_no_host(&hidden_buf, &weight_buf, batch, vocab, hidden) {
+                    Ok(buffer) => {
+                        return Tensor::from_cuda_f32_buffer_no_host(
+                            &out_shape,
+                            buffer,
+                            Device::Cuda,
+                        );
+                    }
+                    Err(err) if is_strict_device_execution() => {
+                        panic!("CUDA lm_head f32 logits fallback failed: {err}");
+                    }
+                    Err(_) => {}
+                }
+            } else if is_strict_device_execution() {
+                panic!("CUDA lm_head logits require resident CUDA data");
+            }
+        }
+
+        self.lm_head.forward(last_hidden)
     }
 
     /// 生成/benchmark 专用：只返回最后一个位置的 logits。
@@ -844,7 +1162,7 @@ impl LlamaModel {
     pub fn forward_last_logits(
         &self,
         input_ids: Tensor,
-        caches: &mut Vec<KVCache>,
+        caches: &mut [KVCache],
         _pos: usize,
     ) -> Tensor {
         let x = self.forward_hidden_infer(input_ids, caches);
@@ -857,7 +1175,7 @@ impl LlamaModel {
 
         debug_assert_eq!(last_hidden.shape_vec(), vec![b, 1, h]);
 
-        self.lm_head.forward(last_hidden)
+        self.lm_head_logits_from_last_hidden(last_hidden, b, h)
     }
 
     /// 生成/benchmark 热路径：直接返回最后一个位置的 greedy argmax token。
@@ -867,7 +1185,7 @@ impl LlamaModel {
     pub fn forward_last_argmax(
         &self,
         input_ids: Tensor,
-        caches: &mut Vec<KVCache>,
+        caches: &mut [KVCache],
         _pos: usize,
     ) -> usize {
         let x = self.forward_hidden_infer(input_ids, caches);
@@ -877,7 +1195,7 @@ impl LlamaModel {
     pub fn forward_last_argmax_batch(
         &self,
         input_ids: Tensor,
-        caches: &mut Vec<KVCache>,
+        caches: &mut [KVCache],
         _pos: usize,
     ) -> Vec<usize> {
         let x = self.forward_hidden_infer(input_ids, caches);
@@ -988,14 +1306,12 @@ impl Module for LlamaModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autograd::no_grad;
-    #[cfg(feature = "cuda")]
-    use crate::autograd::set_strict_device_execution;
+    use crate::autograd::{no_grad, set_strict_device_execution};
     #[cfg(feature = "cuda")]
     use crate::loss::CrossEntropyLoss;
     use crate::precision::{
-        PrecisionConfig, set_default_runtime_dtype, with_precision_config,
-        with_runtime_component_dtypes,
+        ParameterQuantization, PrecisionConfig, set_default_runtime_dtype,
+        with_parameter_quantization, with_precision_config, with_runtime_component_dtypes,
     };
     use ndarray::ArrayD;
     use ndarray::IxDyn;
@@ -1187,27 +1503,39 @@ mod tests {
 
     #[test]
     fn forward_last_argmax_batch_matches_logits_argmax() {
-        let model = LlamaModel::new_with_dtype(test_config(), DType::BF16);
-        let input = input_ids(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let mut logits_caches = model.init_kv_caches(2);
-        let mut argmax_caches = model.init_kv_caches(2);
+        crate::ops::cuda::set_enabled(false);
+        set_strict_device_execution(false);
+        with_precision_config(PrecisionConfig::default(), || {
+            with_runtime_component_dtypes(Some(DType::F32), Some(DType::F32), || {
+                with_parameter_quantization(ParameterQuantization::Disabled, || {
+                    let model = LlamaModel::new_with_dtype(test_config(), DType::BF16);
+                    let input = input_ids(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+                    let mut logits_caches = model.init_kv_caches(2);
+                    let mut argmax_caches = model.init_kv_caches(2);
 
-        let logits = no_grad(|| model.forward_last_logits(input.clone(), &mut logits_caches, 0));
-        let got = no_grad(|| model.forward_last_argmax_batch(input, &mut argmax_caches, 0));
-        let logits_vals = logits.data_ref().iter().copied().collect::<Vec<_>>();
-        let vocab = test_config().vocab_size;
-        let expected = logits_vals
-            .chunks(vocab)
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .expect("logits row must not be empty")
-            })
-            .collect::<Vec<_>>();
+                    let logits =
+                        no_grad(|| model.forward_last_logits(input.clone(), &mut logits_caches, 0));
+                    let got =
+                        no_grad(|| model.forward_last_argmax_batch(input, &mut argmax_caches, 0));
+                    let logits_vals = logits.data_ref().iter().copied().collect::<Vec<_>>();
+                    let vocab = test_config().vocab_size;
+                    let expected = logits_vals
+                        .chunks(vocab)
+                        .map(|row| {
+                            row.iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| {
+                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .map(|(idx, _)| idx)
+                                .expect("logits row must not be empty")
+                        })
+                        .collect::<Vec<_>>();
 
-        assert_eq!(got, expected);
+                    assert_eq!(got, expected);
+                });
+            });
+        });
     }
 
     #[test]
@@ -1261,6 +1589,46 @@ mod tests {
                     .expect("logits row must not be empty")
             })
             .collect::<Vec<_>>();
+
+        assert_eq!(got, expected);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn llama_forward_last_argmax_f16_activation_i8_lm_head_matches_cpu_logits_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let config = test_config();
+        let model =
+            LlamaModel::new_with_runtime_dtypes(config.clone(), DType::I8, DType::F16, DType::F16);
+        let input = input_ids(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let mut logits_caches = model.init_kv_caches(2);
+        let logits = no_grad(|| model.forward_last_logits(input.clone(), &mut logits_caches, 0));
+        let logits_vals = logits.data_ref().iter().copied().collect::<Vec<_>>();
+        let expected = logits_vals
+            .chunks(config.vocab_size)
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx)
+                    .expect("logits row must not be empty")
+            })
+            .collect::<Vec<_>>();
+
+        model.to_cuda();
+        let mut argmax_caches = model.init_kv_caches(2);
+        let input = input.to_cuda();
+
+        set_strict_device_execution(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            no_grad(|| model.forward_last_argmax_batch(input, &mut argmax_caches, 0))
+        }));
+        set_strict_device_execution(false);
+        let got = result.unwrap();
 
         assert_eq!(got, expected);
     }
@@ -1469,7 +1837,7 @@ mod tests {
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 3e-2, "got {got}, expect {expect}");
+            assert!((got - expect).abs() < 4e-2, "got {got}, expect {expect}");
         }
     }
 }

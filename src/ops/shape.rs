@@ -85,6 +85,15 @@ fn validate_cat_inputs(tensors: &[Tensor], axis: usize) -> Vec<Vec<usize>> {
     shapes
 }
 
+fn cat_output_shape(shapes: &[Vec<usize>], axis: usize) -> Vec<usize> {
+    let mut out_shape = shapes[0].clone();
+    out_shape[axis] = shapes
+        .iter()
+        .try_fold(0usize, |sum, shape| sum.checked_add(shape[axis]))
+        .expect("Concat axis length overflow");
+    out_shape
+}
+
 fn preserve_device_after_view(
     tensor: Tensor,
     output_device: crate::autograd::Device,
@@ -93,7 +102,16 @@ fn preserve_device_after_view(
     match output_device {
         crate::autograd::Device::Cpu => tensor,
         crate::autograd::Device::Cuda => {
-            if let Some(buffer) = source.cloned_cuda_f32_buffer() {
+            if let Some((dtype, buffer, scale)) = source.cloned_cuda_native_lowp_buffer() {
+                let shape = tensor.shape_vec();
+                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                    &shape,
+                    buffer,
+                    output_device,
+                    dtype,
+                    scale,
+                );
+            } else if let Some(buffer) = source.cloned_cuda_f32_buffer() {
                 tensor.set_cuda_f32_buffer_inplace(buffer);
             } else {
                 tensor.to_cuda_inplace();
@@ -131,6 +149,9 @@ fn try_cuda_permute_graph(
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: Some(cuda_buffer),
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: false,
         storage_dtype: crate::precision::DType::F32,
@@ -252,14 +273,17 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
             "Reshape cannot infer dimension when known product is zero"
         );
         assert!(
-            input_len % known_product == 0,
+            input_len.is_multiple_of(known_product),
             "Reshape inferred dimension mismatch: input elements {} not divisible by known product {}",
             input_len,
             known_product
         );
         new_shape[axis] = input_len / known_product;
     } else {
-        let new_len = new_shape.iter().product::<usize>();
+        let new_len = new_shape
+            .iter()
+            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+            .expect("Reshape dimension product overflow");
         assert_eq!(
             new_len, input_len,
             "Reshape failed: total element count mismatch (input {}, target {})",
@@ -268,6 +292,22 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
     }
 
     if is_no_grad() || !input.requires_grad() {
+        if output_device == crate::autograd::Device::Cuda {
+            if let Some((dtype, buffer, scale)) = input.cloned_cuda_native_lowp_buffer() {
+                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                    &new_shape,
+                    buffer,
+                    output_device,
+                    dtype,
+                    scale,
+                );
+            }
+            if input.dtype() == DType::F32
+                && let Some(buffer) = input.cloned_cuda_f32_buffer()
+            {
+                return Tensor::from_cuda_f32_buffer_no_host(&new_shape, buffer, output_device);
+            }
+        }
         return match input.native_storage_owned() {
             TensorStorageOwned::F32(data) => preserve_device_after_view(
                 Tensor::from_data_no_grad(reshape_shared(data, &new_shape)),
@@ -292,41 +332,45 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
         };
     }
 
-    if output_device == crate::autograd::Device::Cuda {
-        if let Some(cuda_buffer) = input.cloned_cuda_f32_buffer() {
-            let input_clone = input.clone();
-            let input_shape = input.shape_vec();
-            let output_self = Rc::new(RefCell::new(None::<Tensor>));
-            let output_self_for_backward = output_self.clone();
-            let tensor = Tensor(Rc::new(RefCell::new(TensorData {
-                data: Array::zeros(IxDyn(&new_shape)).into_shared(),
-                f16_data: None,
-                bf16_data: None,
-                i8_data: None,
-                cuda_f32_data: Some(cuda_buffer),
-                i8_scale: None,
-                has_f32_data: false,
-                storage_dtype: crate::precision::DType::F32,
-                cache_dirty: false,
-                is_parameter: false,
-                grad: None,
-                cuda_f32_grad: None,
-                parents: vec![input.clone()],
-                backward_op: Some(std::rc::Rc::new(move |grad| {
-                    let upstream_cuda_grad = output_self_for_backward
-                        .borrow()
-                        .as_ref()
-                        .and_then(|output| output.cloned_cuda_f32_grad())
-                        .filter(|buffer| buffer.len() == grad.len());
-                    if is_strict_device_execution()
-                        && let Some(buffer) = upstream_cuda_grad.clone()
-                    {
-                        input_clone.add_cuda_grad_buffer_only(buffer);
-                        return;
-                    }
+    if output_device == crate::autograd::Device::Cuda
+        && let Some(cuda_buffer) = input.cloned_cuda_f32_buffer()
+    {
+        let input_clone = input.clone();
+        let input_shape = input.shape_vec();
+        let output_self = Rc::new(RefCell::new(None::<Tensor>));
+        let output_self_for_backward = output_self.clone();
+        let tensor = Tensor(Rc::new(RefCell::new(TensorData {
+            data: Array::zeros(IxDyn(&new_shape)).into_shared(),
+            f16_data: None,
+            bf16_data: None,
+            i8_data: None,
+            cuda_f32_data: Some(cuda_buffer),
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
+            i8_scale: None,
+            has_f32_data: false,
+            storage_dtype: crate::precision::DType::F32,
+            cache_dirty: false,
+            is_parameter: false,
+            grad: None,
+            cuda_f32_grad: None,
+            parents: vec![input.clone()],
+            backward_op: Some(std::rc::Rc::new(move |grad| {
+                let upstream_cuda_grad = output_self_for_backward
+                    .borrow()
+                    .as_ref()
+                    .and_then(|output| output.cloned_cuda_f32_grad())
+                    .filter(|buffer| buffer.len() == grad.len());
+                if is_strict_device_execution()
+                    && let Some(buffer) = upstream_cuda_grad.clone()
+                {
+                    input_clone.add_cuda_grad_buffer_only(buffer);
+                    return;
+                }
 
-                    let grad_contig = grad.as_standard_layout().into_owned();
-                    let cuda_grad = upstream_cuda_grad.or_else(|| {
+                let grad_contig = grad.as_standard_layout().into_owned();
+                let cuda_grad = upstream_cuda_grad.or_else(|| {
                             let grad_host = grad_contig.iter().copied().collect::<Vec<_>>();
                             match cuda::upload_f32(&grad_host) {
                                 Ok(buffer) => Some(buffer),
@@ -339,18 +383,17 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
                                 }
                             }
                         });
-                    let grad_reshaped = grad_contig
-                        .into_shape(input_shape.clone())
-                        .expect("Backward Reshape failed")
-                        .into_dyn();
-                    input_clone.add_grad_with_cuda_buffer(grad_reshaped, cuda_grad);
-                })),
-                requires_grad: true,
-                device: output_device,
-            })));
-            *output_self.borrow_mut() = Some(tensor.clone());
-            return tensor;
-        }
+                let grad_reshaped = grad_contig
+                    .into_shape(input_shape.clone())
+                    .expect("Backward Reshape failed")
+                    .into_dyn();
+                input_clone.add_grad_with_cuda_buffer(grad_reshaped, cuda_grad);
+            })),
+            requires_grad: true,
+            device: output_device,
+        })));
+        *output_self.borrow_mut() = Some(tensor.clone());
+        return tensor;
     }
 
     assert_native_device_support(output_device, "reshape", true);
@@ -371,6 +414,9 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: cuda_buffer,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -420,7 +466,7 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
         output_device == crate::autograd::Device::Cuda,
     );
 
-    if !build_graph && output_device == crate::autograd::Device::Cuda && input.len() == 0 {
+    if !build_graph && output_device == crate::autograd::Device::Cuda && input.is_empty() {
         return match input.native_storage_owned() {
             TensorStorageOwned::F32(data) => Tensor::from_shared_f32_no_grad_with_device(
                 data.permuted_axes(axes.clone()).into_dyn(),
@@ -447,6 +493,25 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
             .iter()
             .map(|&axis| input.shape_vec()[axis])
             .collect::<Vec<_>>();
+        if let Some((dtype, input_buf, i8_scale)) = input.cloned_cuda_native_lowp_buffer() {
+            match cuda::permute_typed_buffer(&input_buf, dtype, &out_shape, &axes) {
+                Ok(buffer) => {
+                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &out_shape,
+                        buffer,
+                        output_device,
+                        dtype,
+                        i8_scale,
+                    );
+                }
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "CUDA typed permute forward failed while strict device execution is enabled: {err}"
+                    );
+                }
+            }
+        }
         if input.dtype() == DType::F32 {
             let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
                 cuda::permute_f32_buffer(input_buf, &out_shape, &axes)
@@ -497,10 +562,10 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
         .iter()
         .map(|&axis| input_shape[axis])
         .collect::<Vec<_>>();
-    if output_device == crate::autograd::Device::Cuda {
-        if let Some(tensor) = try_cuda_permute_graph(input, &axes, &input_shape, &out_shape) {
-            return tensor;
-        }
+    if output_device == crate::autograd::Device::Cuda
+        && let Some(tensor) = try_cuda_permute_graph(input, &axes, &input_shape, &out_shape)
+    {
+        return tensor;
     }
 
     let data: ArcArray<f32, IxDyn> = input.data_arc();
@@ -522,6 +587,9 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: cuda_buffer,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -577,6 +645,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
         );
     }
     let shapes = validate_cat_inputs(tensors, axis);
+    let out_shape = cat_output_shape(&shapes, axis);
 
     if tensors.len() == 1 && (is_no_grad() || !tensors[0].requires_grad()) {
         return tensors[0].clone();
@@ -584,23 +653,24 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
 
     if !build_graph {
         if output_device == crate::autograd::Device::Cuda {
-            let mut out_shape = shapes[0].clone();
-            out_shape[axis] = shapes.iter().map(|shape| shape[axis]).sum();
-
             let same_dtype = tensors
                 .iter()
                 .all(|tensor| tensor.dtype() == tensors[0].dtype());
             let i8_scale = if same_dtype && tensors[0].dtype() == DType::I8 {
                 let scales = tensors
                     .iter()
-                    .map(|tensor| match tensor.native_storage_owned() {
-                        TensorStorageOwned::I8(_, scale) => scale,
-                        TensorStorageOwned::F32(_)
-                        | TensorStorageOwned::F16(_)
-                        | TensorStorageOwned::BF16(_) => unreachable!("checked i8 dtype above"),
+                    .filter_map(|tensor| {
+                        tensor
+                            .cloned_cuda_native_lowp_buffer()
+                            .and_then(
+                                |(dtype, _, scale)| {
+                                    if dtype == DType::I8 { scale } else { None }
+                                },
+                            )
                     })
                     .collect::<Vec<_>>();
-                if scales.windows(2).all(|pair| pair[0] == pair[1]) {
+                if scales.len() == tensors.len() && scales.windows(2).all(|pair| pair[0] == pair[1])
+                {
                     Some(scales[0])
                 } else {
                     None
@@ -620,6 +690,61 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                 DType::F32
             };
 
+            if output_dtype != DType::F32 {
+                let cuda_out = (|| -> Result<_, String> {
+                    let mut acc_shape = shapes[0].clone();
+                    let (dtype, mut acc_buffer, scale) = tensors[0]
+                        .cloned_cuda_native_lowp_buffer()
+                        .ok_or_else(|| "CUDA typed cat expected lhs native buffer".to_string())?;
+                    if dtype != output_dtype {
+                        return Err(format!(
+                            "CUDA typed cat dtype mismatch: expected {:?}, got {:?}",
+                            output_dtype, dtype
+                        ));
+                    }
+                    let mut out_scale = scale;
+                    for (rhs, rhs_shape) in tensors.iter().skip(1).zip(shapes.iter().skip(1)) {
+                        let (rhs_dtype, rhs_buffer, rhs_scale) =
+                            rhs.cloned_cuda_native_lowp_buffer().ok_or_else(|| {
+                                "CUDA typed cat expected rhs native buffer".to_string()
+                            })?;
+                        if rhs_dtype != output_dtype {
+                            return Err(format!(
+                                "CUDA typed cat dtype mismatch: expected {:?}, got {:?}",
+                                output_dtype, rhs_dtype
+                            ));
+                        }
+                        if output_dtype == DType::I8 && rhs_scale != out_scale {
+                            return Err("CUDA typed cat i8 scale mismatch".to_string());
+                        }
+                        let mut next_shape = acc_shape.clone();
+                        next_shape[axis] = next_shape[axis]
+                            .checked_add(rhs_shape[axis])
+                            .expect("Concat axis length overflow");
+                        acc_buffer = cuda::cat_typed_buffer(
+                            &acc_buffer,
+                            &rhs_buffer,
+                            output_dtype,
+                            &next_shape,
+                            axis,
+                            acc_shape[axis],
+                        )?;
+                        acc_shape = next_shape;
+                        out_scale = rhs_scale;
+                    }
+                    Ok((acc_buffer, out_scale))
+                })();
+                if let Ok((buffer, scale)) = cuda_out {
+                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &out_shape,
+                        buffer,
+                        output_device,
+                        output_dtype,
+                        scale,
+                    );
+                }
+            }
+
             if output_dtype == DType::F32
                 && tensors.iter().all(|tensor| tensor.dtype() == DType::F32)
             {
@@ -633,7 +758,9 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                             .cloned_cuda_f32_buffer()
                             .ok_or_else(|| "CUDA cat expected rhs resident buffer".to_string())?;
                         let mut next_shape = acc_shape.clone();
-                        next_shape[axis] += rhs_shape[axis];
+                        next_shape[axis] = next_shape[axis]
+                            .checked_add(rhs_shape[axis])
+                            .expect("Concat axis length overflow");
                         acc_buffer = cuda::cat_f32_buffer(
                             &acc_buffer,
                             &rhs_buffer,
@@ -661,7 +788,9 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                         .cloned_cuda_f32_buffer()
                         .ok_or_else(|| "CUDA cat expected rhs resident buffer".to_string())?;
                     let mut next_shape = acc_shape.clone();
-                    next_shape[axis] += rhs_shape[axis];
+                    next_shape[axis] = next_shape[axis]
+                        .checked_add(rhs_shape[axis])
+                        .expect("Concat axis length overflow");
                     let (next_buffer, next_host) = cuda::cat_f32(
                         &acc_buffer,
                         &rhs_buffer,
@@ -809,8 +938,6 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
     if output_device == crate::autograd::Device::Cuda
         && tensors.iter().all(|tensor| tensor.dtype() == DType::F32)
     {
-        let mut out_shape = shapes[0].clone();
-        out_shape[axis] = shapes.iter().map(|shape| shape[axis]).sum();
         let cuda_out = (|| -> Result<_, String> {
             let mut acc_shape = shapes[0].clone();
             let mut acc_buffer = tensors[0]
@@ -821,7 +948,9 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                     .cloned_cuda_f32_buffer()
                     .ok_or_else(|| "CUDA cat expected next resident buffer".to_string())?;
                 let mut next_shape = acc_shape.clone();
-                next_shape[axis] += rhs_shape[axis];
+                next_shape[axis] = next_shape[axis]
+                    .checked_add(rhs_shape[axis])
+                    .expect("Concat axis length overflow");
                 acc_buffer = cuda::cat_f32_buffer(
                     &acc_buffer,
                     &rhs_buffer,
@@ -847,6 +976,9 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: Some(buffer),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: crate::precision::DType::F32,
@@ -881,7 +1013,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                                 })() {
                                     Ok(pieces) => {
                                         for (tensor, grad_buffer) in
-                                            tensors_clone.iter().zip(pieces.into_iter())
+                                            tensors_clone.iter().zip(pieces)
                                         {
                                             tensor.add_cuda_grad_buffer_only(grad_buffer);
                                         }
@@ -990,11 +1122,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
 
     let lengths: Vec<usize> = shapes.iter().map(|shape| shape[axis]).collect();
     let tensors_clone: Vec<Tensor> = tensors.to_vec();
-    let out_shape_for_cuda = {
-        let mut out_shape = shapes[0].clone();
-        out_shape[axis] = lengths.iter().sum();
-        out_shape
-    };
+    let out_shape_for_cuda = out_shape;
     let cuda_buffer = if output_device == crate::autograd::Device::Cuda {
         let cuda_out = (|| -> Result<_, String> {
             let mut acc_shape = shapes[0].clone();
@@ -1006,7 +1134,9 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
                     .cloned_cuda_f32_buffer()
                     .ok_or_else(|| "CUDA cat expected next resident buffer".to_string())?;
                 let mut next_shape = acc_shape.clone();
-                next_shape[axis] += rhs_shape[axis];
+                next_shape[axis] = next_shape[axis]
+                    .checked_add(rhs_shape[axis])
+                    .expect("Concat axis length overflow");
                 acc_buffer = cuda::cat_f32_buffer(
                     &acc_buffer,
                     &rhs_buffer,
@@ -1040,6 +1170,9 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: cuda_buffer,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -1163,6 +1296,27 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
         let outer = input.len() / last_len;
         let mut out_shape = input_shape.clone();
         out_shape[last_dim] = slice_len;
+        if let Some((dtype, input_buf, i8_scale)) = input.cloned_cuda_native_lowp_buffer() {
+            match cuda::slice_lastdim_typed_buffer(
+                &input_buf, dtype, outer, last_len, start, slice_len,
+            ) {
+                Ok(buffer) => {
+                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &out_shape,
+                        buffer,
+                        output_device,
+                        dtype,
+                        i8_scale,
+                    );
+                }
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "CUDA typed slice_last_dim forward failed while strict device execution is enabled: {err}"
+                    );
+                }
+            }
+        }
         if input.dtype() == DType::F32 {
             let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
                 cuda::slice_lastdim_f32_buffer(input_buf, outer, last_len, start, slice_len)
@@ -1228,6 +1382,9 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: Some(buffer),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: crate::precision::DType::F32,
@@ -1293,7 +1450,7 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
                                 let mut full_grad = ndarray::Array::zeros(full_shape.clone());
                                 full_grad
                                     .slice_axis_mut(axis, ndarray::Slice::from(start..end))
-                                    .assign(&grad);
+                                    .assign(grad);
                                 input_clone.add_grad(full_grad.into_dyn());
                             }
                         }
@@ -1329,6 +1486,9 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -1341,7 +1501,7 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
             let mut full_grad = ndarray::Array::zeros(full_shape.clone());
             full_grad
                 .slice_axis_mut(axis, ndarray::Slice::from(start..end))
-                .assign(&grad);
+                .assign(grad);
             input_clone.add_grad(full_grad.into_dyn());
         })),
         requires_grad: true,
@@ -1391,6 +1551,21 @@ mod tests {
         no_grad(|| {
             let _ = reshape(&input, vec![2, -2, 6]);
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "dimension product overflow")]
+    fn reshape_rejects_dimension_product_overflow() {
+        let input = make_tensor(&[1], vec![0.0], DType::F32);
+        no_grad(|| {
+            let _ = reshape(&input, vec![i32::MAX, i32::MAX, i32::MAX]);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Concat axis length overflow")]
+    fn cat_output_shape_rejects_axis_length_overflow() {
+        let _ = cat_output_shape(&[vec![usize::MAX], vec![1]], 0);
     }
 
     #[test]
@@ -1498,6 +1673,52 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_reshape_reuses_native_bf16_buffer_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let input = make_tensor(
+            &[2, 4],
+            (0..8).map(|v| v as f32 * 0.25).collect(),
+            DType::BF16,
+        )
+        .to_cuda();
+        let before_handle = {
+            let inner = input.0.borrow();
+            assert!(inner.cuda_f32_data.is_none());
+            inner
+                .cuda_bf16_data
+                .as_ref()
+                .expect("cuda bf16 tensor should have resident native buffer")
+                .handle()
+        };
+
+        crate::autograd::set_strict_device_execution(true);
+        let reshaped = no_grad(|| reshape(&input, vec![4, 2]));
+        crate::autograd::set_strict_device_execution(false);
+
+        assert!(reshaped.is_cuda());
+        assert_eq!(reshaped.dtype(), DType::BF16);
+        assert_eq!(reshaped.shape_vec(), vec![4, 2]);
+        let after_handle = {
+            let inner = reshaped.0.borrow();
+            assert!(inner.cuda_f32_data.is_none());
+            inner
+                .cuda_bf16_data
+                .as_ref()
+                .expect("reshaped cuda bf16 tensor should keep native buffer")
+                .handle()
+        };
+        assert_eq!(before_handle, after_handle);
+        let cpu = no_grad(|| reshape(&input.to_cpu(), vec![4, 2]));
+        for (got, expect) in reshaped.data_ref().iter().zip(cpu.data_ref().iter()) {
+            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_reshape_backward_keeps_grad_resident_in_strict_mode() {
         if !crate::ops::cuda::is_available() {
             return;
@@ -1552,6 +1773,9 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(input.0.borrow().cuda_bf16_data.is_some());
+
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| permute(&input, vec![2, 0, 1]));
         crate::autograd::set_strict_device_execution(false);
@@ -1559,6 +1783,8 @@ mod tests {
         let cpu_out = no_grad(|| permute(&input.to_cpu(), vec![2, 0, 1]));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        assert!(cuda_out.0.borrow().cuda_f32_data.is_none());
+        assert!(cuda_out.0.borrow().cuda_bf16_data.is_some());
         assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -1627,6 +1853,9 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(input.0.borrow().cuda_bf16_data.is_some());
+
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| slice_last_dim(&input, 1, 4));
         crate::autograd::set_strict_device_execution(false);
@@ -1634,6 +1863,8 @@ mod tests {
         let cpu_out = no_grad(|| slice_last_dim(&input.to_cpu(), 1, 4));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        assert!(cuda_out.0.borrow().cuda_f32_data.is_none());
+        assert!(cuda_out.0.borrow().cuda_bf16_data.is_some());
         assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -1773,6 +2004,10 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(lhs.0.borrow().cuda_f32_data.is_none());
+        assert!(rhs.0.borrow().cuda_f32_data.is_none());
+        assert!(lhs.0.borrow().cuda_bf16_data.is_some());
+        assert!(rhs.0.borrow().cuda_bf16_data.is_some());
 
         set_strict_device_execution(true);
         let cuda_out = no_grad(|| cat(&[lhs.clone(), rhs.clone()], 1));
@@ -1781,6 +2016,8 @@ mod tests {
         let cpu_out = no_grad(|| cat(&[lhs.to_cpu(), rhs.to_cpu()], 1));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        assert!(cuda_out.0.borrow().cuda_f32_data.is_none());
+        assert!(cuda_out.0.borrow().cuda_bf16_data.is_some());
         assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -1867,6 +2104,10 @@ mod tests {
 
         let lhs = make_tensor(&[1, 2], vec![-2.0, 1.0], DType::I8).to_cuda();
         let rhs = make_tensor(&[1, 2], vec![2.0, -1.0], DType::I8).to_cuda();
+        assert!(lhs.0.borrow().cuda_f32_data.is_none());
+        assert!(rhs.0.borrow().cuda_f32_data.is_none());
+        assert!(lhs.0.borrow().cuda_i8_data.is_some());
+        assert!(rhs.0.borrow().cuda_i8_data.is_some());
 
         set_strict_device_execution(true);
         let out = no_grad(|| cat(&[lhs, rhs], 0));
@@ -1874,5 +2115,7 @@ mod tests {
 
         assert!(out.is_cuda());
         assert_eq!(out.dtype(), DType::I8);
+        assert!(out.0.borrow().cuda_f32_data.is_none());
+        assert!(out.0.borrow().cuda_i8_data.is_some());
     }
 }

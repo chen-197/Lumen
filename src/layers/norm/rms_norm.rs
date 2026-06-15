@@ -11,6 +11,9 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+type RmsNormBackwardTypedResult =
+    Result<((cuda::CudaBuffer, Vec<f32>), (cuda::CudaBuffer, Vec<f32>)), String>;
+
 pub struct RMSNorm {
     pub weight: Tensor,
     pub eps: f32,
@@ -32,6 +35,147 @@ impl RMSNorm {
             eps,
         }
     }
+}
+
+fn cuda_rms_norm_storage_buffer(tensor: &Tensor) -> Option<(DType, cuda::CudaBuffer, Option<f32>)> {
+    tensor.cloned_cuda_native_lowp_buffer().or_else(|| {
+        if tensor.dtype() == DType::F32 && tensor.is_cuda() {
+            tensor
+                .cloned_cuda_f32_buffer()
+                .map(|buffer| (DType::F32, buffer, None))
+        } else {
+            None
+        }
+    })
+}
+
+fn try_cuda_rms_norm_typed(
+    input: &Tensor,
+    weight: &Tensor,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Option<Result<(cuda::CudaBuffer, Vec<f32>), String>> {
+    if input.dtype() == DType::F32 && weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_rms_norm_storage_buffer(input)?;
+    let (weight_dtype, weight_buffer, weight_scale) = cuda_rms_norm_storage_buffer(weight)?;
+    Some(cuda::rms_norm_typed(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &weight_buffer,
+        weight_dtype,
+        weight_scale,
+        rows,
+        dim,
+        eps,
+    ))
+}
+
+fn try_cuda_rms_norm_typed_buffer(
+    input: &Tensor,
+    weight: &Tensor,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    if input.dtype() == DType::F32 && weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_rms_norm_storage_buffer(input)?;
+    let (weight_dtype, weight_buffer, weight_scale) = cuda_rms_norm_storage_buffer(weight)?;
+    Some(cuda::rms_norm_typed_buffer(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &weight_buffer,
+        weight_dtype,
+        weight_scale,
+        rows,
+        dim,
+        eps,
+    ))
+}
+
+fn try_cuda_rms_norm_i8_typed_output_buffer(
+    input: &Tensor,
+    weight: &Tensor,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Option<Result<(cuda::CudaBuffer, f32), String>> {
+    if input.dtype() != DType::I8 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_rms_norm_storage_buffer(input)?;
+    let (weight_dtype, weight_buffer, weight_scale) = cuda_rms_norm_storage_buffer(weight)?;
+    Some(cuda::rms_norm_i8_typed_output_buffer(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &weight_buffer,
+        weight_dtype,
+        weight_scale,
+        rows,
+        dim,
+        eps,
+    ))
+}
+
+fn try_cuda_rms_norm_backward_typed(
+    input: &Tensor,
+    weight: &Tensor,
+    grad: &cuda::CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Option<RmsNormBackwardTypedResult> {
+    if input.dtype() == DType::F32 && weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_rms_norm_storage_buffer(input)?;
+    let (weight_dtype, weight_buffer, weight_scale) = cuda_rms_norm_storage_buffer(weight)?;
+    Some(cuda::rms_norm_backward_typed(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &weight_buffer,
+        weight_dtype,
+        weight_scale,
+        grad,
+        rows,
+        dim,
+        eps,
+    ))
+}
+
+fn try_cuda_rms_norm_backward_typed_buffers(
+    input: &Tensor,
+    weight: &Tensor,
+    grad: &cuda::CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Option<Result<(cuda::CudaBuffer, cuda::CudaBuffer), String>> {
+    if input.dtype() == DType::F32 && weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_rms_norm_storage_buffer(input)?;
+    let (weight_dtype, weight_buffer, weight_scale) = cuda_rms_norm_storage_buffer(weight)?;
+    Some(cuda::rms_norm_backward_typed_buffers(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &weight_buffer,
+        weight_dtype,
+        weight_scale,
+        grad,
+        rows,
+        dim,
+        eps,
+    ))
 }
 
 impl Module for RMSNorm {
@@ -62,24 +206,91 @@ impl Module for RMSNorm {
         );
 
         if !build_graph {
-            if output_device == crate::autograd::Device::Cuda && input.len() > 0 {
+            if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
                 let shape = input.shape_vec();
                 let dim = shape[shape.len() - 1];
                 let rows = input.len() / dim;
-                let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-                    self.weight.with_cuda_f32_buffer(|weight_buf| {
-                        cuda::rms_norm_f32(input_buf, weight_buf, rows, dim, self.eps)
-                    })
-                });
-                if let Ok((buffer, out)) = cuda_out {
-                    let out = ndarray::Array::from_shape_vec(ndarray::IxDyn(&shape), out)
-                        .expect("CUDA RMSNorm output shape build failed")
-                        .into_dyn();
-                    return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-                        out,
-                        input.dtype(),
+                if input.dtype() == DType::I8 {
+                    match try_cuda_rms_norm_i8_typed_output_buffer(
+                        &input,
+                        &self.weight,
+                        rows,
+                        dim,
+                        self.eps,
+                    ) {
+                        Some(Ok((i8_buffer, scale))) => {
+                            return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                &shape,
+                                i8_buffer,
+                                output_device,
+                                DType::I8,
+                                Some(scale),
+                            );
+                        }
+                        Some(Err(err)) => {
+                            assert!(
+                                !is_strict_device_execution(),
+                                "CUDA RMSNorm I8 typed-output failed while strict device execution is enabled: {err}"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                let cuda_out =
+                    try_cuda_rms_norm_typed_buffer(&input, &self.weight, rows, dim, self.eps)
+                        .unwrap_or_else(|| {
+                            input.with_cuda_f32_buffer(|input_buf| {
+                                self.weight.with_cuda_f32_buffer(|weight_buf| {
+                                    cuda::rms_norm_f32_buffer(
+                                        input_buf, weight_buf, rows, dim, self.eps,
+                                    )
+                                })
+                            })
+                        });
+                if let Ok(buffer) = cuda_out {
+                    if input.dtype() == DType::I8 {
+                        match cuda::quantize_f32_to_i8_dynamic_no_host(&buffer) {
+                            Ok((i8_buffer, scale)) => {
+                                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                    &shape,
+                                    i8_buffer,
+                                    output_device,
+                                    DType::I8,
+                                    Some(scale),
+                                );
+                            }
+                            Err(err) => {
+                                assert!(
+                                    !is_strict_device_execution(),
+                                    "CUDA RMSNorm I8 output quantization failed while strict device execution is enabled: {err}"
+                                );
+                            }
+                        }
+                    }
+                    if matches!(input.dtype(), DType::F16 | DType::BF16) {
+                        match cuda::f32_to_lowp_storage_no_host(&buffer, input.dtype()) {
+                            Ok(lowp_buffer) => {
+                                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                    &shape,
+                                    lowp_buffer,
+                                    output_device,
+                                    input.dtype(),
+                                    None,
+                                );
+                            }
+                            Err(err) => {
+                                assert!(
+                                    !is_strict_device_execution(),
+                                    "CUDA RMSNorm low precision output conversion failed while strict device execution is enabled: {err}"
+                                );
+                            }
+                        }
+                    }
+                    return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                        &shape,
+                        buffer,
                         output_device,
-                        Some(buffer),
+                        input.dtype(),
                     );
                 }
             }
@@ -473,15 +684,18 @@ impl Module for RMSNorm {
             });
         }
 
-        if output_device == crate::autograd::Device::Cuda && input.len() > 0 {
+        if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
             let shape = input.shape_vec();
             let dim = shape[shape.len() - 1];
             let rows = input.len() / dim;
-            let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-                self.weight.with_cuda_f32_buffer(|weight_buf| {
-                    cuda::rms_norm_f32(input_buf, weight_buf, rows, dim, self.eps)
-                })
-            });
+            let cuda_out = try_cuda_rms_norm_typed(&input, &self.weight, rows, dim, self.eps)
+                .unwrap_or_else(|| {
+                    input.with_cuda_f32_buffer(|input_buf| {
+                        self.weight.with_cuda_f32_buffer(|weight_buf| {
+                            cuda::rms_norm_f32(input_buf, weight_buf, rows, dim, self.eps)
+                        })
+                    })
+                });
             match cuda_out {
                 Ok((buffer, output_host)) => {
                     let output_data =
@@ -499,6 +713,9 @@ impl Module for RMSNorm {
                         bf16_data: None,
                         i8_data: None,
                         cuda_f32_data: Some(buffer),
+                        cuda_f16_data: None,
+                        cuda_bf16_data: None,
+                        cuda_i8_data: None,
                         i8_scale: None,
                         has_f32_data: true,
                         storage_dtype: crate::precision::DType::F32,
@@ -515,13 +732,25 @@ impl Module for RMSNorm {
                                 .filter(|grad_buf| grad_buf.len() == grad_output.len());
                             let cuda_grad = if let Some(grad_buf) = upstream_cuda_grad {
                                 if is_strict_device_execution() {
-                                    match input_clone.with_cuda_f32_buffer(|input_buf| {
-                                        weight_clone.with_cuda_f32_buffer(|weight_buf| {
-                                            cuda::rms_norm_backward_f32_buffers(
-                                                input_buf, weight_buf, &grad_buf, rows, dim, eps,
-                                            )
+                                    let grad_result = try_cuda_rms_norm_backward_typed_buffers(
+                                        &input_clone,
+                                        &weight_clone,
+                                        &grad_buf,
+                                        rows,
+                                        dim,
+                                        eps,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        input_clone.with_cuda_f32_buffer(|input_buf| {
+                                            weight_clone.with_cuda_f32_buffer(|weight_buf| {
+                                                cuda::rms_norm_backward_f32_buffers(
+                                                    input_buf, weight_buf, &grad_buf, rows, dim,
+                                                    eps,
+                                                )
+                                            })
                                         })
-                                    }) {
+                                    });
+                                    match grad_result {
                                         Ok((grad_input_buffer, grad_weight_buffer)) => {
                                             input_clone
                                                 .add_cuda_grad_buffer_only(grad_input_buffer);
@@ -534,25 +763,49 @@ impl Module for RMSNorm {
                                         }
                                     }
                                 }
-                                input_clone.with_cuda_f32_buffer(|input_buf| {
-                                    weight_clone.with_cuda_f32_buffer(|weight_buf| {
-                                        cuda::rms_norm_backward_f32(
-                                            input_buf, weight_buf, &grad_buf, rows, dim, eps,
-                                        )
+                                try_cuda_rms_norm_backward_typed(
+                                    &input_clone,
+                                    &weight_clone,
+                                    &grad_buf,
+                                    rows,
+                                    dim,
+                                    eps,
+                                )
+                                .unwrap_or_else(|| {
+                                    input_clone.with_cuda_f32_buffer(|input_buf| {
+                                        weight_clone.with_cuda_f32_buffer(|weight_buf| {
+                                            cuda::rms_norm_backward_f32(
+                                                input_buf, weight_buf, &grad_buf, rows, dim, eps,
+                                            )
+                                        })
                                     })
                                 })
                             } else {
                                 let grad_host = grad_output.iter().copied().collect::<Vec<_>>();
                                 if is_strict_device_execution() {
                                     match cuda::upload_f32(&grad_host).and_then(|grad_buf| {
-                                        input_clone.with_cuda_f32_buffer(|input_buf| {
-                                            weight_clone.with_cuda_f32_buffer(|weight_buf| {
-                                                cuda::rms_norm_backward_f32_buffers(
-                                                    input_buf, weight_buf, &grad_buf, rows, dim,
-                                                    eps,
-                                                )
-                                            })
-                                        })
+                                        try_cuda_rms_norm_backward_typed_buffers(
+                                            &input_clone,
+                                            &weight_clone,
+                                            &grad_buf,
+                                            rows,
+                                            dim,
+                                            eps,
+                                        )
+                                        .unwrap_or_else(
+                                            || {
+                                                input_clone.with_cuda_f32_buffer(|input_buf| {
+                                                    weight_clone.with_cuda_f32_buffer(
+                                                        |weight_buf| {
+                                                            cuda::rms_norm_backward_f32_buffers(
+                                                                input_buf, weight_buf, &grad_buf,
+                                                                rows, dim, eps,
+                                                            )
+                                                        },
+                                                    )
+                                                })
+                                            },
+                                        )
                                     }) {
                                         Ok((grad_input_buffer, grad_weight_buffer)) => {
                                             input_clone
@@ -567,11 +820,22 @@ impl Module for RMSNorm {
                                     }
                                 }
                                 cuda::upload_f32(&grad_host).and_then(|grad_buf| {
-                                    input_clone.with_cuda_f32_buffer(|input_buf| {
-                                        weight_clone.with_cuda_f32_buffer(|weight_buf| {
-                                            cuda::rms_norm_backward_f32(
-                                                input_buf, weight_buf, &grad_buf, rows, dim, eps,
-                                            )
+                                    try_cuda_rms_norm_backward_typed(
+                                        &input_clone,
+                                        &weight_clone,
+                                        &grad_buf,
+                                        rows,
+                                        dim,
+                                        eps,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        input_clone.with_cuda_f32_buffer(|input_buf| {
+                                            weight_clone.with_cuda_f32_buffer(|weight_buf| {
+                                                cuda::rms_norm_backward_f32(
+                                                    input_buf, weight_buf, &grad_buf, rows, dim,
+                                                    eps,
+                                                )
+                                            })
                                         })
                                     })
                                 })
@@ -706,6 +970,9 @@ impl Module for RMSNorm {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: crate::precision::DType::F32,
@@ -909,16 +1176,35 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| norm.forward(input.clone()));
         crate::autograd::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
 
         let cpu_out = no_grad(|| norm_ref.forward(input.to_cpu()));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA RMSNorm no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA RMSNorm no-grad output should not keep a resident f32 compute buffer for bf16 output"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA RMSNorm no-grad output should keep resident bf16 storage"
+            );
+        }
 
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -1031,6 +1317,102 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_rms_norm_lowp_backward_uses_resident_inputs_and_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let weight_values = vec![1.0, 0.5, 1.5, 2.0];
+        let input_values = vec![1.0, -2.0, 3.0, -4.0, 0.5, 1.5, -2.5, 4.0];
+        let coeff_values = vec![0.5, -1.0, 2.0, 0.25, -0.75, 1.5, -0.5, 0.75];
+
+        let norm_cuda = RMSNorm::new(4, 1e-5);
+        norm_cuda.weight.set_array_f32_with_dtype(
+            Array::from_shape_vec(IxDyn(&[4]), weight_values.clone())
+                .expect("weight shape mismatch")
+                .into_dyn(),
+            DType::BF16,
+        );
+        norm_cuda.weight.to_cuda_inplace();
+
+        let input_cuda = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(IxDyn(&[1, 2, 4]), input_values.clone())
+                .expect("input shape mismatch")
+                .into_dyn(),
+            true,
+        );
+        input_cuda.cast_inplace(DType::BF16);
+        let input_cuda = input_cuda.to_cuda();
+        let coeff_cuda = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(IxDyn(&[1, 2, 4]), coeff_values.clone())
+                .expect("coeff shape mismatch")
+                .into_dyn(),
+            false,
+        )
+        .to_cuda();
+
+        assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(norm_cuda.weight.0.borrow().cuda_f32_data.is_none());
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let cuda_out = norm_cuda.forward(input_cuda.clone());
+        let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
+        cuda_loss.backward();
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(norm_cuda.weight.0.borrow().cuda_f32_data.is_none());
+        assert!(input_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(norm_cuda.weight.cloned_cuda_f32_grad().is_some());
+        assert!(!input_cuda.has_host_grad());
+        assert!(!norm_cuda.weight.has_host_grad());
+
+        let norm_cpu = RMSNorm::new(4, 1e-5);
+        norm_cpu.weight.set_array_f32_with_dtype(
+            Array::from_shape_vec(IxDyn(&[4]), weight_values)
+                .expect("weight shape mismatch")
+                .into_dyn(),
+            DType::BF16,
+        );
+        let input_cpu = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(IxDyn(&[1, 2, 4]), input_values)
+                .expect("input shape mismatch")
+                .into_dyn(),
+            true,
+        );
+        input_cpu.cast_inplace(DType::BF16);
+        let coeff_cpu = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(IxDyn(&[1, 2, 4]), coeff_values)
+                .expect("coeff shape mismatch")
+                .into_dyn(),
+            false,
+        );
+        let cpu_out = norm_cpu.forward(input_cpu.clone());
+        let cpu_loss = crate::ops::arithmetic::sum(&(&cpu_out * &coeff_cpu));
+        cpu_loss.backward();
+
+        let input_cuda_grad = input_cuda.grad().expect("cuda RMSNorm input grad");
+        let input_cpu_grad = input_cpu.grad().expect("cpu RMSNorm input grad");
+        let weight_cuda_grad = norm_cuda.weight.grad().expect("cuda RMSNorm weight grad");
+        let weight_cpu_grad = norm_cpu.weight.grad().expect("cpu RMSNorm weight grad");
+        for (got, expect) in input_cuda_grad.iter().zip(input_cpu_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "input got {got}, expect {expect}"
+            );
+        }
+        for (got, expect) in weight_cuda_grad.iter().zip(weight_cpu_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "weight got {got}, expect {expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_rms_norm_preserves_i8_dtype_in_strict_mode() {
         if !crate::ops::cuda::is_available() {
             return;
@@ -1059,16 +1441,39 @@ mod tests {
             DType::I8,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| norm.forward(input.clone()));
         crate::autograd::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
 
         let cpu_out = no_grad(|| norm_ref.forward(input.to_cpu()));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::I8);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA RMSNorm I8 no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA RMSNorm I8 no-grad output should not keep a resident f32 compute buffer"
+            );
+            assert!(
+                inner.cuda_i8_data.is_some(),
+                "CUDA RMSNorm I8 no-grad output should keep resident i8 storage"
+            );
+            assert!(
+                inner.i8_scale.is_some(),
+                "CUDA RMSNorm I8 no-grad output should record dynamic quantization scale"
+            );
+        }
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
         }

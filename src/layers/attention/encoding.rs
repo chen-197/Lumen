@@ -18,6 +18,18 @@ pub struct RotaryEmbedding {
     sin_cache: Tensor,
 }
 
+fn cuda_rope_storage_buffer(tensor: &Tensor) -> Option<(DType, cuda::CudaBuffer, Option<f32>)> {
+    tensor.cloned_cuda_native_lowp_buffer().or_else(|| {
+        if tensor.dtype() == DType::F32 && tensor.is_cuda() {
+            tensor
+                .cloned_cuda_f32_buffer()
+                .map(|buffer| (DType::F32, buffer, None))
+        } else {
+            None
+        }
+    })
+}
+
 impl RotaryEmbedding {
     pub fn new(dim: usize, max_seq_len: usize, theta: f32) -> Self {
         Self::new_with_dtype(dim, max_seq_len, theta, default_activation_dtype())
@@ -156,7 +168,97 @@ impl RotaryEmbedding {
                 );
             }
 
-            if output_device == Device::Cuda && x.len() > 0 {
+            if output_device == Device::Cuda && !x.is_empty() {
+                if let Some((dtype, x_buf, scale)) = x.cloned_cuda_native_lowp_buffer()
+                    && let (
+                        Some((cos_dtype, cos_buf, cos_scale)),
+                        Some((sin_dtype, sin_buf, sin_scale)),
+                    ) = (
+                        cuda_rope_storage_buffer(&self.cos_cache),
+                        cuda_rope_storage_buffer(&self.sin_cache),
+                    )
+                    && cos_dtype == sin_dtype
+                {
+                    if x.dtype() == DType::I8 {
+                        match cuda::rope_typed_i8_dynamic_buffer(
+                            &x_buf,
+                            dtype,
+                            scale,
+                            &cos_buf,
+                            &sin_buf,
+                            cos_dtype,
+                            cos_scale,
+                            sin_scale,
+                            b,
+                            h,
+                            seq_len,
+                            d,
+                            offset,
+                            self.max_seq_len,
+                        ) {
+                            Ok((i8_buffer, scale)) => {
+                                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                    &shape,
+                                    i8_buffer,
+                                    output_device,
+                                    DType::I8,
+                                    Some(scale),
+                                );
+                            }
+                            Err(err) => {
+                                assert!(
+                                    !is_strict_device_execution(),
+                                    "CUDA RoPE fused I8 output quantization failed while strict device execution is enabled: {err}"
+                                );
+                            }
+                        }
+                    }
+                    let cuda_out = cuda::rope_typed_buffer(
+                        &x_buf,
+                        dtype,
+                        scale,
+                        &cos_buf,
+                        &sin_buf,
+                        cos_dtype,
+                        cos_scale,
+                        sin_scale,
+                        b,
+                        h,
+                        seq_len,
+                        d,
+                        offset,
+                        self.max_seq_len,
+                    );
+                    if let Ok(buffer) = cuda_out {
+                        if matches!(x.dtype(), DType::F16 | DType::BF16) {
+                            match cuda::f32_to_lowp_storage_no_host(&buffer, x.dtype()) {
+                                Ok(lowp_buffer) => {
+                                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                        &shape,
+                                        lowp_buffer,
+                                        output_device,
+                                        x.dtype(),
+                                        None,
+                                    );
+                                }
+                                Err(err) => {
+                                    assert!(
+                                        !is_strict_device_execution(),
+                                        "CUDA RoPE {:?} output conversion failed while strict device execution is enabled: {err}",
+                                        x.dtype()
+                                    );
+                                }
+                            }
+                        }
+                        return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                            &shape,
+                            buffer,
+                            output_device,
+                            x.dtype(),
+                        );
+                    }
+                }
+
                 if x.dtype().is_float() {
                     let cuda_out = x.with_cuda_f32_buffer(|x_buf| {
                         self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
@@ -176,6 +278,26 @@ impl RotaryEmbedding {
                         })
                     });
                     if let Ok(buffer) = cuda_out {
+                        if matches!(x.dtype(), DType::F16 | DType::BF16) {
+                            match cuda::f32_to_lowp_storage_no_host(&buffer, x.dtype()) {
+                                Ok(lowp_buffer) => {
+                                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                        &shape,
+                                        lowp_buffer,
+                                        output_device,
+                                        x.dtype(),
+                                        None,
+                                    );
+                                }
+                                Err(err) => {
+                                    assert!(
+                                        !is_strict_device_execution(),
+                                        "CUDA RoPE {:?} output conversion failed while strict device execution is enabled: {err}",
+                                        x.dtype()
+                                    );
+                                }
+                            }
+                        }
                         return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
                             &shape,
                             buffer,
@@ -183,35 +305,107 @@ impl RotaryEmbedding {
                             x.dtype(),
                         );
                     }
-                }
-
-                let cuda_out = x.with_cuda_f32_buffer(|x_buf| {
-                    self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
-                        self.sin_cache.with_cuda_f32_buffer(|sin_buf| {
-                            cuda::rope_f32(
-                                x_buf,
-                                cos_buf,
-                                sin_buf,
-                                b,
-                                h,
-                                seq_len,
-                                d,
-                                offset,
-                                self.max_seq_len,
-                            )
+                } else {
+                    let cuda_i8_out = if x.dtype() == DType::I8 {
+                        x.with_cuda_f32_buffer(|x_buf| {
+                            self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
+                                self.sin_cache.with_cuda_f32_buffer(|sin_buf| {
+                                    cuda::rope_typed_i8_dynamic_buffer(
+                                        x_buf,
+                                        DType::F32,
+                                        None,
+                                        cos_buf,
+                                        sin_buf,
+                                        DType::F32,
+                                        None,
+                                        None,
+                                        b,
+                                        h,
+                                        seq_len,
+                                        d,
+                                        offset,
+                                        self.max_seq_len,
+                                    )
+                                })
+                            })
                         })
-                    })
-                });
-                if let Ok((buffer, out)) = cuda_out {
-                    let out = Array::from_shape_vec(ndarray::IxDyn(&shape), out)
-                        .expect("CUDA RoPE output shape build failed")
-                        .into_dyn();
-                    return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-                        out,
-                        x.dtype(),
-                        output_device,
-                        Some(buffer),
-                    );
+                    } else {
+                        Err("CUDA RoPE fused I8 fallback is only valid for I8 output".to_string())
+                    };
+                    if let Ok((i8_buffer, scale)) = cuda_i8_out {
+                        return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                            &shape,
+                            i8_buffer,
+                            output_device,
+                            DType::I8,
+                            Some(scale),
+                        );
+                    }
+
+                    let cuda_out = x.with_cuda_f32_buffer(|x_buf| {
+                        self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
+                            self.sin_cache.with_cuda_f32_buffer(|sin_buf| {
+                                cuda::rope_f32_buffer(
+                                    x_buf,
+                                    cos_buf,
+                                    sin_buf,
+                                    b,
+                                    h,
+                                    seq_len,
+                                    d,
+                                    offset,
+                                    self.max_seq_len,
+                                )
+                            })
+                        })
+                    });
+                    if let Ok(buffer) = cuda_out {
+                        if x.dtype() == DType::I8 {
+                            match cuda::quantize_f32_to_i8_dynamic_no_host(&buffer) {
+                                Ok((i8_buffer, scale)) => {
+                                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                        &shape,
+                                        i8_buffer,
+                                        output_device,
+                                        DType::I8,
+                                        Some(scale),
+                                    );
+                                }
+                                Err(err) => {
+                                    assert!(
+                                        !is_strict_device_execution(),
+                                        "CUDA RoPE I8 output quantization failed while strict device execution is enabled: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        if matches!(x.dtype(), DType::F16 | DType::BF16) {
+                            match cuda::f32_to_lowp_storage_no_host(&buffer, x.dtype()) {
+                                Ok(lowp_buffer) => {
+                                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                        &shape,
+                                        lowp_buffer,
+                                        output_device,
+                                        x.dtype(),
+                                        None,
+                                    );
+                                }
+                                Err(err) => {
+                                    assert!(
+                                        !is_strict_device_execution(),
+                                        "CUDA RoPE {:?} output conversion failed while strict device execution is enabled: {err}",
+                                        x.dtype()
+                                    );
+                                }
+                            }
+                        }
+                        return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                            &shape,
+                            buffer,
+                            output_device,
+                            x.dtype(),
+                        );
+                    }
                 }
             }
 
@@ -485,7 +679,7 @@ impl RotaryEmbedding {
             });
         }
 
-        if output_device == Device::Cuda && x.len() > 0 {
+        if output_device == Device::Cuda && !x.is_empty() {
             let shape = x.shape_vec();
             assert_eq!(shape.len(), 4, "RoPE expects input [B,H,S,D]");
             let (b, h, seq_len, d) = (shape[0], shape[1], shape[2], shape[3]);
@@ -498,23 +692,70 @@ impl RotaryEmbedding {
                 );
             }
 
-            let cuda_out = x.with_cuda_f32_buffer(|x_buf| {
-                self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
-                    self.sin_cache.with_cuda_f32_buffer(|sin_buf| {
-                        cuda::rope_f32_buffer(
-                            x_buf,
-                            cos_buf,
-                            sin_buf,
-                            b,
-                            h,
-                            seq_len,
-                            d,
-                            offset,
-                            self.max_seq_len,
-                        )
+            let cuda_out = if let (
+                Some((x_dtype, x_buf, x_scale)),
+                Some((cos_dtype, cos_buf, cos_scale)),
+                Some((sin_dtype, sin_buf, sin_scale)),
+            ) = (
+                x.cloned_cuda_native_lowp_buffer(),
+                cuda_rope_storage_buffer(&self.cos_cache),
+                cuda_rope_storage_buffer(&self.sin_cache),
+            ) {
+                if cos_dtype == sin_dtype {
+                    cuda::rope_typed_buffer(
+                        &x_buf,
+                        x_dtype,
+                        x_scale,
+                        &cos_buf,
+                        &sin_buf,
+                        cos_dtype,
+                        cos_scale,
+                        sin_scale,
+                        b,
+                        h,
+                        seq_len,
+                        d,
+                        offset,
+                        self.max_seq_len,
+                    )
+                } else {
+                    x.with_cuda_f32_buffer(|x_buf| {
+                        self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
+                            self.sin_cache.with_cuda_f32_buffer(|sin_buf| {
+                                cuda::rope_f32_buffer(
+                                    x_buf,
+                                    cos_buf,
+                                    sin_buf,
+                                    b,
+                                    h,
+                                    seq_len,
+                                    d,
+                                    offset,
+                                    self.max_seq_len,
+                                )
+                            })
+                        })
+                    })
+                }
+            } else {
+                x.with_cuda_f32_buffer(|x_buf| {
+                    self.cos_cache.with_cuda_f32_buffer(|cos_buf| {
+                        self.sin_cache.with_cuda_f32_buffer(|sin_buf| {
+                            cuda::rope_f32_buffer(
+                                x_buf,
+                                cos_buf,
+                                sin_buf,
+                                b,
+                                h,
+                                seq_len,
+                                d,
+                                offset,
+                                self.max_seq_len,
+                            )
+                        })
                     })
                 })
-            });
+            };
             if let Ok(buffer) = cuda_out {
                 let x_clone = x.clone();
                 let cos_cache = self.cos_cache.clone();
@@ -529,6 +770,9 @@ impl RotaryEmbedding {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: Some(buffer),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: crate::precision::DType::F32,
@@ -740,6 +984,9 @@ impl RotaryEmbedding {
                             bf16_data: None,
                             i8_data: None,
                             cuda_f32_data: None,
+                            cuda_f16_data: None,
+                            cuda_bf16_data: None,
+                            cuda_i8_data: None,
                             i8_scale: None,
                             has_f32_data: true,
                             storage_dtype: crate::precision::DType::F32,
@@ -903,9 +1150,19 @@ mod tests {
     use super::*;
     use crate::autograd::no_grad;
     #[cfg(feature = "cuda")]
-    use crate::autograd::set_strict_device_execution;
+    use crate::autograd::set_strict_device_execution_scoped;
     use crate::precision::{PrecisionConfig, with_precision_config};
     use ndarray::{Array, IxDyn};
+    #[cfg(feature = "cuda")]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    #[cfg(feature = "cuda")]
+    fn cuda_strict_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("cuda strict test mutex poisoned")
+    }
 
     fn make_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
         let t = Tensor::from_array_no_grad(
@@ -1003,6 +1260,7 @@ mod tests {
         if !crate::ops::cuda::is_available() {
             return;
         }
+        let _test_guard = cuda_strict_test_guard();
 
         let rope = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::BF16);
         let rope_ref = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::BF16);
@@ -1016,16 +1274,38 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(rope.cos_cache.0.borrow().cuda_f32_data.is_none());
+        assert!(rope.sin_cache.0.borrow().cuda_f32_data.is_none());
 
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let cuda_out = no_grad(|| rope.forward(&input, 1));
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
+        let cuda_out = {
+            let _cuda_guard = crate::ops::cuda::set_enabled_scoped(true);
+            let _strict_guard = set_strict_device_execution_scoped(true);
+            let cuda_out = no_grad(|| rope.forward(&input, 1));
+            assert!(input.0.borrow().cuda_f32_data.is_none());
+            assert!(rope.cos_cache.0.borrow().cuda_f32_data.is_none());
+            assert!(rope.sin_cache.0.borrow().cuda_f32_data.is_none());
+            cuda_out
+        };
 
         let cpu_out = no_grad(|| rope_ref.forward(&input.to_cpu(), 1));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA RoPE BF16 no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA RoPE BF16 no-grad output should not retain only an f32 compute buffer"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA RoPE BF16 no-grad output should keep resident bf16 storage"
+            );
+        }
 
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -1038,16 +1318,17 @@ mod tests {
         if !crate::ops::cuda::is_available() {
             return;
         }
+        let _test_guard = cuda_strict_test_guard();
 
         let rope = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::BF16);
         rope.to_cuda();
         let input = make_tensor(&[1, 2, 0, 4], vec![], DType::BF16).to_cuda();
 
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let out = no_grad(|| rope.forward(&input, 3));
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
+        let out = {
+            let _cuda_guard = crate::ops::cuda::set_enabled_scoped(true);
+            let _strict_guard = set_strict_device_execution_scoped(true);
+            no_grad(|| rope.forward(&input, 3))
+        };
 
         assert!(out.is_cuda());
         assert_eq!(out.dtype(), DType::BF16);
@@ -1061,6 +1342,7 @@ mod tests {
         if !crate::ops::cuda::is_available() {
             return;
         }
+        let _test_guard = cuda_strict_test_guard();
 
         let rope = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::F32);
         let rope_ref = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::F32);
@@ -1088,15 +1370,15 @@ mod tests {
         let input_cuda = input_cpu.to_cuda();
         let coeff_cuda = coeff_cpu.to_cuda();
 
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let cuda_out = rope.forward(&input_cuda, 1);
-        let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
-        cuda_loss.backward();
-        assert!(input_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!input_cuda.has_host_grad());
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
+        {
+            let _cuda_guard = crate::ops::cuda::set_enabled_scoped(true);
+            let _strict_guard = set_strict_device_execution_scoped(true);
+            let cuda_out = rope.forward(&input_cuda, 1);
+            let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
+            cuda_loss.backward();
+            assert!(input_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(!input_cuda.has_host_grad());
+        }
 
         let cpu_out = rope_ref.forward(&input_cpu, 1);
         let cpu_loss = crate::ops::arithmetic::sum(&(&cpu_out * &coeff_cpu));
@@ -1115,23 +1397,44 @@ mod tests {
         if !crate::ops::cuda::is_available() {
             return;
         }
+        let _test_guard = cuda_strict_test_guard();
 
         let rope = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::BF16);
+        let rope_ref = RotaryEmbedding::new_with_dtype(4, 8, 10000.0, DType::BF16);
         rope.to_cuda();
-        let input = make_tensor(
-            &[1, 1, 2, 4],
-            vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.5, -3.0],
-            DType::I8,
-        )
-        .to_cuda();
+        let input_values = vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.5, -3.0];
+        let input = make_tensor(&[1, 1, 2, 4], input_values.clone(), DType::I8).to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
 
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let out = no_grad(|| rope.forward(&input, 0));
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
+        let out = {
+            let _cuda_guard = crate::ops::cuda::set_enabled_scoped(true);
+            let _strict_guard = set_strict_device_execution_scoped(true);
+            no_grad(|| rope.forward(&input, 0))
+        };
 
         assert!(out.is_cuda());
         assert_eq!(out.dtype(), DType::I8);
+        {
+            let inner = out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA RoPE I8 no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA RoPE I8 no-grad output should not retain only an f32 compute buffer"
+            );
+            assert!(
+                inner.cuda_i8_data.is_some(),
+                "CUDA RoPE I8 no-grad output should keep resident i8 storage"
+            );
+            assert!(inner.i8_scale.is_some());
+        }
+
+        let cpu_input = make_tensor(&[1, 1, 2, 4], input_values, DType::I8);
+        let cpu_out = no_grad(|| rope_ref.forward(&cpu_input, 0));
+        for (got, expect) in out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
+            assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
+        }
     }
 }

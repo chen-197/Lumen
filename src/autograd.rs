@@ -1,21 +1,31 @@
 // src/autograd.rs
+use crate::ops::fp_kernels::{
+    adam_update_bf16_f32_arch, adam_update_f16_f32_arch, sgd_momentum_update_bf16_f32_arch,
+    sgd_momentum_update_f16_f32_arch, sgd_update_bf16_f32_arch, sgd_update_f16_f32_arch,
+};
+use crate::ops::int8_kernels::{
+    adam_update_i8_f32_arch, sgd_momentum_update_i8_f32_arch, sgd_update_i8_f32_arch,
+};
 use crate::precision::{
     DType, ParameterQuantization, allow_parameter_dtype_copies, default_parameter_dtype,
     default_parameter_quantization,
 };
 use half::{bf16, f16, slice::HalfFloatSliceExt};
+use ndarray::Zip;
 use ndarray::prelude::*;
 pub use ndarray::{ArcArray, IxDyn};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+pub type BackwardOp = Rc<dyn Fn(&ArrayViewD<f32>)>;
+
 thread_local! {
     static INFERENCE_MODE: Cell<bool> = const { Cell::new(false) };
     static NO_GRAD_DEPTH: Cell<usize> = const { Cell::new(0) };
     static F32_COMPUTE_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static STRICT_DEVICE_EXECUTION: Cell<bool> = Cell::new(env_strict_device_execution());
 }
 
 pub struct NoGradGuard {
@@ -71,17 +81,12 @@ fn env_strict_device_execution() -> bool {
         .unwrap_or(false)
 }
 
-fn strict_device_execution_toggle() -> &'static AtomicBool {
-    static STRICT_DEVICE_EXECUTION: OnceLock<AtomicBool> = OnceLock::new();
-    STRICT_DEVICE_EXECUTION.get_or_init(|| AtomicBool::new(env_strict_device_execution()))
-}
-
 pub fn set_strict_device_execution(enabled: bool) {
-    strict_device_execution_toggle().store(enabled, Ordering::Relaxed);
+    STRICT_DEVICE_EXECUTION.with(|flag| flag.set(enabled));
 }
 
 pub fn is_strict_device_execution() -> bool {
-    strict_device_execution_toggle().load(Ordering::Relaxed)
+    STRICT_DEVICE_EXECUTION.with(|flag| flag.get())
 }
 
 pub struct StrictDeviceExecutionGuard {
@@ -212,6 +217,9 @@ pub struct TensorData {
     pub bf16_data: Option<ArcArray<bf16, IxDyn>>,
     pub i8_data: Option<ArcArray<i8, IxDyn>>,
     pub cuda_f32_data: Option<crate::ops::cuda::CudaBuffer>,
+    pub cuda_f16_data: Option<crate::ops::cuda::CudaBuffer>,
+    pub cuda_bf16_data: Option<crate::ops::cuda::CudaBuffer>,
+    pub cuda_i8_data: Option<crate::ops::cuda::CudaBuffer>,
     pub i8_scale: Option<f32>,
     pub has_f32_data: bool,
     pub storage_dtype: DType,
@@ -222,7 +230,7 @@ pub struct TensorData {
     pub cuda_f32_grad: Option<crate::ops::cuda::CudaBuffer>,
     pub parents: Vec<Tensor>,
     // backward_op 接收 grad 的 view，避免在反传遍历时额外 to_owned
-    pub backward_op: Option<Rc<dyn Fn(&ArrayViewD<f32>)>>,
+    pub backward_op: Option<BackwardOp>,
     pub requires_grad: bool,
     pub device: Device,
 }
@@ -252,6 +260,9 @@ impl Tensor {
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: true,
                 storage_dtype: DType::F32,
@@ -272,6 +283,9 @@ impl Tensor {
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: false,
                 storage_dtype: DType::F16,
@@ -292,6 +306,9 @@ impl Tensor {
                 f16_data: None,
                 i8_data: None,
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: false,
                 storage_dtype: DType::BF16,
@@ -310,6 +327,9 @@ impl Tensor {
                 bf16_data: None,
                 i8_data: Some(ArrayD::<i8>::zeros(shape_dyn).into_shared()),
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: Some(i8_scale.unwrap_or(1.0)),
                 has_f32_data: false,
                 storage_dtype: DType::I8,
@@ -330,6 +350,7 @@ impl Tensor {
         scale_override: Option<f32>,
     ) -> (ArcArray<i8, IxDyn>, f32) {
         let shape = data.shape().to_vec();
+        let max_abs = Self::finite_max_abs(data.iter().copied());
         let scale = if let Some(scale) = scale_override {
             assert!(
                 scale.is_finite() && scale > 0.0,
@@ -338,8 +359,11 @@ impl Tensor {
             );
             scale
         } else {
-            let max_abs = data.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-            if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+            if max_abs > 0.0 {
+                (max_abs / 127.0).max(f32::MIN_POSITIVE)
+            } else {
+                1.0
+            }
         };
         let inv_scale = 1.0 / scale;
         let raw = data
@@ -360,6 +384,7 @@ impl Tensor {
         dst: &mut [i8],
     ) -> f32 {
         assert_eq!(data.len(), dst.len(), "quantized dst len mismatch");
+        let max_abs = Self::finite_max_abs(data.iter().copied());
         let scale = if let Some(scale) = scale_override {
             assert!(
                 scale.is_finite() && scale > 0.0,
@@ -368,8 +393,11 @@ impl Tensor {
             );
             scale
         } else {
-            let max_abs = data.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-            if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+            if max_abs > 0.0 {
+                (max_abs / 127.0).max(f32::MIN_POSITIVE)
+            } else {
+                1.0
+            }
         };
         let inv_scale = 1.0 / scale;
         for (src, dst) in data.iter().zip(dst.iter_mut()) {
@@ -384,6 +412,7 @@ impl Tensor {
         dst: &mut [i8],
     ) -> f32 {
         assert_eq!(data.len(), dst.len(), "quantized dst len mismatch");
+        let max_abs = Self::finite_max_abs(data.iter().map(|&v| v.to_f32()));
         let scale = if let Some(scale) = scale_override {
             assert!(
                 scale.is_finite() && scale > 0.0,
@@ -392,11 +421,11 @@ impl Tensor {
             );
             scale
         } else {
-            let max_abs = data
-                .iter()
-                .map(|&v| v.to_f32().abs())
-                .fold(0.0f32, f32::max);
-            if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+            if max_abs > 0.0 {
+                (max_abs / 127.0).max(f32::MIN_POSITIVE)
+            } else {
+                1.0
+            }
         };
         let inv_scale = 1.0 / scale;
         for (src, dst) in data.iter().zip(dst.iter_mut()) {
@@ -411,6 +440,7 @@ impl Tensor {
         dst: &mut [i8],
     ) -> f32 {
         assert_eq!(data.len(), dst.len(), "quantized dst len mismatch");
+        let max_abs = Self::finite_max_abs(data.iter().map(|&v| v.to_f32()));
         let scale = if let Some(scale) = scale_override {
             assert!(
                 scale.is_finite() && scale > 0.0,
@@ -419,17 +449,29 @@ impl Tensor {
             );
             scale
         } else {
-            let max_abs = data
-                .iter()
-                .map(|&v| v.to_f32().abs())
-                .fold(0.0f32, f32::max);
-            if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+            if max_abs > 0.0 {
+                (max_abs / 127.0).max(f32::MIN_POSITIVE)
+            } else {
+                1.0
+            }
         };
         let inv_scale = 1.0 / scale;
         for (src, dst) in data.iter().zip(dst.iter_mut()) {
             *dst = (src.to_f32() * inv_scale).round().clamp(-127.0, 127.0) as i8;
         }
         scale
+    }
+
+    fn finite_max_abs(values: impl Iterator<Item = f32>) -> f32 {
+        let mut max_abs = 0.0f32;
+        for value in values {
+            assert!(
+                value.is_finite(),
+                "cannot quantize non-finite value to I8: {value}"
+            );
+            max_abs = max_abs.max(value.abs());
+        }
+        max_abs
     }
 
     fn quantize_f32_slice_to_i8(
@@ -731,23 +773,26 @@ impl Tensor {
 
     fn clear_cuda_storage(inner: &mut TensorData) {
         inner.cuda_f32_data = None;
+        inner.cuda_f16_data = None;
+        inner.cuda_bf16_data = None;
+        inner.cuda_i8_data = None;
     }
 
     fn logical_shape(inner: &TensorData) -> &[usize] {
-        if inner.storage_dtype == DType::F16 {
-            if let Some(f16_data) = inner.f16_data.as_ref() {
-                return f16_data.shape();
-            }
+        if inner.storage_dtype == DType::F16
+            && let Some(f16_data) = inner.f16_data.as_ref()
+        {
+            return f16_data.shape();
         }
-        if inner.storage_dtype == DType::BF16 {
-            if let Some(bf16_data) = inner.bf16_data.as_ref() {
-                return bf16_data.shape();
-            }
+        if inner.storage_dtype == DType::BF16
+            && let Some(bf16_data) = inner.bf16_data.as_ref()
+        {
+            return bf16_data.shape();
         }
-        if inner.storage_dtype == DType::I8 {
-            if let Some(i8_data) = inner.i8_data.as_ref() {
-                return i8_data.shape();
-            }
+        if inner.storage_dtype == DType::I8
+            && let Some(i8_data) = inner.i8_data.as_ref()
+        {
+            return i8_data.shape();
         }
 
         if inner.has_f32_data {
@@ -759,6 +804,13 @@ impl Tensor {
         } else {
             inner.data.shape()
         }
+    }
+
+    fn checked_shape_len(shape: &[usize], context: &str) -> usize {
+        shape
+            .iter()
+            .try_fold(1usize, |len, &dim| len.checked_mul(dim))
+            .unwrap_or_else(|| panic!("{context} shape element count overflow"))
     }
 
     fn build_tensor_data(
@@ -774,6 +826,9 @@ impl Tensor {
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: true,
                 storage_dtype: DType::F32,
@@ -792,6 +847,9 @@ impl Tensor {
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: false,
                 storage_dtype: DType::F16,
@@ -810,6 +868,9 @@ impl Tensor {
                 bf16_data: Some(Self::f32_array_to_bf16(&f32_data)),
                 i8_data: None,
                 cuda_f32_data: None,
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: false,
                 storage_dtype: DType::BF16,
@@ -830,6 +891,9 @@ impl Tensor {
                     bf16_data: None,
                     i8_data: Some(i8_data),
                     cuda_f32_data: None,
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: Some(scale),
                     has_f32_data: false,
                     storage_dtype: DType::I8,
@@ -870,12 +934,31 @@ impl Tensor {
             return;
         }
 
-        if let Some(buffer) = inner.cuda_f32_data.as_ref()
-            && inner.storage_dtype != DType::I8
-        {
+        let should_download_cuda_f32 = if inner.cuda_f32_data.is_some() {
+            inner.storage_dtype == DType::F32
+                || inner.cache_dirty
+                || match inner.storage_dtype {
+                    DType::F32 => false,
+                    DType::F16 => inner.f16_data.is_none(),
+                    DType::BF16 => inner.bf16_data.is_none(),
+                    DType::I8 => inner.i8_data.is_none(),
+                }
+        } else {
+            false
+        };
+
+        if should_download_cuda_f32 {
+            let buffer = inner
+                .cuda_f32_data
+                .as_ref()
+                .expect("CUDA download requested without resident buffer");
             let host_data = crate::ops::cuda::download_f32(buffer)
                 .unwrap_or_else(|err| panic!("Failed to download CUDA tensor to host: {}", err));
             let shape = Self::logical_shape(&inner).to_vec();
+            let keep_parameter_dtype = !mutable
+                && inner.is_parameter
+                && inner.storage_dtype != DType::F32
+                && allow_parameter_dtype_copies();
             inner.data = Array::from_shape_vec(IxDyn(&shape), host_data)
                 .expect("Failed to materialize host f32 storage from CUDA buffer")
                 .into_shared();
@@ -883,11 +966,88 @@ impl Tensor {
             if mutable {
                 Self::clear_cuda_storage(&mut inner);
             }
-            if mutable || !inner.is_parameter || !allow_parameter_dtype_copies() {
+            if keep_parameter_dtype {
+                inner.cache_dirty = true;
+            } else if mutable || !inner.is_parameter || !allow_parameter_dtype_copies() {
                 inner.storage_dtype = DType::F32;
                 Self::clear_non_f32_storage(&mut inner);
+                inner.cache_dirty = false;
+            } else {
+                inner.cache_dirty = false;
             }
-            inner.cache_dirty = false;
+            return;
+        }
+
+        let cuda_native_buffer = match inner.storage_dtype {
+            DType::F16 if inner.f16_data.is_none() => inner
+                .cuda_f16_data
+                .clone()
+                .map(|buffer| (DType::F16, buffer)),
+            DType::BF16 if inner.bf16_data.is_none() => inner
+                .cuda_bf16_data
+                .clone()
+                .map(|buffer| (DType::BF16, buffer)),
+            DType::I8 if inner.i8_data.is_none() => {
+                inner.cuda_i8_data.clone().map(|buffer| (DType::I8, buffer))
+            }
+            _ => None,
+        };
+        if let Some((dtype, buffer)) = cuda_native_buffer {
+            let shape = Self::logical_shape(&inner).to_vec();
+            match dtype {
+                DType::F16 => {
+                    let bits =
+                        crate::ops::cuda::download_u16_storage(&buffer).unwrap_or_else(|err| {
+                            panic!("Failed to download CUDA F16 tensor to host: {}", err)
+                        });
+                    let values = bits.into_iter().map(f16::from_bits).collect::<Vec<_>>();
+                    let host = Array::from_shape_vec(IxDyn(&shape), values)
+                        .expect("Failed to materialize host f16 storage from CUDA buffer")
+                        .into_shared();
+                    inner.data = Self::f16_arc_to_f32(&host);
+                    inner.f16_data = Some(host);
+                }
+                DType::BF16 => {
+                    let bits =
+                        crate::ops::cuda::download_u16_storage(&buffer).unwrap_or_else(|err| {
+                            panic!("Failed to download CUDA BF16 tensor to host: {}", err)
+                        });
+                    let values = bits.into_iter().map(bf16::from_bits).collect::<Vec<_>>();
+                    let host = Array::from_shape_vec(IxDyn(&shape), values)
+                        .expect("Failed to materialize host bf16 storage from CUDA buffer")
+                        .into_shared();
+                    inner.data = Self::bf16_arc_to_f32(&host);
+                    inner.bf16_data = Some(host);
+                }
+                DType::I8 => {
+                    let values =
+                        crate::ops::cuda::download_i8_storage(&buffer).unwrap_or_else(|err| {
+                            panic!("Failed to download CUDA I8 tensor to host: {}", err)
+                        });
+                    let scale = inner
+                        .i8_scale
+                        .expect("I8 tensor missing quantization scale");
+                    let host = Array::from_shape_vec(IxDyn(&shape), values)
+                        .expect("Failed to materialize host i8 storage from CUDA buffer")
+                        .into_shared();
+                    inner.data = Self::i8_arc_to_f32(&host, scale);
+                    inner.i8_data = Some(host);
+                }
+                DType::F32 => unreachable!("native CUDA lowp materialization excludes f32"),
+            }
+            inner.has_f32_data = true;
+            if mutable {
+                Self::clear_cuda_storage(&mut inner);
+            }
+            if mutable || !inner.is_parameter || !allow_parameter_dtype_copies() {
+                inner.storage_dtype = DType::F32;
+                if inner.is_parameter && allow_parameter_dtype_copies() && mutable {
+                    inner.cache_dirty = true;
+                } else {
+                    Self::clear_non_f32_storage(&mut inner);
+                    inner.cache_dirty = false;
+                }
+            }
             return;
         }
 
@@ -962,10 +1122,78 @@ impl Tensor {
         if self.0.borrow().cuda_f32_data.is_some() {
             return;
         }
-        if self.len() == 0 {
+        if self.is_empty() {
             let mut inner = self.0.borrow_mut();
             inner.device = Device::Cuda;
             inner.cuda_f32_data = None;
+            return;
+        }
+
+        let native_cuda_source = {
+            let inner = self.0.borrow();
+            if !inner.has_f32_data && inner.cuda_f32_data.is_none() {
+                match inner.storage_dtype {
+                    DType::F16 if inner.f16_data.is_none() => inner
+                        .cuda_f16_data
+                        .clone()
+                        .map(|buffer| (DType::F16, buffer)),
+                    DType::BF16 if inner.bf16_data.is_none() => inner
+                        .cuda_bf16_data
+                        .clone()
+                        .map(|buffer| (DType::BF16, buffer)),
+                    DType::I8 if inner.i8_data.is_none() => {
+                        inner.cuda_i8_data.clone().map(|buffer| (DType::I8, buffer))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((dtype, native_buffer)) = native_cuda_source {
+            let shape = self.shape_vec();
+            let host_data = match dtype {
+                DType::F16 => crate::ops::cuda::download_u16_storage(&native_buffer)
+                    .unwrap_or_else(|err| {
+                        panic!("Failed to download CUDA F16 tensor for f32 upload: {}", err)
+                    })
+                    .into_iter()
+                    .map(|bits| f16::from_bits(bits).to_f32())
+                    .collect::<Vec<_>>(),
+                DType::BF16 => crate::ops::cuda::download_u16_storage(&native_buffer)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "Failed to download CUDA BF16 tensor for f32 upload: {}",
+                            err
+                        )
+                    })
+                    .into_iter()
+                    .map(|bits| bf16::from_bits(bits).to_f32())
+                    .collect::<Vec<_>>(),
+                DType::I8 => {
+                    let scale = self
+                        .0
+                        .borrow()
+                        .i8_scale
+                        .expect("I8 tensor missing quantization scale");
+                    crate::ops::cuda::download_i8_storage(&native_buffer)
+                        .unwrap_or_else(|err| {
+                            panic!("Failed to download CUDA I8 tensor for f32 upload: {}", err)
+                        })
+                        .into_iter()
+                        .map(|value| (value as f32) * scale)
+                        .collect::<Vec<_>>()
+                }
+                DType::F32 => unreachable!("native CUDA f32 upload excludes f32"),
+            };
+            let buffer = crate::ops::cuda::upload_f32(&host_data)
+                .unwrap_or_else(|err| panic!("Failed to upload tensor to CUDA: {}", err));
+            let mut inner = self.0.borrow_mut();
+            inner.data = Array::from_shape_vec(IxDyn(&shape), host_data)
+                .expect("Failed to materialize host f32 storage from CUDA native buffer")
+                .into_shared();
+            inner.has_f32_data = true;
+            inner.cuda_f32_data = Some(buffer);
             return;
         }
 
@@ -976,6 +1204,123 @@ impl Tensor {
         let mut inner = self.0.borrow_mut();
         inner.device = Device::Cuda;
         inner.cuda_f32_data = Some(buffer);
+    }
+
+    fn ensure_cuda_native_lowp_data(&self) {
+        assert!(
+            self.device() == Device::Cuda,
+            "ensure_cuda_native_lowp_data expects a CUDA tensor"
+        );
+        if self.is_empty() {
+            return;
+        }
+
+        let should_upload = {
+            let inner = self.0.borrow();
+            if inner.cache_dirty {
+                return;
+            }
+            match inner.storage_dtype {
+                DType::F16 => inner.cuda_f16_data.is_none() && inner.f16_data.is_some(),
+                DType::BF16 => inner.cuda_bf16_data.is_none() && inner.bf16_data.is_some(),
+                DType::I8 => inner.cuda_i8_data.is_none() && inner.i8_data.is_some(),
+                DType::F32 => false,
+            }
+        };
+        if !should_upload {
+            return;
+        }
+
+        let owned = self.native_storage_owned();
+        let mut inner = self.0.borrow_mut();
+        match owned {
+            TensorStorageOwned::F16(data) if inner.storage_dtype == DType::F16 => {
+                if let Some(slice) = data.as_slice_memory_order() {
+                    let bits = slice.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    inner.cuda_f16_data = Some(
+                        crate::ops::cuda::upload_u16_storage(&bits).unwrap_or_else(|err| {
+                            panic!(
+                                "Failed to upload F16 tensor to CUDA native storage: {}",
+                                err
+                            )
+                        }),
+                    );
+                }
+            }
+            TensorStorageOwned::BF16(data) if inner.storage_dtype == DType::BF16 => {
+                if let Some(slice) = data.as_slice_memory_order() {
+                    let bits = slice.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    inner.cuda_bf16_data = Some(
+                        crate::ops::cuda::upload_u16_storage(&bits).unwrap_or_else(|err| {
+                            panic!(
+                                "Failed to upload BF16 tensor to CUDA native storage: {}",
+                                err
+                            )
+                        }),
+                    );
+                }
+            }
+            TensorStorageOwned::I8(data, _) if inner.storage_dtype == DType::I8 => {
+                if let Some(slice) = data.as_slice_memory_order() {
+                    inner.cuda_i8_data = Some(
+                        crate::ops::cuda::upload_i8_storage(slice).unwrap_or_else(|err| {
+                            panic!("Failed to upload I8 tensor to CUDA native storage: {}", err)
+                        }),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn cloned_cuda_native_lowp_buffer(
+        &self,
+    ) -> Option<(DType, crate::ops::cuda::CudaBuffer, Option<f32>)> {
+        if self.device() != Device::Cuda {
+            return None;
+        }
+        {
+            let inner = self.0.borrow();
+            if inner.cache_dirty {
+                return None;
+            }
+            match inner.storage_dtype {
+                DType::F16 => {
+                    if let Some(buffer) = inner.cuda_f16_data.clone() {
+                        return Some((DType::F16, buffer, None));
+                    }
+                }
+                DType::BF16 => {
+                    if let Some(buffer) = inner.cuda_bf16_data.clone() {
+                        return Some((DType::BF16, buffer, None));
+                    }
+                }
+                DType::I8 => {
+                    if let Some(buffer) = inner.cuda_i8_data.clone() {
+                        return Some((DType::I8, buffer, inner.i8_scale));
+                    }
+                }
+                DType::F32 => return None,
+            }
+        }
+
+        self.ensure_cuda_native_lowp_data();
+        let inner = self.0.borrow();
+        match inner.storage_dtype {
+            DType::F16 => inner
+                .cuda_f16_data
+                .clone()
+                .map(|buffer| (DType::F16, buffer, None)),
+            DType::BF16 => inner
+                .cuda_bf16_data
+                .clone()
+                .map(|buffer| (DType::BF16, buffer, None)),
+            DType::I8 => inner
+                .cuda_i8_data
+                .clone()
+                .map(|buffer| (DType::I8, buffer, inner.i8_scale)),
+            DType::F32 => None,
+        }
     }
 
     pub(crate) fn with_cuda_f32_buffer<R>(
@@ -1008,6 +1353,9 @@ impl Tensor {
         let mut inner = self.0.borrow_mut();
         inner.device = Device::Cuda;
         inner.cuda_f32_data = Some(buffer);
+        inner.cuda_f16_data = None;
+        inner.cuda_bf16_data = None;
+        inner.cuda_i8_data = None;
     }
 
     pub(crate) fn replace_cuda_f32_buffer_no_host_sync(
@@ -1018,7 +1366,7 @@ impl Tensor {
             let inner = self.0.borrow();
             Self::logical_shape(&inner).to_vec()
         };
-        let len = shape.iter().product::<usize>();
+        let len = Self::checked_shape_len(&shape, "CUDA tensor buffer replacement");
         assert_eq!(
             buffer.len(),
             len,
@@ -1028,13 +1376,19 @@ impl Tensor {
         );
 
         let mut inner = self.0.borrow_mut();
-        Self::clear_non_f32_storage(&mut inner);
+        let storage_dtype = inner.storage_dtype;
+        if storage_dtype == DType::F32 {
+            Self::clear_non_f32_storage(&mut inner);
+        }
         inner.data = ArrayD::<f32>::zeros(IxDyn(&shape)).into_shared();
         inner.has_f32_data = false;
-        inner.storage_dtype = DType::F32;
-        inner.cache_dirty = false;
+        inner.storage_dtype = storage_dtype;
+        inner.cache_dirty = storage_dtype != DType::F32;
         inner.device = Device::Cuda;
         inner.cuda_f32_data = Some(buffer);
+        inner.cuda_f16_data = None;
+        inner.cuda_bf16_data = None;
+        inner.cuda_i8_data = None;
         inner.grad = None;
         inner.cuda_f32_grad = None;
     }
@@ -1209,20 +1563,20 @@ impl Tensor {
     #[inline]
     pub fn len(&self) -> usize {
         let inner = self.0.borrow();
-        if inner.storage_dtype == DType::F16 {
-            if let Some(f16_data) = inner.f16_data.as_ref() {
-                return f16_data.len();
-            }
+        if inner.storage_dtype == DType::F16
+            && let Some(f16_data) = inner.f16_data.as_ref()
+        {
+            return f16_data.len();
         }
-        if inner.storage_dtype == DType::BF16 {
-            if let Some(bf16_data) = inner.bf16_data.as_ref() {
-                return bf16_data.len();
-            }
+        if inner.storage_dtype == DType::BF16
+            && let Some(bf16_data) = inner.bf16_data.as_ref()
+        {
+            return bf16_data.len();
         }
-        if inner.storage_dtype == DType::I8 {
-            if let Some(i8_data) = inner.i8_data.as_ref() {
-                return i8_data.len();
-            }
+        if inner.storage_dtype == DType::I8
+            && let Some(i8_data) = inner.i8_data.as_ref()
+        {
+            return i8_data.len();
         }
         if inner.has_f32_data {
             inner.data.len()
@@ -1235,6 +1589,11 @@ impl Tensor {
         } else {
             inner.data.len()
         }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     #[inline]
@@ -1954,6 +2313,9 @@ impl Tensor {
                         && allow_parameter_dtype_copies()
                         && inner.storage_dtype != DType::F32)
                         || (inner.storage_dtype == DType::F32 && !inner.has_f32_data)
+                        || (inner.cache_dirty
+                            && inner.cuda_f32_data.is_some()
+                            && !inner.has_f32_data)
                         || (inner.cuda_f32_data.is_some()
                             && ((inner.storage_dtype == DType::F16 && inner.f16_data.is_none())
                                 || (inner.storage_dtype == DType::BF16
@@ -1961,6 +2323,9 @@ impl Tensor {
                 }
                 StoragePreference::Native => {
                     (inner.storage_dtype == DType::F32 && !inner.has_f32_data)
+                        || (inner.cache_dirty
+                            && inner.cuda_f32_data.is_some()
+                            && !inner.has_f32_data)
                         || (inner.cuda_f32_data.is_some()
                             && ((inner.storage_dtype == DType::F16 && inner.f16_data.is_none())
                                 || (inner.storage_dtype == DType::BF16
@@ -2004,9 +2369,7 @@ impl Tensor {
                 .i8_scale
                 .expect("I8 tensor missing quantization scale");
             drop(inner);
-            return Self::with_i8_compute_view(&i8_data, scale, |view| {
-                f(TensorStorageView::F32(view))
-            });
+            Self::with_i8_compute_view(&i8_data, scale, |view| f(TensorStorageView::F32(view)))
         } else {
             f(TensorStorageView::F32(inner.data.view()))
         }
@@ -2120,7 +2483,7 @@ impl Tensor {
     pub fn op_data(
         data: ArcArray<f32, IxDyn>,
         parents: Vec<Tensor>,
-        backward_op: Option<Rc<dyn Fn(&ArrayViewD<f32>)>>,
+        backward_op: Option<BackwardOp>,
         requires_grad: bool,
     ) -> TensorData {
         TensorData {
@@ -2129,6 +2492,9 @@ impl Tensor {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: DType::F32,
@@ -2181,6 +2547,32 @@ impl Tensor {
         self.0.borrow().grad.is_some()
     }
 
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_has_host_grad(&self) -> bool {
+        self.0.borrow().grad.is_some()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_has_cuda_f32_grad(&self) -> bool {
+        self.device() == Device::Cuda && self.0.borrow().cuda_f32_grad.is_some()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_has_cuda_i8_data(&self) -> bool {
+        self.device() == Device::Cuda && self.0.borrow().cuda_i8_data.is_some()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_has_host_f32_data(&self) -> bool {
+        self.0.borrow().has_f32_data
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_grad(&self) -> bool {
+        let inner = self.0.borrow();
+        inner.grad.is_some() || inner.cuda_f32_grad.is_some()
+    }
+
     // 获取数据的可变引用
     pub fn data_mut(&self) -> RefMut<'_, ArcArray<f32, IxDyn>> {
         self.ensure_f32_data(true);
@@ -2227,6 +2619,500 @@ impl Tensor {
         self.0.borrow().cuda_f32_grad.clone()
     }
 
+    pub(crate) fn apply_sgd_update_cpu(&self, lr: f32) -> bool {
+        if self.device() != Device::Cpu {
+            return false;
+        }
+        let Some(grad) = self.0.borrow().grad.clone() else {
+            return false;
+        };
+
+        if self.dtype() != DType::F32 && !self.has_host_f32_data() {
+            self.with_native_storage_view_mut(|view| match view {
+                TensorStorageViewMut::F32(_) => unreachable!("checked non-f32 dtype above"),
+                TensorStorageViewMut::F16(mut data) => {
+                    if let (Some(data_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !sgd_update_f16_f32_arch(data_slice, grad_slice, lr) {
+                            for (w, g) in data_slice.iter_mut().zip(grad_slice.iter()) {
+                                *w = f16::from_f32(w.to_f32() - lr * *g);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, g| {
+                                *w = f16::from_f32(w.to_f32() - lr * *g);
+                            });
+                    }
+                }
+                TensorStorageViewMut::BF16(mut data) => {
+                    if let (Some(data_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !sgd_update_bf16_f32_arch(data_slice, grad_slice, lr) {
+                            for (w, g) in data_slice.iter_mut().zip(grad_slice.iter()) {
+                                *w = bf16::from_f32(w.to_f32() - lr * *g);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, g| {
+                                *w = bf16::from_f32(w.to_f32() - lr * *g);
+                            });
+                    }
+                }
+                TensorStorageViewMut::I8(mut data, scale) => {
+                    let inv_scale = 1.0 / scale;
+                    let quantize = |value: f32| -> i8 {
+                        (value * inv_scale).round().clamp(-127.0, 127.0) as i8
+                    };
+                    if let (Some(data_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !sgd_update_i8_f32_arch(data_slice, scale, grad_slice, lr) {
+                            for (w, g) in data_slice.iter_mut().zip(grad_slice.iter()) {
+                                let updated = (*w as f32) * scale - lr * *g;
+                                *w = quantize(updated);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, g| {
+                                let updated = (*w as f32) * scale - lr * *g;
+                                *w = quantize(updated);
+                            });
+                    }
+                }
+            });
+            return true;
+        }
+
+        self.ensure_f32_data(true);
+        let mut inner = self.0.borrow_mut();
+        let data = &mut inner.data;
+        if let (Some(data_slice), Some(grad_slice)) = (
+            data.as_slice_memory_order_mut(),
+            grad.as_slice_memory_order(),
+        ) {
+            for (w, g) in data_slice.iter_mut().zip(grad_slice.iter()) {
+                *w -= lr * *g;
+            }
+        } else {
+            Zip::from(data.view_mut())
+                .and(grad.view())
+                .for_each(|w, g| *w -= lr * *g);
+        }
+        true
+    }
+
+    pub(crate) fn apply_sgd_momentum_update_cpu(
+        &self,
+        velocity: &Tensor,
+        lr: f32,
+        momentum: f32,
+    ) -> bool {
+        if self.device() != Device::Cpu
+            || velocity.device() != Device::Cpu
+            || velocity.dtype() != DType::F32
+            || Rc::ptr_eq(&self.0, &velocity.0)
+        {
+            return false;
+        }
+        let Some(grad) = self.0.borrow().grad.clone() else {
+            return false;
+        };
+
+        if self.dtype() != DType::F32 && !self.has_host_f32_data() {
+            velocity.ensure_f32_data(true);
+            let mut velocity_inner = velocity.0.borrow_mut();
+            let velocity_data = &mut velocity_inner.data;
+
+            self.with_native_storage_view_mut(|view| match view {
+                TensorStorageViewMut::F32(_) => unreachable!("checked non-f32 dtype above"),
+                TensorStorageViewMut::F16(mut data) => {
+                    if let (Some(data_slice), Some(velocity_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        velocity_data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !sgd_momentum_update_f16_f32_arch(
+                            data_slice,
+                            velocity_slice,
+                            grad_slice,
+                            lr,
+                            momentum,
+                        ) {
+                            for ((w, v), g) in data_slice
+                                .iter_mut()
+                                .zip(velocity_slice.iter_mut())
+                                .zip(grad_slice.iter())
+                            {
+                                *v = momentum * *v + *g;
+                                *w = f16::from_f32(w.to_f32() - lr * *v);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(velocity_data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, v, g| {
+                                *v = momentum * *v + *g;
+                                *w = f16::from_f32(w.to_f32() - lr * *v);
+                            });
+                    }
+                }
+                TensorStorageViewMut::BF16(mut data) => {
+                    if let (Some(data_slice), Some(velocity_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        velocity_data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !sgd_momentum_update_bf16_f32_arch(
+                            data_slice,
+                            velocity_slice,
+                            grad_slice,
+                            lr,
+                            momentum,
+                        ) {
+                            for ((w, v), g) in data_slice
+                                .iter_mut()
+                                .zip(velocity_slice.iter_mut())
+                                .zip(grad_slice.iter())
+                            {
+                                *v = momentum * *v + *g;
+                                *w = bf16::from_f32(w.to_f32() - lr * *v);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(velocity_data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, v, g| {
+                                *v = momentum * *v + *g;
+                                *w = bf16::from_f32(w.to_f32() - lr * *v);
+                            });
+                    }
+                }
+                TensorStorageViewMut::I8(mut data, scale) => {
+                    let inv_scale = 1.0 / scale;
+                    let quantize = |value: f32| -> i8 {
+                        (value * inv_scale).round().clamp(-127.0, 127.0) as i8
+                    };
+                    if let (Some(data_slice), Some(velocity_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        velocity_data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !sgd_momentum_update_i8_f32_arch(
+                            data_slice,
+                            scale,
+                            velocity_slice,
+                            grad_slice,
+                            lr,
+                            momentum,
+                        ) {
+                            for ((w, v), g) in data_slice
+                                .iter_mut()
+                                .zip(velocity_slice.iter_mut())
+                                .zip(grad_slice.iter())
+                            {
+                                *v = momentum * *v + *g;
+                                let updated = (*w as f32) * scale - lr * *v;
+                                *w = quantize(updated);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(velocity_data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, v, g| {
+                                *v = momentum * *v + *g;
+                                let updated = (*w as f32) * scale - lr * *v;
+                                *w = quantize(updated);
+                            });
+                    }
+                }
+            });
+            return true;
+        }
+
+        self.ensure_f32_data(true);
+        velocity.ensure_f32_data(true);
+        let mut param_inner = self.0.borrow_mut();
+        let mut velocity_inner = velocity.0.borrow_mut();
+        let data = &mut param_inner.data;
+        let velocity_data = &mut velocity_inner.data;
+
+        if let (Some(data_slice), Some(velocity_slice), Some(grad_slice)) = (
+            data.as_slice_memory_order_mut(),
+            velocity_data.as_slice_memory_order_mut(),
+            grad.as_slice_memory_order(),
+        ) {
+            for ((w, v), g) in data_slice
+                .iter_mut()
+                .zip(velocity_slice.iter_mut())
+                .zip(grad_slice.iter())
+            {
+                *v = momentum * *v + *g;
+                *w -= lr * *v;
+            }
+        } else {
+            Zip::from(data.view_mut())
+                .and(velocity_data.view_mut())
+                .and(grad.view())
+                .for_each(|w, v, g| {
+                    *v = momentum * *v + *g;
+                    *w -= lr * *v;
+                });
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_adam_update_cpu(
+        &self,
+        exp_avg: &Tensor,
+        exp_avg_sq: &Tensor,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        bias_correction1: f32,
+        bias_correction2: f32,
+        eps: f32,
+    ) -> bool {
+        if self.device() != Device::Cpu
+            || exp_avg.device() != Device::Cpu
+            || exp_avg_sq.device() != Device::Cpu
+            || exp_avg.dtype() != DType::F32
+            || exp_avg_sq.dtype() != DType::F32
+            || Rc::ptr_eq(&self.0, &exp_avg.0)
+            || Rc::ptr_eq(&self.0, &exp_avg_sq.0)
+            || Rc::ptr_eq(&exp_avg.0, &exp_avg_sq.0)
+        {
+            return false;
+        }
+        let Some(grad) = self.0.borrow().grad.clone() else {
+            return false;
+        };
+
+        if self.dtype() != DType::F32 && !self.has_host_f32_data() {
+            exp_avg.ensure_f32_data(true);
+            exp_avg_sq.ensure_f32_data(true);
+            let mut exp_avg_inner = exp_avg.0.borrow_mut();
+            let mut exp_avg_sq_inner = exp_avg_sq.0.borrow_mut();
+            let m_data = &mut exp_avg_inner.data;
+            let v_data = &mut exp_avg_sq_inner.data;
+
+            self.with_native_storage_view_mut(|view| match view {
+                TensorStorageViewMut::F32(_) => unreachable!("checked non-f32 dtype above"),
+                TensorStorageViewMut::F16(mut data) => {
+                    if let (Some(data_slice), Some(m_slice), Some(v_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        m_data.as_slice_memory_order_mut(),
+                        v_data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !adam_update_f16_f32_arch(
+                            data_slice,
+                            m_slice,
+                            v_slice,
+                            grad_slice,
+                            lr,
+                            beta1,
+                            beta2,
+                            bias_correction1,
+                            bias_correction2,
+                            eps,
+                        ) {
+                            for (((w, m), v), g) in data_slice
+                                .iter_mut()
+                                .zip(m_slice.iter_mut())
+                                .zip(v_slice.iter_mut())
+                                .zip(grad_slice.iter())
+                            {
+                                *m = beta1 * *m + (1.0 - beta1) * *g;
+                                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                                let m_hat = *m / bias_correction1;
+                                let v_hat = *v / bias_correction2;
+                                *w =
+                                    f16::from_f32(w.to_f32() - lr * (m_hat / (v_hat.sqrt() + eps)));
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(m_data.view_mut())
+                            .and(v_data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, m, v, g| {
+                                *m = beta1 * *m + (1.0 - beta1) * *g;
+                                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                                let m_hat = *m / bias_correction1;
+                                let v_hat = *v / bias_correction2;
+                                *w =
+                                    f16::from_f32(w.to_f32() - lr * (m_hat / (v_hat.sqrt() + eps)));
+                            });
+                    }
+                }
+                TensorStorageViewMut::BF16(mut data) => {
+                    if let (Some(data_slice), Some(m_slice), Some(v_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        m_data.as_slice_memory_order_mut(),
+                        v_data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !adam_update_bf16_f32_arch(
+                            data_slice,
+                            m_slice,
+                            v_slice,
+                            grad_slice,
+                            lr,
+                            beta1,
+                            beta2,
+                            bias_correction1,
+                            bias_correction2,
+                            eps,
+                        ) {
+                            for (((w, m), v), g) in data_slice
+                                .iter_mut()
+                                .zip(m_slice.iter_mut())
+                                .zip(v_slice.iter_mut())
+                                .zip(grad_slice.iter())
+                            {
+                                *m = beta1 * *m + (1.0 - beta1) * *g;
+                                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                                let m_hat = *m / bias_correction1;
+                                let v_hat = *v / bias_correction2;
+                                *w = bf16::from_f32(
+                                    w.to_f32() - lr * (m_hat / (v_hat.sqrt() + eps)),
+                                );
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(m_data.view_mut())
+                            .and(v_data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, m, v, g| {
+                                *m = beta1 * *m + (1.0 - beta1) * *g;
+                                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                                let m_hat = *m / bias_correction1;
+                                let v_hat = *v / bias_correction2;
+                                *w = bf16::from_f32(
+                                    w.to_f32() - lr * (m_hat / (v_hat.sqrt() + eps)),
+                                );
+                            });
+                    }
+                }
+                TensorStorageViewMut::I8(mut data, scale) => {
+                    let inv_scale = 1.0 / scale;
+                    let quantize = |value: f32| -> i8 {
+                        (value * inv_scale).round().clamp(-127.0, 127.0) as i8
+                    };
+                    if let (Some(data_slice), Some(m_slice), Some(v_slice), Some(grad_slice)) = (
+                        data.as_slice_memory_order_mut(),
+                        m_data.as_slice_memory_order_mut(),
+                        v_data.as_slice_memory_order_mut(),
+                        grad.as_slice_memory_order(),
+                    ) {
+                        if !adam_update_i8_f32_arch(
+                            data_slice,
+                            scale,
+                            m_slice,
+                            v_slice,
+                            grad_slice,
+                            lr,
+                            beta1,
+                            beta2,
+                            bias_correction1,
+                            bias_correction2,
+                            eps,
+                        ) {
+                            for (((w, m), v), g) in data_slice
+                                .iter_mut()
+                                .zip(m_slice.iter_mut())
+                                .zip(v_slice.iter_mut())
+                                .zip(grad_slice.iter())
+                            {
+                                *m = beta1 * *m + (1.0 - beta1) * *g;
+                                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                                let m_hat = *m / bias_correction1;
+                                let v_hat = *v / bias_correction2;
+                                let updated =
+                                    (*w as f32) * scale - lr * (m_hat / (v_hat.sqrt() + eps));
+                                *w = quantize(updated);
+                            }
+                        }
+                    } else {
+                        Zip::from(data.view_mut())
+                            .and(m_data.view_mut())
+                            .and(v_data.view_mut())
+                            .and(grad.view())
+                            .for_each(|w, m, v, g| {
+                                *m = beta1 * *m + (1.0 - beta1) * *g;
+                                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                                let m_hat = *m / bias_correction1;
+                                let v_hat = *v / bias_correction2;
+                                let updated =
+                                    (*w as f32) * scale - lr * (m_hat / (v_hat.sqrt() + eps));
+                                *w = quantize(updated);
+                            });
+                    }
+                }
+            });
+            return true;
+        }
+
+        self.ensure_f32_data(true);
+        exp_avg.ensure_f32_data(true);
+        exp_avg_sq.ensure_f32_data(true);
+        let mut param_inner = self.0.borrow_mut();
+        let mut exp_avg_inner = exp_avg.0.borrow_mut();
+        let mut exp_avg_sq_inner = exp_avg_sq.0.borrow_mut();
+        let data = &mut param_inner.data;
+        let m_data = &mut exp_avg_inner.data;
+        let v_data = &mut exp_avg_sq_inner.data;
+
+        if let (Some(data_slice), Some(m_slice), Some(v_slice), Some(grad_slice)) = (
+            data.as_slice_memory_order_mut(),
+            m_data.as_slice_memory_order_mut(),
+            v_data.as_slice_memory_order_mut(),
+            grad.as_slice_memory_order(),
+        ) {
+            for (((w, m), v), g) in data_slice
+                .iter_mut()
+                .zip(m_slice.iter_mut())
+                .zip(v_slice.iter_mut())
+                .zip(grad_slice.iter())
+            {
+                *m = beta1 * *m + (1.0 - beta1) * *g;
+                *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                let m_hat = *m / bias_correction1;
+                let v_hat = *v / bias_correction2;
+                *w -= lr * (m_hat / (v_hat.sqrt() + eps));
+            }
+        } else {
+            Zip::from(data.view_mut())
+                .and(m_data.view_mut())
+                .and(v_data.view_mut())
+                .and(grad.view())
+                .for_each(|w, m, v, g| {
+                    *m = beta1 * *m + (1.0 - beta1) * *g;
+                    *v = beta2 * *v + (1.0 - beta2) * *g * *g;
+                    let m_hat = *m / bias_correction1;
+                    let v_hat = *v / bias_correction2;
+                    *w -= lr * (m_hat / (v_hat.sqrt() + eps));
+                });
+        }
+        true
+    }
+
     #[inline]
     pub fn device(&self) -> Device {
         self.0.borrow().device
@@ -2258,15 +3144,95 @@ impl Tensor {
                     crate::ops::cuda::is_available(),
                     "CUDA is not available. Rebuild with `--features cuda` and ensure the NVIDIA runtime is installed."
                 );
-                if self.is_cuda() && self.0.borrow().cuda_f32_data.is_some() {
-                    return;
+                if self.is_cuda() {
+                    let inner = self.0.borrow();
+                    if inner.cuda_f32_data.is_some()
+                        || inner.cuda_f16_data.is_some()
+                        || inner.cuda_bf16_data.is_some()
+                        || inner.cuda_i8_data.is_some()
+                    {
+                        return;
+                    }
                 }
-                if self.len() == 0 {
+                if self.is_empty() {
                     let mut inner = self.0.borrow_mut();
                     inner.device = Device::Cuda;
                     inner.cuda_f32_data = None;
                     return;
                 }
+
+                let lowp_upload =
+                    {
+                        let (storage_dtype, cache_dirty) = {
+                            let inner = self.0.borrow();
+                            (inner.storage_dtype, inner.cache_dirty)
+                        };
+                        if cache_dirty {
+                            None
+                        } else {
+                            match self.native_storage_owned() {
+                                TensorStorageOwned::F16(data) if storage_dtype == DType::F16 => {
+                                    data.as_slice_memory_order().map(|slice| {
+                                        let bits =
+                                            slice.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                                        (
+                                            DType::F16,
+                                            crate::ops::cuda::upload_u16_storage(&bits)
+                                                .unwrap_or_else(|err| {
+                                                    panic!(
+                                                        "Failed to upload F16 tensor to CUDA: {}",
+                                                        err
+                                                    )
+                                                }),
+                                        )
+                                    })
+                                }
+                                TensorStorageOwned::BF16(data) if storage_dtype == DType::BF16 => {
+                                    data.as_slice_memory_order().map(|slice| {
+                                        let bits =
+                                            slice.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                                        (
+                                            DType::BF16,
+                                            crate::ops::cuda::upload_u16_storage(&bits)
+                                                .unwrap_or_else(|err| {
+                                                    panic!(
+                                                        "Failed to upload BF16 tensor to CUDA: {}",
+                                                        err
+                                                    )
+                                                }),
+                                        )
+                                    })
+                                }
+                                TensorStorageOwned::I8(data, _) if storage_dtype == DType::I8 => {
+                                    data.as_slice_memory_order().map(|slice| {
+                                        (
+                                            DType::I8,
+                                            crate::ops::cuda::upload_i8_storage(slice)
+                                                .unwrap_or_else(|err| {
+                                                    panic!(
+                                                        "Failed to upload I8 tensor to CUDA: {}",
+                                                        err
+                                                    )
+                                                }),
+                                        )
+                                    })
+                                }
+                                _ => None,
+                            }
+                        }
+                    };
+                if let Some((dtype, buffer)) = lowp_upload {
+                    let mut inner = self.0.borrow_mut();
+                    inner.device = Device::Cuda;
+                    match dtype {
+                        DType::F16 => inner.cuda_f16_data = Some(buffer),
+                        DType::BF16 => inner.cuda_bf16_data = Some(buffer),
+                        DType::I8 => inner.cuda_i8_data = Some(buffer),
+                        DType::F32 => {}
+                    }
+                    return;
+                }
+
                 let host_data = self.storage_as_f32_vec();
                 let buffer = crate::ops::cuda::upload_f32(&host_data)
                     .unwrap_or_else(|err| panic!("Failed to upload tensor to CUDA: {}", err));
@@ -2295,6 +3261,9 @@ impl Tensor {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: None,
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: true,
                     storage_dtype: DType::F32,
@@ -2327,6 +3296,9 @@ impl Tensor {
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: None,
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: DType::F16,
@@ -2359,6 +3331,9 @@ impl Tensor {
                     ),
                     i8_data: None,
                     cuda_f32_data: None,
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: DType::BF16,
@@ -2391,6 +3366,9 @@ impl Tensor {
                             .clone(),
                     ),
                     cuda_f32_data: None,
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: Some(
                         inner
                             .i8_scale
@@ -2467,6 +3445,9 @@ impl Tensor {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: DType::F32,
@@ -2488,6 +3469,9 @@ impl Tensor {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: false,
             storage_dtype: DType::F16,
@@ -2509,6 +3493,9 @@ impl Tensor {
             bf16_data: Some(data),
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: false,
             storage_dtype: DType::BF16,
@@ -2530,6 +3517,9 @@ impl Tensor {
             bf16_data: None,
             i8_data: Some(data),
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: Some(scale),
             has_f32_data: false,
             storage_dtype: DType::I8,
@@ -2589,12 +3579,21 @@ impl Tensor {
             Device::Cuda,
             "from_cuda_f32_buffer_no_host currently expects CUDA device"
         );
+        let len = Self::checked_shape_len(shape, "CUDA f32 tensor");
+        assert_eq!(
+            buffer.len(),
+            len,
+            "CUDA f32 buffer length does not match tensor shape"
+        );
         Tensor(Rc::new(RefCell::new(TensorData {
             data: ArrayD::<f32>::zeros(IxDyn(shape)).into_shared(),
             f16_data: None,
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: Some(buffer),
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: false,
             storage_dtype: DType::F32,
@@ -2623,13 +3622,112 @@ impl Tensor {
             Device::Cuda,
             "from_cuda_f32_buffer_no_host_with_dtype currently expects CUDA device"
         );
+        let len = Self::checked_shape_len(shape, "CUDA typed tensor");
+        assert_eq!(
+            buffer.len(),
+            len,
+            "CUDA f32 buffer length does not match typed tensor shape"
+        );
+        let (cuda_f16_data, cuda_bf16_data, cuda_i8_data, i8_scale) = match dtype {
+            DType::F16 => (
+                Some(
+                    crate::ops::cuda::f32_to_lowp_storage_no_host(&buffer, DType::F16)
+                        .unwrap_or_else(|err| {
+                            panic!("Failed to convert CUDA f32 buffer to F16 storage: {err}")
+                        }),
+                ),
+                None,
+                None,
+                None,
+            ),
+            DType::BF16 => (
+                None,
+                Some(
+                    crate::ops::cuda::f32_to_lowp_storage_no_host(&buffer, DType::BF16)
+                        .unwrap_or_else(|err| {
+                            panic!("Failed to convert CUDA f32 buffer to BF16 storage: {err}")
+                        }),
+                ),
+                None,
+                None,
+            ),
+            DType::I8 => {
+                let (i8_buffer, scale) =
+                    crate::ops::cuda::quantize_f32_to_i8_dynamic_no_host(&buffer).unwrap_or_else(
+                        |err| panic!("Failed to quantize CUDA f32 buffer to I8 storage: {err}"),
+                    );
+                (None, None, Some(i8_buffer), Some(scale))
+            }
+            DType::F32 => unreachable!("F32 dtype returned earlier"),
+        };
         Tensor(Rc::new(RefCell::new(TensorData {
             data: ArrayD::<f32>::zeros(IxDyn(shape)).into_shared(),
             f16_data: None,
             bf16_data: None,
             i8_data: None,
-            cuda_f32_data: Some(buffer),
-            i8_scale: None,
+            cuda_f32_data: None,
+            cuda_f16_data,
+            cuda_bf16_data,
+            cuda_i8_data,
+            i8_scale,
+            has_f32_data: false,
+            storage_dtype: dtype,
+            cache_dirty: false,
+            is_parameter: false,
+            grad: None,
+            cuda_f32_grad: None,
+            parents: vec![],
+            backward_op: None,
+            requires_grad: false,
+            device,
+        })))
+    }
+
+    pub(crate) fn from_cuda_native_lowp_buffer_no_host_with_dtype(
+        shape: &[usize],
+        buffer: crate::ops::cuda::CudaBuffer,
+        device: Device,
+        dtype: DType,
+        i8_scale: Option<f32>,
+    ) -> Tensor {
+        assert_eq!(
+            device,
+            Device::Cuda,
+            "from_cuda_native_lowp_buffer_no_host_with_dtype expects CUDA device"
+        );
+        assert!(
+            dtype != DType::F32,
+            "from_cuda_native_lowp_buffer_no_host_with_dtype expects a low precision dtype"
+        );
+        if dtype == DType::I8 {
+            assert!(
+                i8_scale.is_some_and(|scale| scale.is_finite() && scale > 0.0),
+                "I8 CUDA native tensor requires a finite positive quantization scale"
+            );
+        }
+        let len = Self::checked_shape_len(shape, "CUDA native low precision tensor");
+        assert_eq!(
+            buffer.len(),
+            len,
+            "CUDA native low precision buffer length does not match tensor shape"
+        );
+
+        let (cuda_f16_data, cuda_bf16_data, cuda_i8_data) = match dtype {
+            DType::F16 => (Some(buffer), None, None),
+            DType::BF16 => (None, Some(buffer), None),
+            DType::I8 => (None, None, Some(buffer)),
+            DType::F32 => unreachable!("checked above"),
+        };
+        Tensor(Rc::new(RefCell::new(TensorData {
+            data: ArrayD::<f32>::zeros(IxDyn(shape)).into_shared(),
+            f16_data: None,
+            bf16_data: None,
+            i8_data: None,
+            cuda_f32_data: None,
+            cuda_f16_data,
+            cuda_bf16_data,
+            cuda_i8_data,
+            i8_scale,
             has_f32_data: false,
             storage_dtype: dtype,
             cache_dirty: false,
@@ -2683,25 +3781,25 @@ impl Tensor {
     pub(crate) fn native_storage_owned(&self) -> TensorStorageOwned {
         let inner = self.0.borrow();
 
-        if inner.storage_dtype == DType::F16 {
-            if let Some(f16_data) = inner.f16_data.as_ref() {
-                return TensorStorageOwned::F16(f16_data.clone());
-            }
+        if inner.storage_dtype == DType::F16
+            && let Some(f16_data) = inner.f16_data.as_ref()
+        {
+            return TensorStorageOwned::F16(f16_data.clone());
         }
-        if inner.storage_dtype == DType::BF16 {
-            if let Some(bf16_data) = inner.bf16_data.as_ref() {
-                return TensorStorageOwned::BF16(bf16_data.clone());
-            }
+        if inner.storage_dtype == DType::BF16
+            && let Some(bf16_data) = inner.bf16_data.as_ref()
+        {
+            return TensorStorageOwned::BF16(bf16_data.clone());
         }
-        if inner.storage_dtype == DType::I8 {
-            if let Some(i8_data) = inner.i8_data.as_ref() {
-                return TensorStorageOwned::I8(
-                    i8_data.clone(),
-                    inner
-                        .i8_scale
-                        .expect("I8 tensor missing quantization scale"),
-                );
-            }
+        if inner.storage_dtype == DType::I8
+            && let Some(i8_data) = inner.i8_data.as_ref()
+        {
+            return TensorStorageOwned::I8(
+                i8_data.clone(),
+                inner
+                    .i8_scale
+                    .expect("I8 tensor missing quantization scale"),
+            );
         }
 
         if inner.has_f32_data {
@@ -2774,6 +3872,9 @@ impl Tensor {
                     bf16_data: None,
                     i8_data: Some(i8_data),
                     cuda_f32_data: None,
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: Some(scale),
                     has_f32_data: false,
                     storage_dtype: dtype,
@@ -2909,11 +4010,15 @@ impl Tensor {
             return;
         }
 
-        let grad_len = Self::logical_shape(&inner).iter().product::<usize>();
-        if let Some(new_buffer) = cuda_grad {
-            if new_buffer.len() == grad_len {
-                inner.cuda_f32_grad = match inner.cuda_f32_grad.as_ref() {
-                    Some(existing_buffer) if existing_buffer.len() == grad_len => {
+        let grad_len = Self::checked_shape_len(Self::logical_shape(&inner), "CUDA gradient");
+        if let Some(new_buffer) = cuda_grad
+            && new_buffer.len() == grad_len
+        {
+            inner.cuda_f32_grad = match inner.cuda_f32_grad.as_ref() {
+                Some(existing_buffer) if existing_buffer.len() == grad_len => {
+                    if crate::ops::cuda::add_inplace_f32(existing_buffer, &new_buffer).is_ok() {
+                        Some(existing_buffer.clone())
+                    } else {
                         match crate::ops::cuda::binary_f32_buffer(
                             existing_buffer,
                             &new_buffer,
@@ -2923,10 +4028,10 @@ impl Tensor {
                             Err(_) => Some(new_buffer),
                         }
                     }
-                    _ => Some(new_buffer),
-                };
-                return;
-            }
+                }
+                _ => Some(new_buffer),
+            };
+            return;
         }
 
         let host_grad = inner
@@ -2947,7 +4052,7 @@ impl Tensor {
             Device::Cuda,
             "add_cuda_grad_buffer_only expects a CUDA tensor"
         );
-        let grad_len = Self::logical_shape(&inner).iter().product::<usize>();
+        let grad_len = Self::checked_shape_len(Self::logical_shape(&inner), "CUDA gradient");
         assert_eq!(
             cuda_grad.len(),
             grad_len,
@@ -2965,13 +4070,17 @@ impl Tensor {
 
         inner.cuda_f32_grad = match existing_cuda_grad.as_ref() {
             Some(existing_buffer) if existing_buffer.len() == grad_len => {
-                match crate::ops::cuda::binary_f32_buffer(
-                    existing_buffer,
-                    &cuda_grad,
-                    crate::ops::cuda::BinaryOp::Add,
-                ) {
-                    Ok(buffer) => Some(buffer),
-                    Err(_) => Some(cuda_grad),
+                if crate::ops::cuda::add_inplace_f32(existing_buffer, &cuda_grad).is_ok() {
+                    Some(existing_buffer.clone())
+                } else {
+                    match crate::ops::cuda::binary_f32_buffer(
+                        existing_buffer,
+                        &cuda_grad,
+                        crate::ops::cuda::BinaryOp::Add,
+                    ) {
+                        Ok(buffer) => Some(buffer),
+                        Err(_) => Some(cuda_grad),
+                    }
                 }
             }
             _ => Some(cuda_grad),
@@ -3034,7 +4143,7 @@ impl Tensor {
                 )
             };
             if seed_cuda_only {
-                let len = shape.iter().product::<usize>();
+                let len = Self::checked_shape_len(&shape, "CUDA backward seed");
                 if len == 0 {
                     self.add_grad(ArrayD::ones(shape));
                 } else {
@@ -3152,6 +4261,12 @@ mod tests {
     };
 
     #[test]
+    #[should_panic(expected = "shape element count overflow")]
+    fn checked_shape_len_rejects_overflow() {
+        let _ = Tensor::checked_shape_len(&[usize::MAX, 2], "test tensor");
+    }
+
+    #[test]
     fn parameter_creation_follows_precision_scope() {
         with_precision_config(
             PrecisionConfig {
@@ -3244,6 +4359,42 @@ mod tests {
 
         handle.join().expect("join inference thread");
         set_inference_mode(false);
+    }
+
+    #[test]
+    fn strict_device_execution_is_thread_local() {
+        set_strict_device_execution(false);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            set_strict_device_execution(true);
+            tx.send(is_strict_device_execution())
+                .expect("send thread-local strict device state");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            tx.send(is_strict_device_execution())
+                .expect("send thread-local strict device state");
+            set_strict_device_execution(false);
+        });
+
+        assert!(
+            rx.recv().expect("receive spawned thread state"),
+            "spawned thread should observe its own strict device flag"
+        );
+        assert!(
+            !is_strict_device_execution(),
+            "main thread should not inherit spawned thread's strict device flag"
+        );
+        assert!(
+            rx.recv().expect("receive spawned thread state"),
+            "spawned thread should remain strict until it resets"
+        );
+        assert!(
+            !is_strict_device_execution(),
+            "main thread should still remain outside strict device execution"
+        );
+
+        handle.join().expect("join strict device thread");
+        set_strict_device_execution(false);
     }
 
     #[test]
@@ -3722,6 +4873,32 @@ mod tests {
         let dst_vals = dst.data();
         for (&lhs, &rhs) in src_vals.iter().zip(dst_vals.iter()) {
             assert!((lhs - rhs).abs() <= 1e-6, "lhs={lhs}, rhs={rhs}");
+        }
+    }
+
+    #[test]
+    fn i8_quantization_rejects_non_finite_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Tensor::new_with_dtype(
+                    ArrayD::from_shape_vec(IxDyn(&[1]), vec![value]).unwrap(),
+                    DType::I8,
+                )
+            }));
+            assert!(result.is_err(), "I8 quantization accepted {value}");
+        }
+    }
+
+    #[test]
+    fn i8_quantization_keeps_subnormal_scale_positive() {
+        let tensor = Tensor::new_with_dtype(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::from_bits(1)]).unwrap(),
+            DType::I8,
+        );
+        let (_, _, raw) = tensor.export_raw();
+        match raw {
+            TensorRawData::I8 { scale, .. } => assert_eq!(scale, f32::MIN_POSITIVE),
+            _ => panic!("I8 tensor exported non-I8 storage"),
         }
     }
 

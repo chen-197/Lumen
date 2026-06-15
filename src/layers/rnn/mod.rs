@@ -1,7 +1,7 @@
 pub mod gru;
 pub mod lstm;
-pub mod rnn;
+pub mod simple;
 
 pub use gru::GRU;
 pub use lstm::LSTM;
-pub use rnn::RNN;
+pub use simple::RNN;

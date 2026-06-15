@@ -1,3 +1,8 @@
+#![cfg_attr(
+    feature = "x86-fp-kernels-nightly",
+    feature(f16, stdarch_x86_avx512_f16)
+)]
+
 // src/lib.rs
 
 pub mod arch;

@@ -31,8 +31,8 @@ fn find_cuda_root() -> Option<PathBuf> {
     } else {
         "nvcc"
     };
-    if let Some(nvcc) = find_executable_in_path(nvcc_name) {
-        if let Some(root) = nvcc
+    if let Some(nvcc) = find_executable_in_path(nvcc_name)
+        && let Some(root) = nvcc
             .parent()
             .and_then(|bin_dir| {
                 bin_dir
@@ -41,9 +41,8 @@ fn find_cuda_root() -> Option<PathBuf> {
                     .then_some(bin_dir)
             })
             .and_then(|bin_dir| bin_dir.parent())
-        {
-            return Some(root.to_path_buf());
-        }
+    {
+        return Some(root.to_path_buf());
     }
 
     #[cfg(target_os = "windows")]
@@ -648,6 +647,46 @@ fn copy_if_present(src: &Path, dst: &Path) {
     fs::copy(src, dst).expect("failed to copy runtime DLL");
 }
 
+fn emit_rerun_if_changed_recursive(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
+    if !path.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for child in paths {
+        emit_rerun_if_changed_recursive(&child);
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    let mut entries = fs::read_dir(src)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for src_path in entries {
+        let dst_path = dst.join(
+            src_path
+                .file_name()
+                .expect("CUDA source path must have a file name"),
+        );
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn stage_cudnn_runtime_dlls(install: &CudnnInstall, out_dir: &Path) {
     if !cfg!(target_os = "windows") {
         return;
@@ -682,7 +721,8 @@ fn stage_cudnn_runtime_dlls(install: &CudnnInstall, out_dir: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/ops/cuda/lumen_cuda.cu");
+    let cuda_src_dir = Path::new("src/ops/cuda");
+    emit_rerun_if_changed_recursive(cuda_src_dir);
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_ROOT");
@@ -713,9 +753,9 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
-    let staging_source = out_dir.join("lumen_cuda.cu");
-    fs::copy("src/ops/cuda/lumen_cuda.cu", &staging_source)
-        .expect("failed to stage CUDA source into OUT_DIR");
+    let staging_cuda_dir = out_dir.join("cuda");
+    copy_dir_recursive(cuda_src_dir, &staging_cuda_dir)
+        .expect("failed to stage CUDA sources into OUT_DIR");
 
     let cudnn_install = resolve_cudnn_install(&cuda_root, &out_dir);
     if let Some(install) = cudnn_install.as_ref() {
@@ -739,7 +779,7 @@ fn main() {
 
     let mut command = Command::new(&nvcc);
     command
-        .current_dir(&out_dir)
+        .current_dir(&staging_cuda_dir)
         .arg("--lib")
         .arg("-std=c++17")
         .arg(format!(

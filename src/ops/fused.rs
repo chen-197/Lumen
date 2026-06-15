@@ -14,7 +14,7 @@ use crate::ops::matmul::{
 };
 use crate::precision::DType;
 use half::{bf16, f16};
-use ndarray::{Array, Array2, Array3, Axis, Ix2, Zip};
+use ndarray::{Array, Array2, Array3, Axis, Ix2, IxDyn, Zip};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -37,6 +37,446 @@ fn slice_ref_dtype(slice: SliceRef<'_>) -> DType {
         SliceRef::BF16(_) => DType::BF16,
         SliceRef::I8(_, _) => DType::I8,
     }
+}
+
+fn cuda_fused_storage_buffer(tensor: &Tensor) -> Option<(DType, cuda::CudaBuffer, Option<f32>)> {
+    tensor.cloned_cuda_native_lowp_buffer().or_else(|| {
+        if tensor.dtype() == DType::F32 && tensor.is_cuda() {
+            tensor
+                .cloned_cuda_f32_buffer()
+                .map(|buffer| (DType::F32, buffer, None))
+        } else {
+            None
+        }
+    })
+}
+
+fn cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
+    shape: &[usize],
+    buffer: cuda::CudaBuffer,
+    device: crate::autograd::Device,
+    dtype: DType,
+    op_name: &str,
+) -> Tensor {
+    if matches!(dtype, DType::F16 | DType::BF16) {
+        match cuda::f32_to_lowp_storage_no_host(&buffer, dtype) {
+            Ok(lowp_buffer) => {
+                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                    shape,
+                    lowp_buffer,
+                    device,
+                    dtype,
+                    None,
+                );
+            }
+            Err(err) => {
+                assert!(
+                    !is_strict_device_execution(),
+                    "{op_name} CUDA low precision output conversion failed while strict device execution is enabled: {err}"
+                );
+            }
+        }
+    }
+    Tensor::from_cuda_f32_buffer_no_host_with_dtype(shape, buffer, device, dtype)
+}
+
+fn try_cuda_fused_gate_up_silu_typed(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    up_weight: &Tensor,
+    rows: usize,
+    n_dim: usize,
+    k_dim: usize,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    if gate_weight.dtype() != up_weight.dtype() {
+        return None;
+    }
+    if input.dtype() == DType::F32 && gate_weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_fused_storage_buffer(input)?;
+    let (gate_dtype, gate_buffer, gate_scale) = cuda_fused_storage_buffer(gate_weight)?;
+    let (up_dtype, up_buffer, up_scale) = cuda_fused_storage_buffer(up_weight)?;
+    if gate_dtype != up_dtype {
+        return None;
+    }
+    Some(cuda::fused_gate_up_silu_typed_buffer(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &gate_buffer,
+        gate_dtype,
+        gate_scale,
+        &up_buffer,
+        up_scale,
+        rows,
+        n_dim,
+        k_dim,
+    ))
+}
+
+fn try_cuda_fused_gate_up_silu_mixed_i8_matmul(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    up_weight: &Tensor,
+    rows: usize,
+    n_dim: usize,
+    k_dim: usize,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    if rows <= 1 {
+        return None;
+    }
+    let (gate_dtype, gate_buffer, gate_scale) = gate_weight.cloned_cuda_native_lowp_buffer()?;
+    let (up_dtype, up_buffer, up_scale) = up_weight.cloned_cuda_native_lowp_buffer()?;
+    if gate_dtype != DType::I8 || up_dtype != DType::I8 {
+        return None;
+    }
+    let gate_scale = gate_scale?;
+    let up_scale = up_scale?;
+
+    if let Some((DType::BF16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
+        return Some((|| {
+            let gate = cuda::matmul_bf16_i8_buffer_no_host(
+                &input_buffer,
+                &gate_buffer,
+                gate_scale,
+                rows,
+                n_dim,
+                k_dim,
+            )?;
+            let up = cuda::matmul_bf16_i8_buffer_no_host(
+                &input_buffer,
+                &up_buffer,
+                up_scale,
+                rows,
+                n_dim,
+                k_dim,
+            )?;
+            cuda::silu_mul_f32_buffer_no_host(&gate, &up)
+        })());
+    }
+
+    if let Some((DType::F16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
+        return Some((|| {
+            let gate = cuda::matmul_f16_i8_buffer_no_host(
+                &input_buffer,
+                &gate_buffer,
+                gate_scale,
+                rows,
+                n_dim,
+                k_dim,
+            )?;
+            let up = cuda::matmul_f16_i8_buffer_no_host(
+                &input_buffer,
+                &up_buffer,
+                up_scale,
+                rows,
+                n_dim,
+                k_dim,
+            )?;
+            cuda::silu_mul_f32_buffer_no_host(&gate, &up)
+        })());
+    }
+
+    if input.dtype() == DType::F32
+        && let Some(input_buffer) = input.cloned_cuda_f32_buffer()
+    {
+        return Some((|| {
+            let gate = cuda::matmul_f32_i8_buffer_no_host(
+                &input_buffer,
+                &gate_buffer,
+                gate_scale,
+                rows,
+                n_dim,
+                k_dim,
+            )?;
+            let up = cuda::matmul_f32_i8_buffer_no_host(
+                &input_buffer,
+                &up_buffer,
+                up_scale,
+                rows,
+                n_dim,
+                k_dim,
+            )?;
+            cuda::silu_mul_f32_buffer_no_host(&gate, &up)
+        })());
+    }
+
+    None
+}
+
+fn try_cuda_fused_gate_up_silu_typed_output(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    up_weight: &Tensor,
+    output_dtype: DType,
+    rows: usize,
+    n_dim: usize,
+    k_dim: usize,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    if !matches!(output_dtype, DType::F16 | DType::BF16) {
+        return None;
+    }
+    if gate_weight.dtype() != up_weight.dtype() {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_fused_storage_buffer(input)?;
+    let (gate_dtype, gate_buffer, gate_scale) = cuda_fused_storage_buffer(gate_weight)?;
+    let (up_dtype, up_buffer, up_scale) = cuda_fused_storage_buffer(up_weight)?;
+    if gate_dtype != up_dtype {
+        return None;
+    }
+    Some(cuda::fused_gate_up_silu_typed_output_buffer(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &gate_buffer,
+        gate_dtype,
+        gate_scale,
+        &up_buffer,
+        up_scale,
+        output_dtype,
+        rows,
+        n_dim,
+        k_dim,
+    ))
+}
+
+fn try_cuda_fused_gate_up_silu_typed_host(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    up_weight: &Tensor,
+    rows: usize,
+    n_dim: usize,
+    k_dim: usize,
+) -> Option<Result<(cuda::CudaBuffer, Vec<f32>), String>> {
+    if gate_weight.dtype() != up_weight.dtype() {
+        return None;
+    }
+    if input.dtype() == DType::F32 && gate_weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_fused_storage_buffer(input)?;
+    let (gate_dtype, gate_buffer, gate_scale) = cuda_fused_storage_buffer(gate_weight)?;
+    let (up_dtype, up_buffer, up_scale) = cuda_fused_storage_buffer(up_weight)?;
+    if gate_dtype != up_dtype {
+        return None;
+    }
+    Some(cuda::fused_gate_up_silu_typed(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &gate_buffer,
+        gate_dtype,
+        gate_scale,
+        &up_buffer,
+        up_scale,
+        rows,
+        n_dim,
+        k_dim,
+    ))
+}
+
+fn try_cuda_fused_qkv_typed_buffer(
+    input: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    v_weight: &Tensor,
+    rows: usize,
+    q_n: usize,
+    k_n: usize,
+    k_dim: usize,
+) -> Option<Result<(cuda::CudaBuffer, cuda::CudaBuffer, cuda::CudaBuffer), String>> {
+    if q_weight.dtype() != k_weight.dtype() || q_weight.dtype() != v_weight.dtype() {
+        return None;
+    }
+    if input.dtype() == DType::F32 && q_weight.dtype() == DType::F32 {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_fused_storage_buffer(input)?;
+    let (q_dtype, q_buffer, q_scale) = cuda_fused_storage_buffer(q_weight)?;
+    let (k_dtype, k_buffer, k_scale) = cuda_fused_storage_buffer(k_weight)?;
+    let (v_dtype, v_buffer, v_scale) = cuda_fused_storage_buffer(v_weight)?;
+    if q_dtype != k_dtype || q_dtype != v_dtype {
+        return None;
+    }
+    Some(cuda::fused_qkv_typed_buffer(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &q_buffer,
+        &k_buffer,
+        &v_buffer,
+        q_dtype,
+        q_scale,
+        k_scale,
+        v_scale,
+        rows,
+        q_n,
+        k_n,
+        k_dim,
+    ))
+}
+
+fn try_cuda_fused_qkv_mixed_i8_matmul_buffer(
+    input: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    v_weight: &Tensor,
+    rows: usize,
+    q_n: usize,
+    k_n: usize,
+    k_dim: usize,
+) -> Option<Result<(cuda::CudaBuffer, cuda::CudaBuffer, cuda::CudaBuffer), String>> {
+    if rows == 1 {
+        return None;
+    }
+    let (q_dtype, q_buffer, q_scale) = q_weight.cloned_cuda_native_lowp_buffer()?;
+    let (k_dtype, k_buffer, k_scale) = k_weight.cloned_cuda_native_lowp_buffer()?;
+    let (v_dtype, v_buffer, v_scale) = v_weight.cloned_cuda_native_lowp_buffer()?;
+    if q_dtype != DType::I8 || k_dtype != DType::I8 || v_dtype != DType::I8 {
+        return None;
+    }
+    let q_scale = q_scale?;
+    let k_scale = k_scale?;
+    let v_scale = v_scale?;
+
+    if let Some((DType::BF16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
+        return Some((|| {
+            let q = cuda::matmul_bf16_i8_buffer_no_host(
+                &input_buffer,
+                &q_buffer,
+                q_scale,
+                rows,
+                q_n,
+                k_dim,
+            )?;
+            let k = cuda::matmul_bf16_i8_buffer_no_host(
+                &input_buffer,
+                &k_buffer,
+                k_scale,
+                rows,
+                k_n,
+                k_dim,
+            )?;
+            let v = cuda::matmul_bf16_i8_buffer_no_host(
+                &input_buffer,
+                &v_buffer,
+                v_scale,
+                rows,
+                k_n,
+                k_dim,
+            )?;
+            Ok((q, k, v))
+        })());
+    }
+
+    if let Some((DType::F16, input_buffer, _)) = input.cloned_cuda_native_lowp_buffer() {
+        return Some((|| {
+            let q = cuda::matmul_f16_i8_buffer_no_host(
+                &input_buffer,
+                &q_buffer,
+                q_scale,
+                rows,
+                q_n,
+                k_dim,
+            )?;
+            let k = cuda::matmul_f16_i8_buffer_no_host(
+                &input_buffer,
+                &k_buffer,
+                k_scale,
+                rows,
+                k_n,
+                k_dim,
+            )?;
+            let v = cuda::matmul_f16_i8_buffer_no_host(
+                &input_buffer,
+                &v_buffer,
+                v_scale,
+                rows,
+                k_n,
+                k_dim,
+            )?;
+            Ok((q, k, v))
+        })());
+    }
+
+    if input.dtype() == DType::F32
+        && let Some(input_buffer) = input.cloned_cuda_f32_buffer()
+    {
+        return Some((|| {
+            let q = cuda::matmul_f32_i8_buffer_no_host(
+                &input_buffer,
+                &q_buffer,
+                q_scale,
+                rows,
+                q_n,
+                k_dim,
+            )?;
+            let k = cuda::matmul_f32_i8_buffer_no_host(
+                &input_buffer,
+                &k_buffer,
+                k_scale,
+                rows,
+                k_n,
+                k_dim,
+            )?;
+            let v = cuda::matmul_f32_i8_buffer_no_host(
+                &input_buffer,
+                &v_buffer,
+                v_scale,
+                rows,
+                k_n,
+                k_dim,
+            )?;
+            Ok((q, k, v))
+        })());
+    }
+
+    None
+}
+
+fn try_cuda_fused_qkv_typed_output_buffer(
+    input: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    v_weight: &Tensor,
+    output_dtype: DType,
+    rows: usize,
+    q_n: usize,
+    k_n: usize,
+    k_dim: usize,
+) -> Option<Result<(cuda::CudaBuffer, cuda::CudaBuffer, cuda::CudaBuffer), String>> {
+    if !matches!(output_dtype, DType::F16 | DType::BF16) {
+        return None;
+    }
+    if q_weight.dtype() != k_weight.dtype() || q_weight.dtype() != v_weight.dtype() {
+        return None;
+    }
+    let (input_dtype, input_buffer, input_scale) = cuda_fused_storage_buffer(input)?;
+    let (q_dtype, q_buffer, q_scale) = cuda_fused_storage_buffer(q_weight)?;
+    let (k_dtype, k_buffer, k_scale) = cuda_fused_storage_buffer(k_weight)?;
+    let (v_dtype, v_buffer, v_scale) = cuda_fused_storage_buffer(v_weight)?;
+    if q_dtype != k_dtype || q_dtype != v_dtype {
+        return None;
+    }
+    Some(cuda::fused_qkv_typed_output_buffer(
+        &input_buffer,
+        input_dtype,
+        input_scale,
+        &q_buffer,
+        &k_buffer,
+        &v_buffer,
+        q_dtype,
+        q_scale,
+        k_scale,
+        v_scale,
+        output_dtype,
+        rows,
+        q_n,
+        k_n,
+        k_dim,
+    ))
 }
 
 fn with_decode_input_as_slice_ref<R>(input: &Tensor, f: impl FnOnce(SliceRef<'_>) -> R) -> R {
@@ -394,11 +834,22 @@ fn run_qkv_slices(
             SliceRef::F16(k_slice),
             SliceRef::F16(v_slice),
         ) => {
-            with_f16_input_as_f32(x_f16, |x_f32| {
-                qkv_matvec_rowmajor_parallel_f32_f16(
-                    x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
-                );
-            });
+            matvec_rowmajor_parallel_mixed(
+                SliceRef::F16(x_f16),
+                SliceRef::F16(q_slice),
+                q_n,
+                k_dim,
+                q_out,
+            );
+            dual_matvec_rowmajor_parallel_mixed(
+                SliceRef::F16(x_f16),
+                SliceRef::F16(k_slice),
+                SliceRef::F16(v_slice),
+                k_n,
+                k_dim,
+                k_out,
+                v_out,
+            );
         }
         (
             SliceRef::BF16(x_bf16),
@@ -440,11 +891,22 @@ fn run_qkv_slices(
             SliceRef::BF16(k_slice),
             SliceRef::BF16(v_slice),
         ) => {
-            with_bf16_input_as_f32(x_bf16, |x_f32| {
-                qkv_matvec_rowmajor_parallel_f32_bf16(
-                    x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
-                );
-            });
+            matvec_rowmajor_parallel_mixed(
+                SliceRef::BF16(x_bf16),
+                SliceRef::BF16(q_slice),
+                q_n,
+                k_dim,
+                q_out,
+            );
+            dual_matvec_rowmajor_parallel_mixed(
+                SliceRef::BF16(x_bf16),
+                SliceRef::BF16(k_slice),
+                SliceRef::BF16(v_slice),
+                k_n,
+                k_dim,
+                k_out,
+                v_out,
+            );
         }
         (
             SliceRef::I8(x_i8, x_scale),
@@ -530,11 +992,14 @@ fn run_gate_up_slice(
             );
         }
         (SliceRef::F16(x_f16), SliceRef::F16(gate_slice), SliceRef::F16(up_slice)) => {
-            with_f16_input_as_f32(x_f16, |x_f32| {
-                dual_matvec_silu_mul_rowmajor_parallel_f32_f16(
-                    x_f32, gate_slice, up_slice, n_dim, k_dim, out,
-                );
-            });
+            dual_matvec_silu_mul_rowmajor_parallel_mixed(
+                SliceRef::F16(x_f16),
+                SliceRef::F16(gate_slice),
+                SliceRef::F16(up_slice),
+                n_dim,
+                k_dim,
+                out,
+            );
         }
         (SliceRef::F32(x_f32), SliceRef::BF16(gate_slice), SliceRef::BF16(up_slice)) => {
             dual_matvec_silu_mul_rowmajor_parallel_f32_bf16(
@@ -542,11 +1007,14 @@ fn run_gate_up_slice(
             );
         }
         (SliceRef::BF16(x_bf16), SliceRef::BF16(gate_slice), SliceRef::BF16(up_slice)) => {
-            with_bf16_input_as_f32(x_bf16, |x_f32| {
-                dual_matvec_silu_mul_rowmajor_parallel_f32_bf16(
-                    x_f32, gate_slice, up_slice, n_dim, k_dim, out,
-                );
-            });
+            dual_matvec_silu_mul_rowmajor_parallel_mixed(
+                SliceRef::BF16(x_bf16),
+                SliceRef::BF16(gate_slice),
+                SliceRef::BF16(up_slice),
+                n_dim,
+                k_dim,
+                out,
+            );
         }
         (SliceRef::I8(x_i8, x_scale), SliceRef::BF16(gate_slice), SliceRef::BF16(up_slice)) => {
             with_i8_input_as_f32(x_i8, x_scale, |x_f32| {
@@ -623,24 +1091,47 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
             shape[3] > 0,
             "Fused Softmax key dimension must be greater than zero"
         );
-        if output_device == crate::autograd::Device::Cuda && input.len() > 0 {
+        if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
             let batch_heads = shape[0]
                 .checked_mul(shape[1])
                 .expect("fused_softmax batch_heads overflow");
             let q_len = shape[2];
             let k_len = shape[3];
             let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-                cuda::fused_softmax_f32(input_buf, batch_heads, q_len, k_len, scale, is_causal)
+                cuda::fused_softmax_f32_no_host(
+                    input_buf,
+                    batch_heads,
+                    q_len,
+                    k_len,
+                    scale,
+                    is_causal,
+                )
             });
-            if let Ok((buffer, out)) = cuda_out {
-                let out = Array::from_shape_vec(ndarray::IxDyn(&shape), out)
-                    .expect("CUDA fused_softmax output shape build failed")
-                    .into_dyn();
-                return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-                    out,
-                    output_dtype,
+            if let Ok(buffer) = cuda_out {
+                if matches!(output_dtype, DType::F16 | DType::BF16) {
+                    match cuda::f32_to_lowp_storage_no_host(&buffer, output_dtype) {
+                        Ok(lowp_buffer) => {
+                            return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                &shape,
+                                lowp_buffer,
+                                output_device,
+                                output_dtype,
+                                None,
+                            );
+                        }
+                        Err(err) => {
+                            assert!(
+                                !is_strict_device_execution(),
+                                "fused_softmax CUDA low precision output conversion failed while strict device execution is enabled: {err}"
+                            );
+                        }
+                    }
+                }
+                return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                    &shape,
+                    buffer,
                     output_device,
-                    Some(buffer),
+                    output_dtype,
                 );
             }
         }
@@ -864,7 +1355,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
             .expect("fused_softmax batch_heads overflow");
         let q_len = shape[2];
         let k_len = shape[3];
-        let cuda_out = if input.len() > 0 {
+        let cuda_out = if !input.is_empty() {
             input.with_cuda_f32_buffer(|input_buf| {
                 cuda::fused_softmax_f32_no_host(
                     input_buf,
@@ -890,6 +1381,9 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: Some(output_buffer),
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: false,
                 storage_dtype: crate::precision::DType::F32,
@@ -1015,6 +1509,9 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -1069,9 +1566,9 @@ pub(crate) fn fused_softmax_with_past_infer(
         DType::F32 | DType::I8 => DType::F32,
     };
 
-    if output_device == crate::autograd::Device::Cuda && input.len() > 0 {
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-            cuda::fused_softmax_f32_with_past(
+            cuda::fused_softmax_f32_with_past_no_host(
                 input_buf,
                 batch_heads,
                 q_len,
@@ -1081,15 +1578,31 @@ pub(crate) fn fused_softmax_with_past_infer(
                 past_len,
             )
         });
-        if let Ok((buffer, out)) = cuda_out {
-            let out = Array::from_shape_vec(ndarray::IxDyn(&shape), out)
-                .expect("CUDA fused_softmax_with_past output shape build failed")
-                .into_dyn();
-            return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-                out,
-                output_dtype,
+        if let Ok(buffer) = cuda_out {
+            if matches!(output_dtype, DType::F16 | DType::BF16) {
+                match cuda::f32_to_lowp_storage_no_host(&buffer, output_dtype) {
+                    Ok(lowp_buffer) => {
+                        return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                            &shape,
+                            lowp_buffer,
+                            output_device,
+                            output_dtype,
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "fused_softmax_with_past CUDA low precision output conversion failed while strict device execution is enabled: {err}"
+                        );
+                    }
+                }
+            }
+            return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                &shape,
+                buffer,
                 output_device,
-                Some(buffer),
+                output_dtype,
             );
         }
     }
@@ -1293,26 +1806,69 @@ pub fn fused_gate_up_silu_infer(
     } else {
         DType::F32
     };
-    if output_device == crate::autograd::Device::Cuda && input.len() > 0 {
-        let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-            gate_weight.with_cuda_f32_buffer(|gate_buf| {
-                up_weight.with_cuda_f32_buffer(|up_buf| {
-                    cuda::fused_gate_up_silu_f32(input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim)
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        if let Some(cuda_native_out) = try_cuda_fused_gate_up_silu_typed_output(
+            input,
+            gate_weight,
+            up_weight,
+            output_dtype,
+            m_dim,
+            n_dim,
+            k_dim,
+        ) {
+            match cuda_native_out {
+                Ok(buffer) => {
+                    let mut out_shape = x_shape.clone();
+                    let last = out_shape.len() - 1;
+                    out_shape[last] = n_dim;
+                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &out_shape,
+                        buffer,
+                        output_device,
+                        output_dtype,
+                        None,
+                    );
+                }
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "fused_gate_up_silu_infer CUDA typed low precision output failed while strict device execution is enabled: {err}"
+                    );
+                }
+            }
+        }
+        let cuda_out = try_cuda_fused_gate_up_silu_mixed_i8_matmul(
+            input,
+            gate_weight,
+            up_weight,
+            m_dim,
+            n_dim,
+            k_dim,
+        )
+        .or_else(|| {
+            try_cuda_fused_gate_up_silu_typed(input, gate_weight, up_weight, m_dim, n_dim, k_dim)
+        })
+        .unwrap_or_else(|| {
+            input.with_cuda_f32_buffer(|input_buf| {
+                gate_weight.with_cuda_f32_buffer(|gate_buf| {
+                    up_weight.with_cuda_f32_buffer(|up_buf| {
+                        cuda::fused_gate_up_silu_f32_buffer(
+                            input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim,
+                        )
+                    })
                 })
             })
         });
-        if let Ok((buffer, out)) = cuda_out {
+        if let Ok(buffer) = cuda_out {
             let mut out_shape = x_shape.clone();
             let last = out_shape.len() - 1;
             out_shape[last] = n_dim;
-            let out = Array::from_shape_vec(ndarray::IxDyn(&out_shape), out)
-                .expect("CUDA fused gate/up output shape build failed")
-                .into_dyn();
-            return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-                out,
-                output_dtype,
+            return cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
+                &out_shape,
+                buffer,
                 output_device,
-                Some(buffer),
+                output_dtype,
+                "fused_gate_up_silu_infer",
             );
         }
     }
@@ -1468,6 +2024,79 @@ pub fn fused_gate_up_silu_infer(
     )
 }
 
+pub(crate) fn fused_gate_up_silu_decode_f32(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    up_weight: &Tensor,
+) -> Tensor {
+    assert!(
+        is_no_grad(),
+        "fused_gate_up_silu_decode_f32 is inference-only"
+    );
+    let output_device = input.device();
+    assert_native_device_support(
+        output_device,
+        "fused_gate_up_silu_decode_f32",
+        output_device == crate::autograd::Device::Cuda,
+    );
+    assert_eq!(
+        gate_weight.device(),
+        output_device,
+        "fused_gate_up_silu_decode_f32 expects input and gate_weight on the same device"
+    );
+    assert_eq!(
+        up_weight.device(),
+        output_device,
+        "fused_gate_up_silu_decode_f32 expects input and up_weight on the same device"
+    );
+
+    let x_shape = input.shape_vec();
+    let k_dim = *x_shape.last().expect("input must have last dim");
+    let n_dim = validate_gate_up_shapes(k_dim, gate_weight, up_weight);
+    let m_dim = input.len() / k_dim;
+    assert_eq!(
+        m_dim, 1,
+        "fused_gate_up_silu_decode_f32 expects single-token decode input"
+    );
+
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        let cuda_out =
+            try_cuda_fused_gate_up_silu_typed(input, gate_weight, up_weight, m_dim, n_dim, k_dim)
+                .unwrap_or_else(|| {
+                    input.with_cuda_f32_buffer(|input_buf| {
+                        gate_weight.with_cuda_f32_buffer(|gate_buf| {
+                            up_weight.with_cuda_f32_buffer(|up_buf| {
+                                cuda::fused_gate_up_silu_f32_buffer(
+                                    input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim,
+                                )
+                            })
+                        })
+                    })
+                });
+        if let Ok(buffer) = cuda_out {
+            let mut out_shape = x_shape;
+            let last = out_shape.len() - 1;
+            out_shape[last] = n_dim;
+            return Tensor::from_cuda_f32_buffer_no_host(&out_shape, buffer, output_device);
+        }
+    }
+
+    let mut out = vec![0.0f32; n_dim];
+    fused_gate_up_silu_infer_into(input, gate_weight, up_weight, &mut out);
+    let mut out_shape = x_shape;
+    let last = out_shape.len() - 1;
+    out_shape[last] = n_dim;
+    Tensor::from_f32_data_no_grad_with_device_dtype(
+        Array2::from_shape_vec((1, n_dim), out)
+            .expect("decode gate/up f32 output shape build failed")
+            .into_shape(out_shape)
+            .expect("decode gate/up f32 reshape failed")
+            .into_dyn(),
+        DType::F32,
+        output_device,
+    )
+}
+
 pub fn fused_gate_up_silu_infer_into(
     input: &Tensor,
     gate_weight: &Tensor,
@@ -1505,10 +2134,22 @@ pub fn fused_gate_up_silu_infer_into(
     );
     assert_eq!(out.len(), n_dim, "output size mismatch");
     if compute_device == crate::autograd::Device::Cuda {
-        let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-            gate_weight.with_cuda_f32_buffer(|gate_buf| {
-                up_weight.with_cuda_f32_buffer(|up_buf| {
-                    cuda::fused_gate_up_silu_f32(input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim)
+        let cuda_out = try_cuda_fused_gate_up_silu_typed_host(
+            input,
+            gate_weight,
+            up_weight,
+            m_dim,
+            n_dim,
+            k_dim,
+        )
+        .unwrap_or_else(|| {
+            input.with_cuda_f32_buffer(|input_buf| {
+                gate_weight.with_cuda_f32_buffer(|gate_buf| {
+                    up_weight.with_cuda_f32_buffer(|up_buf| {
+                        cuda::fused_gate_up_silu_f32(
+                            input_buf, gate_buf, up_buf, m_dim, n_dim, k_dim,
+                        )
+                    })
                 })
             })
         });
@@ -1688,7 +2329,7 @@ pub fn fused_qkv_decode_infer_into(
     assert_eq!(q_out.len(), b * q_n, "Q output size mismatch");
     assert_eq!(k_out.len(), b * k_n, "K output size mismatch");
     assert_eq!(v_out.len(), b * v_n, "V output size mismatch");
-    if compute_device == crate::autograd::Device::Cuda && input.len() > 0 {
+    if compute_device == crate::autograd::Device::Cuda && !input.is_empty() {
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             q_weight.with_cuda_f32_buffer(|q_buf| {
                 k_weight.with_cuda_f32_buffer(|k_buf| {
@@ -1875,7 +2516,7 @@ pub fn fused_qkv_decode_infer(
     let d = q_n / n_head;
     assert_eq!(k_n / n_kv_head, d, "Q/K head dim mismatch");
 
-    if compute_device == crate::autograd::Device::Cuda && input.len() > 0 {
+    if compute_device == crate::autograd::Device::Cuda && !input.is_empty() {
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             q_weight.with_cuda_f32_buffer(|q_buf| {
                 k_weight.with_cuda_f32_buffer(|k_buf| {
@@ -2241,36 +2882,91 @@ pub fn fused_qkv_decode_infer_tensors(
     assert_eq!(v_n / n_kv_head, d, "V/K head dim mismatch");
     let output_dtype = fused_qkv_tensor_output_dtype(input, q_weight, k_weight, v_weight);
 
-    if compute_device == crate::autograd::Device::Cuda && input.len() > 0 {
-        let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-            q_weight.with_cuda_f32_buffer(|q_buf| {
-                k_weight.with_cuda_f32_buffer(|k_buf| {
-                    v_weight.with_cuda_f32_buffer(|v_buf| {
-                        cuda::fused_qkv_f32_buffer(
-                            input_buf, q_buf, k_buf, v_buf, b, q_n, k_n, k_dim,
-                        )
+    if compute_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        if let Some(cuda_native_out) = try_cuda_fused_qkv_typed_output_buffer(
+            input,
+            q_weight,
+            k_weight,
+            v_weight,
+            output_dtype,
+            b,
+            q_n,
+            k_n,
+            k_dim,
+        ) {
+            match cuda_native_out {
+                Ok((q_buf, k_buf, v_buf)) => {
+                    let q = Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &[b, n_head, 1, d],
+                        q_buf,
+                        compute_device,
+                        output_dtype,
+                        None,
+                    );
+                    let k = Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &[b, n_kv_head, 1, d],
+                        k_buf,
+                        compute_device,
+                        output_dtype,
+                        None,
+                    );
+                    let v = Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &[b, n_kv_head, 1, d],
+                        v_buf,
+                        compute_device,
+                        output_dtype,
+                        None,
+                    );
+                    return (q, k, v);
+                }
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "fused_qkv_decode_infer_tensors CUDA typed low precision output failed while strict device execution is enabled: {err}"
+                    );
+                }
+            }
+        }
+        let cuda_out = try_cuda_fused_qkv_mixed_i8_matmul_buffer(
+            input, q_weight, k_weight, v_weight, b, q_n, k_n, k_dim,
+        )
+        .or_else(|| {
+            try_cuda_fused_qkv_typed_buffer(input, q_weight, k_weight, v_weight, b, q_n, k_n, k_dim)
+        })
+        .unwrap_or_else(|| {
+            input.with_cuda_f32_buffer(|input_buf| {
+                q_weight.with_cuda_f32_buffer(|q_buf| {
+                    k_weight.with_cuda_f32_buffer(|k_buf| {
+                        v_weight.with_cuda_f32_buffer(|v_buf| {
+                            cuda::fused_qkv_f32_buffer(
+                                input_buf, q_buf, k_buf, v_buf, b, q_n, k_n, k_dim,
+                            )
+                        })
                     })
                 })
             })
         });
         if let Ok((q_buf, k_buf, v_buf)) = cuda_out {
-            let q = Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+            let q = cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
                 &[b, n_head, 1, d],
                 q_buf,
                 compute_device,
                 output_dtype,
+                "fused_qkv_decode_infer_tensors Q",
             );
-            let k = Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+            let k = cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
                 &[b, n_kv_head, 1, d],
                 k_buf,
                 compute_device,
                 output_dtype,
+                "fused_qkv_decode_infer_tensors K",
             );
-            let v = Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+            let v = cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
                 &[b, n_kv_head, 1, d],
                 v_buf,
                 compute_device,
                 output_dtype,
+                "fused_qkv_decode_infer_tensors V",
             );
             return (q, k, v);
         }
@@ -2330,7 +3026,12 @@ pub fn fused_qkv_prefill_infer_tensors(
     }
     let (b, s, k_dim) = (x_shape[0], x_shape[1], x_shape[2]);
     let (q_n, k_n, v_n) = validate_qkv_shapes(k_dim, q_weight, k_weight, v_weight);
-    if q_n % n_head != 0 || k_n % n_kv_head != 0 || v_n != k_n {
+    if n_head == 0
+        || n_kv_head == 0
+        || !q_n.is_multiple_of(n_head)
+        || !k_n.is_multiple_of(n_kv_head)
+        || v_n != k_n
+    {
         return None;
     }
     let d = q_n / n_head;
@@ -2358,13 +3059,87 @@ pub fn fused_qkv_prefill_infer_tensors(
     }
 
     let rows = b.checked_mul(s)?;
-    let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-        q_weight.with_cuda_f32_buffer(|q_buf| {
-            k_weight.with_cuda_f32_buffer(|k_buf| {
-                v_weight.with_cuda_f32_buffer(|v_buf| {
-                    cuda::fused_qkv_f32_buffer(
-                        input_buf, q_buf, k_buf, v_buf, rows, q_n, k_n, k_dim,
-                    )
+    if let Some(cuda_native_out) = try_cuda_fused_qkv_typed_output_buffer(
+        input,
+        q_weight,
+        k_weight,
+        v_weight,
+        output_dtype,
+        rows,
+        q_n,
+        k_n,
+        k_dim,
+    ) {
+        match cuda_native_out {
+            Ok((q_bshd, k_bshd, v_bshd)) => {
+                let q_buf = cuda::permute_typed_buffer(
+                    &q_bshd,
+                    output_dtype,
+                    &[b, n_head, s, d],
+                    &[0, 2, 1, 3],
+                )
+                .ok()?;
+                let k_buf = cuda::permute_typed_buffer(
+                    &k_bshd,
+                    output_dtype,
+                    &[b, n_kv_head, s, d],
+                    &[0, 2, 1, 3],
+                )
+                .ok()?;
+                let v_buf = cuda::permute_typed_buffer(
+                    &v_bshd,
+                    output_dtype,
+                    &[b, n_kv_head, s, d],
+                    &[0, 2, 1, 3],
+                )
+                .ok()?;
+                return Some((
+                    Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &[b, n_head, s, d],
+                        q_buf,
+                        compute_device,
+                        output_dtype,
+                        None,
+                    ),
+                    Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &[b, n_kv_head, s, d],
+                        k_buf,
+                        compute_device,
+                        output_dtype,
+                        None,
+                    ),
+                    Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                        &[b, n_kv_head, s, d],
+                        v_buf,
+                        compute_device,
+                        output_dtype,
+                        None,
+                    ),
+                ));
+            }
+            Err(err) => {
+                assert!(
+                    !is_strict_device_execution(),
+                    "fused_qkv_prefill_infer_tensors CUDA typed low precision output failed while strict device execution is enabled: {err}"
+                );
+            }
+        }
+    }
+    let cuda_out = try_cuda_fused_qkv_mixed_i8_matmul_buffer(
+        input, q_weight, k_weight, v_weight, rows, q_n, k_n, k_dim,
+    )
+    .or_else(|| {
+        try_cuda_fused_qkv_typed_buffer(input, q_weight, k_weight, v_weight, rows, q_n, k_n, k_dim)
+    })
+    .unwrap_or_else(|| {
+        input.with_cuda_f32_buffer(|input_buf| {
+            q_weight.with_cuda_f32_buffer(|q_buf| {
+                k_weight.with_cuda_f32_buffer(|k_buf| {
+                    v_weight.with_cuda_f32_buffer(|v_buf| {
+                        cuda::fused_qkv_f32_buffer(
+                            input_buf, q_buf, k_buf, v_buf, rows, q_n, k_n, k_dim,
+                        )
+                    })
                 })
             })
         })
@@ -2375,31 +3150,428 @@ pub fn fused_qkv_prefill_infer_tensors(
     let v_buf = cuda::permute_f32_buffer(&v_bshd, &[b, n_kv_head, s, d], &[0, 2, 1, 3]).ok()?;
 
     Some((
-        Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+        cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
             &[b, n_head, s, d],
             q_buf,
             compute_device,
             output_dtype,
+            "fused_qkv_prefill_infer_tensors Q",
         ),
-        Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+        cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
             &[b, n_kv_head, s, d],
             k_buf,
             compute_device,
             output_dtype,
+            "fused_qkv_prefill_infer_tensors K",
         ),
-        Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+        cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
             &[b, n_kv_head, s, d],
             v_buf,
             compute_device,
             output_dtype,
+            "fused_qkv_prefill_infer_tensors V",
         ),
     ))
+}
+
+struct QkvProjectionSpec {
+    out_shape: Vec<usize>,
+    grad_restore_permute: Option<(Vec<usize>, Vec<usize>)>,
+    rows: usize,
+    k_dim: usize,
+    n_dim: usize,
+}
+
+fn try_cuda_fused_qkv_projection_backward_buffers(
+    grad: &cuda::CudaBuffer,
+    input: &Tensor,
+    weight: &Tensor,
+    rows: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Result<(cuda::CudaBuffer, cuda::CudaBuffer), String> {
+    if let (Some((DType::BF16, input_buffer, _)), Some((DType::I8, weight_buffer, weight_scale))) = (
+        input.cloned_cuda_native_lowp_buffer(),
+        weight.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::matmul_backward_bf16_i8_no_host(
+            grad,
+            &input_buffer,
+            &weight_buffer,
+            weight_scale.ok_or_else(|| "CUDA fused QKV I8 weight scale missing".to_string())?,
+            rows,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let (Some((DType::F16, input_buffer, _)), Some((DType::I8, weight_buffer, weight_scale))) = (
+        input.cloned_cuda_native_lowp_buffer(),
+        weight.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::matmul_backward_f16_i8_no_host(
+            grad,
+            &input_buffer,
+            &weight_buffer,
+            weight_scale.ok_or_else(|| "CUDA fused QKV I8 weight scale missing".to_string())?,
+            rows,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let Some((DType::I8, weight_buffer, weight_scale)) = weight.cloned_cuda_native_lowp_buffer()
+        && input.dtype() == DType::F32
+    {
+        let input_buffer = input
+            .cloned_cuda_f32_buffer()
+            .ok_or_else(|| "CUDA fused QKV F32xI8 backward expected input buffer".to_string())?;
+        return cuda::matmul_backward_f32_i8_no_host(
+            grad,
+            &input_buffer,
+            &weight_buffer,
+            weight_scale.ok_or_else(|| "CUDA fused QKV I8 weight scale missing".to_string())?,
+            rows,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    let input_buf = input
+        .cloned_cuda_f32_buffer()
+        .ok_or_else(|| "fused QKV training backward expected CUDA input buffer".to_string())?;
+    let weight_buf = weight
+        .cloned_cuda_f32_buffer()
+        .ok_or_else(|| "fused QKV training backward expected CUDA weight buffer".to_string())?;
+    cuda::matmul_backward_f32_no_host(grad, &input_buf, &weight_buf, rows, k_dim, n_dim)
+}
+
+fn fused_qkv_training_projection_tensor(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    out_buffer: cuda::CudaBuffer,
+    spec: QkvProjectionSpec,
+) -> Tensor {
+    let input_clone = input.clone();
+    let weight_clone = weight.clone();
+    let bias_clone = bias.cloned();
+    let out_shape = spec.out_shape.clone();
+    let mut parents = vec![input.clone(), weight.clone()];
+    if let Some(bias) = bias {
+        parents.push(bias.clone());
+    }
+    let output_self = Rc::new(RefCell::new(None::<Tensor>));
+    let output_self_for_backward = output_self.clone();
+    let tensor = Tensor(Rc::new(RefCell::new(TensorData {
+        data: Array::zeros(IxDyn(&out_shape)).into_shared(),
+        f16_data: None,
+        bf16_data: None,
+        i8_data: None,
+        cuda_f32_data: Some(out_buffer),
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
+        i8_scale: None,
+        has_f32_data: false,
+        storage_dtype: DType::F32,
+        cache_dirty: false,
+        is_parameter: false,
+        grad: None,
+        cuda_f32_grad: None,
+        parents,
+        backward_op: Some(Rc::new(move |grad| {
+            let cuda_grad = output_self_for_backward
+                .borrow()
+                .as_ref()
+                .and_then(|output| output.cloned_cuda_f32_grad())
+                .filter(|buffer| buffer.len() == grad.len());
+            let grad_buf = match cuda_grad {
+                Some(buffer) => buffer,
+                None => match cuda::upload_f32(&grad.iter().copied().collect::<Vec<_>>()) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "fused QKV training backward grad upload failed in strict device execution mode: {err}"
+                        );
+                        return;
+                    }
+                },
+            };
+            let grad_matmul = if let Some((restore_shape, restore_axes)) =
+                &spec.grad_restore_permute
+            {
+                match cuda::permute_f32_buffer(&grad_buf, restore_shape, restore_axes) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "fused QKV training backward grad layout restore failed in strict device execution mode: {err}"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                grad_buf
+            };
+            let d_bias = if bias_clone.is_some() {
+                match cuda::sum_lastdim_f32_buffer(&grad_matmul, spec.rows, spec.n_dim) {
+                    Ok(buffer) => Some(buffer),
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "fused QKV training bias grad failed in strict device execution mode: {err}"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let (d_input, d_weight) = match try_cuda_fused_qkv_projection_backward_buffers(
+                &grad_matmul,
+                &input_clone,
+                &weight_clone,
+                spec.rows,
+                spec.k_dim,
+                spec.n_dim,
+            ) {
+                Ok(grads) => grads,
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "fused QKV training matmul backward failed in strict device execution mode: {err}"
+                    );
+                    return;
+                }
+            };
+            if is_strict_device_execution() {
+                input_clone.add_cuda_grad_buffer_only(d_input);
+                weight_clone.add_cuda_grad_buffer_only(d_weight);
+                if let (Some(bias), Some(d_bias)) = (&bias_clone, d_bias) {
+                    bias.add_cuda_grad_buffer_only(d_bias);
+                }
+                return;
+            }
+
+            let input_shape = input_clone.shape_vec();
+            let weight_shape = weight_clone.shape_vec();
+            let d_input_host = match cuda::download_f32(&d_input) {
+                Ok(host) => host,
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "fused QKV training input grad download failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let d_weight_host = match cuda::download_f32(&d_weight) {
+                Ok(host) => host,
+                Err(err) => {
+                    assert!(
+                        !is_strict_device_execution(),
+                        "fused QKV training weight grad download failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let d_input_array = Array::from_shape_vec(IxDyn(&input_shape), d_input_host)
+                .expect("fused QKV input grad shape build failed")
+                .into_dyn();
+            let d_weight_array = Array::from_shape_vec(IxDyn(&weight_shape), d_weight_host)
+                .expect("fused QKV weight grad shape build failed")
+                .into_dyn();
+            input_clone.add_grad_with_cuda_buffer(d_input_array, Some(d_input));
+            weight_clone.add_grad_with_cuda_buffer(d_weight_array, Some(d_weight));
+            if let (Some(bias), Some(d_bias)) = (&bias_clone, d_bias) {
+                let bias_shape = bias.shape_vec();
+                let d_bias_host = match cuda::download_f32(&d_bias) {
+                    Ok(host) => host,
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "fused QKV training bias grad download failed: {err}"
+                        );
+                        return;
+                    }
+                };
+                let d_bias_array = Array::from_shape_vec(IxDyn(&bias_shape), d_bias_host)
+                    .expect("fused QKV bias grad shape build failed")
+                    .into_dyn();
+                bias.add_grad_with_cuda_buffer(d_bias_array, Some(d_bias));
+            }
+        })),
+        requires_grad: true,
+        device: crate::autograd::Device::Cuda,
+    })));
+    *output_self.borrow_mut() = Some(tensor.clone());
+    tensor
+}
+
+pub(crate) fn fused_qkv_train_tensors(
+    input: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    v_weight: &Tensor,
+    q_bias: Option<&Tensor>,
+    k_bias: Option<&Tensor>,
+    v_bias: Option<&Tensor>,
+    n_head: usize,
+    n_kv_head: usize,
+) -> Option<(Tensor, Tensor, Tensor)> {
+    if input.device() != crate::autograd::Device::Cuda
+        || q_weight.device() != crate::autograd::Device::Cuda
+        || k_weight.device() != crate::autograd::Device::Cuda
+        || v_weight.device() != crate::autograd::Device::Cuda
+        || q_bias.is_some_and(|bias| bias.device() != crate::autograd::Device::Cuda)
+        || k_bias.is_some_and(|bias| bias.device() != crate::autograd::Device::Cuda)
+        || v_bias.is_some_and(|bias| bias.device() != crate::autograd::Device::Cuda)
+    {
+        return None;
+    }
+    if !(input.requires_grad()
+        || q_weight.requires_grad()
+        || k_weight.requires_grad()
+        || v_weight.requires_grad())
+        && q_bias.is_none_or(|bias| !bias.requires_grad())
+        && k_bias.is_none_or(|bias| !bias.requires_grad())
+        && v_bias.is_none_or(|bias| !bias.requires_grad())
+    {
+        return None;
+    }
+
+    let x_shape = input.shape_vec();
+    if x_shape.len() != 3 {
+        return None;
+    }
+    let (b, s, k_dim) = (x_shape[0], x_shape[1], x_shape[2]);
+    let (q_n, k_n, v_n) = validate_qkv_shapes(k_dim, q_weight, k_weight, v_weight);
+    if n_head == 0
+        || n_kv_head == 0
+        || !q_n.is_multiple_of(n_head)
+        || !k_n.is_multiple_of(n_kv_head)
+        || v_n != k_n
+        || b == 0
+        || s == 0
+    {
+        return None;
+    }
+    let d = q_n / n_head;
+    if k_n / n_kv_head != d {
+        return None;
+    }
+    if q_bias.is_some_and(|bias| bias.shape_vec() != vec![q_n])
+        || k_bias.is_some_and(|bias| bias.shape_vec() != vec![k_n])
+        || v_bias.is_some_and(|bias| bias.shape_vec() != vec![k_n])
+    {
+        return None;
+    }
+    let rows = b.checked_mul(s)?;
+    let cuda_out = try_cuda_fused_qkv_mixed_i8_matmul_buffer(
+        input, q_weight, k_weight, v_weight, rows, q_n, k_n, k_dim,
+    )
+    .or_else(|| {
+        try_cuda_fused_qkv_typed_buffer(input, q_weight, k_weight, v_weight, rows, q_n, k_n, k_dim)
+    })
+    .unwrap_or_else(|| {
+        input.with_cuda_f32_buffer(|input_buf| {
+            q_weight.with_cuda_f32_buffer(|q_buf| {
+                k_weight.with_cuda_f32_buffer(|k_buf| {
+                    v_weight.with_cuda_f32_buffer(|v_buf| {
+                        cuda::fused_qkv_f32_buffer(
+                            input_buf, q_buf, k_buf, v_buf, rows, q_n, k_n, k_dim,
+                        )
+                    })
+                })
+            })
+        })
+    });
+    let (q_bshd, k_bshd, v_bshd) = match cuda_out {
+        Ok(buffers) => buffers,
+        Err(err) => {
+            assert!(
+                !is_strict_device_execution(),
+                "fused QKV training CUDA projection failed in strict device execution mode: {err}"
+            );
+            return None;
+        }
+    };
+
+    let q_buf = if let Some(bias) = q_bias {
+        bias.with_cuda_f32_buffer(|bias_buf| {
+            cuda::bshd_to_bhsd_add_bias_f32_buffer(&q_bshd, bias_buf, b, s, n_head, d)
+        })
+        .ok()?
+    } else {
+        cuda::permute_f32_buffer(&q_bshd, &[b, n_head, s, d], &[0, 2, 1, 3]).ok()?
+    };
+    let k_buf = if let Some(bias) = k_bias {
+        bias.with_cuda_f32_buffer(|bias_buf| {
+            cuda::bshd_to_bhsd_add_bias_f32_buffer(&k_bshd, bias_buf, b, s, n_kv_head, d)
+        })
+        .ok()?
+    } else {
+        cuda::permute_f32_buffer(&k_bshd, &[b, n_kv_head, s, d], &[0, 2, 1, 3]).ok()?
+    };
+    let v_buf = if let Some(bias) = v_bias {
+        bias.with_cuda_f32_buffer(|bias_buf| {
+            cuda::bshd_to_bhsd_add_bias_f32_buffer(&v_bshd, bias_buf, b, s, n_kv_head, d)
+        })
+        .ok()?
+    } else {
+        cuda::permute_f32_buffer(&v_bshd, &[b, n_kv_head, s, d], &[0, 2, 1, 3]).ok()?
+    };
+
+    let q = fused_qkv_training_projection_tensor(
+        input,
+        q_weight,
+        q_bias,
+        q_buf,
+        QkvProjectionSpec {
+            out_shape: vec![b, n_head, s, d],
+            grad_restore_permute: Some((vec![b, s, n_head, d], vec![0, 2, 1, 3])),
+            rows,
+            k_dim,
+            n_dim: q_n,
+        },
+    );
+    let k = fused_qkv_training_projection_tensor(
+        input,
+        k_weight,
+        k_bias,
+        k_buf,
+        QkvProjectionSpec {
+            out_shape: vec![b, n_kv_head, s, d],
+            grad_restore_permute: Some((vec![b, s, n_kv_head, d], vec![0, 2, 1, 3])),
+            rows,
+            k_dim,
+            n_dim: k_n,
+        },
+    );
+    let v = fused_qkv_training_projection_tensor(
+        input,
+        v_weight,
+        v_bias,
+        v_buf,
+        QkvProjectionSpec {
+            out_shape: vec![b, n_kv_head, s, d],
+            grad_restore_permute: Some((vec![b, s, n_kv_head, d], vec![0, 2, 1, 3])),
+            rows,
+            k_dim,
+            n_dim: k_n,
+        },
+    );
+    Some((q, k, v))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::autograd::no_grad;
+    #[cfg(feature = "cuda")]
+    use crate::ops::shape::{permute, reshape};
     use crate::precision::DType;
     use ndarray::IxDyn;
 
@@ -3186,15 +4358,36 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(gate.0.borrow().cuda_f32_data.is_none());
+        assert!(up.0.borrow().cuda_f32_data.is_none());
 
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| fused_gate_up_silu_infer(&input, &gate, &up));
         crate::autograd::set_strict_device_execution(false);
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(gate.0.borrow().cuda_f32_data.is_none());
+        assert!(up.0.borrow().cuda_f32_data.is_none());
 
         let cpu_out =
             no_grad(|| fused_gate_up_silu_infer(&input.to_cpu(), &gate.to_cpu(), &up.to_cpu()));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA fused GateUp tensor output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA fused GateUp tensor output should not keep a resident f32 compute buffer for bf16 output"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA fused GateUp tensor output should keep resident bf16 storage"
+            );
+        }
         assert_eq!(cpu_out.dtype(), DType::BF16);
         assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
         let got = cuda_out.data_ref().iter().copied().collect::<Vec<_>>();
@@ -3230,13 +4423,28 @@ mod tests {
             DType::I8,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(gate.0.borrow().cuda_f32_data.is_none());
+        assert!(up.0.borrow().cuda_f32_data.is_none());
 
         crate::autograd::set_strict_device_execution(true);
         let out = no_grad(|| fused_gate_up_silu_infer(&input, &gate, &up));
         crate::autograd::set_strict_device_execution(false);
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(gate.0.borrow().cuda_f32_data.is_none());
+        assert!(up.0.borrow().cuda_f32_data.is_none());
 
         assert!(out.is_cuda());
         assert_eq!(out.dtype(), DType::F32);
+        let inner = out.0.borrow();
+        assert!(
+            !inner.has_f32_data,
+            "I8 CUDA fused GateUp output should not eagerly materialize host f32 data"
+        );
+        assert!(
+            inner.cuda_f32_data.is_some(),
+            "I8 CUDA fused GateUp output should stay resident as f32 compute output"
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -3401,16 +4609,32 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(q_w.0.borrow().cuda_f32_data.is_none());
+        assert!(k_w.0.borrow().cuda_f32_data.is_none());
+        assert!(v_w.0.borrow().cuda_f32_data.is_none());
 
         crate::autograd::set_strict_device_execution(true);
         let (q_out, k_out, v_out) =
             no_grad(|| fused_qkv_decode_infer_tensors(&input, &q_w, &k_w, &v_w, 1, 1));
         crate::autograd::set_strict_device_execution(false);
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(q_w.0.borrow().cuda_f32_data.is_none());
+        assert!(k_w.0.borrow().cuda_f32_data.is_none());
+        assert!(v_w.0.borrow().cuda_f32_data.is_none());
 
         for out in [&q_out, &k_out, &v_out] {
             assert!(out.is_cuda());
             assert_eq!(out.dtype(), DType::BF16);
-            assert!(out.cloned_cuda_f32_buffer().is_some());
+            let inner = out.0.borrow();
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA fused QKV decode output should not keep a resident f32 compute buffer for bf16 output"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA fused QKV decode output should keep resident bf16 storage"
+            );
         }
     }
 
@@ -3475,6 +4699,10 @@ mod tests {
             DType::F16,
         )
         .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(q_w.0.borrow().cuda_f32_data.is_none());
+        assert!(k_w.0.borrow().cuda_f32_data.is_none());
+        assert!(v_w.0.borrow().cuda_f32_data.is_none());
 
         crate::autograd::set_strict_device_execution(true);
         let (q_out, k_out, v_out) = no_grad(|| {
@@ -3482,11 +4710,23 @@ mod tests {
                 .expect("CUDA prefill fused QKV should run")
         });
         crate::autograd::set_strict_device_execution(false);
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(q_w.0.borrow().cuda_f32_data.is_none());
+        assert!(k_w.0.borrow().cuda_f32_data.is_none());
+        assert!(v_w.0.borrow().cuda_f32_data.is_none());
 
         for out in [&q_out, &k_out, &v_out] {
             assert!(out.is_cuda());
             assert_eq!(out.dtype(), DType::F16);
-            assert!(out.cloned_cuda_f32_buffer().is_some());
+            let inner = out.0.borrow();
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA fused QKV prefill output should not keep a resident f32 compute buffer for f16 output"
+            );
+            assert!(
+                inner.cuda_f16_data.is_some(),
+                "CUDA fused QKV prefill output should keep resident f16 storage"
+            );
         }
         assert_eq!(q_out.shape_vec(), vec![batch, 1, seq, hidden]);
         assert_eq!(k_out.shape_vec(), vec![batch, 1, seq, hidden]);
@@ -3825,6 +5065,21 @@ mod tests {
         let cpu_out = no_grad(|| fused_softmax(&input.to_cpu(), 0.75, true));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA fused_softmax no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA fused_softmax no-grad output should not keep a resident f32 compute buffer for bf16 output"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA fused_softmax no-grad output should keep resident bf16 storage"
+            );
+        }
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
         }
@@ -3855,6 +5110,17 @@ mod tests {
         let cpu_out = no_grad(|| fused_softmax(&input.to_cpu(), 1.0, false));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::F32);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "I8 CUDA fused_softmax output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_some(),
+                "I8 CUDA fused_softmax output should stay resident as f32 compute output"
+            );
+        }
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
         }
@@ -3943,6 +5209,21 @@ mod tests {
         let cpu_out = no_grad(|| fused_softmax_with_past_infer(&input.to_cpu(), 0.75, true, 2));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA fused_softmax_with_past no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA fused_softmax_with_past no-grad output should not keep a resident f32 compute buffer for bf16 output"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA fused_softmax_with_past no-grad output should keep resident bf16 storage"
+            );
+        }
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
         }
@@ -4109,5 +5390,273 @@ mod tests {
         assert_eq!(q_out.shape_vec(), vec![batch, 1, seq, hidden]);
         assert_eq!(k_out.shape_vec(), vec![batch, 1, seq, hidden]);
         assert_eq!(v_out.shape_vec(), vec![batch, 1, seq, hidden]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_qkv_train_bf16_input_i8_weights_backward_stays_native_lowp() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        fn grad_tensor_typed(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
+            let tensor = Tensor::from_data_with_grad_flag(
+                Array::from_shape_vec(IxDyn(shape), data)
+                    .unwrap()
+                    .into_dyn(),
+                true,
+            );
+            tensor.cast_inplace(dtype);
+            tensor
+        }
+
+        let b = 2usize;
+        let s = 2usize;
+        let k_dim = 4usize;
+        let n_head = 2usize;
+        let n_kv_head = 1usize;
+        let d = 4usize;
+        let q_n = n_head * d;
+        let k_n = n_kv_head * d;
+
+        let input_data = sample_f32(b * s * k_dim);
+        let q_data = sample_f32(q_n * k_dim);
+        let k_data = sample_f32(k_n * k_dim)
+            .into_iter()
+            .map(|v| v * 0.7 - 0.1)
+            .collect::<Vec<_>>();
+        let v_data = sample_f32(k_n * k_dim)
+            .into_iter()
+            .map(|v| v * -0.4 + 0.05)
+            .collect::<Vec<_>>();
+
+        let input_cpu = grad_tensor_typed(&[b, s, k_dim], input_data.clone(), DType::BF16);
+        let q_w_cpu = grad_tensor_typed(&[q_n, k_dim], q_data.clone(), DType::I8);
+        let k_w_cpu = grad_tensor_typed(&[k_n, k_dim], k_data.clone(), DType::I8);
+        let v_w_cpu = grad_tensor_typed(&[k_n, k_dim], v_data.clone(), DType::I8);
+        let q_coeff_cpu = make_tensor(
+            &[b, n_head, s, d],
+            sample_f32(b * n_head * s * d),
+            DType::F32,
+        );
+        let k_coeff_cpu = make_tensor(
+            &[b, n_kv_head, s, d],
+            sample_f32(b * n_kv_head * s * d),
+            DType::F32,
+        );
+        let v_coeff_cpu = make_tensor(
+            &[b, n_kv_head, s, d],
+            sample_f32(b * n_kv_head * s * d),
+            DType::F32,
+        );
+
+        let input_cuda = input_cpu.to_cuda();
+        let q_w_cuda = q_w_cpu.to_cuda();
+        let k_w_cuda = k_w_cpu.to_cuda();
+        let v_w_cuda = v_w_cpu.to_cuda();
+        let q_coeff_cuda = q_coeff_cpu.to_cuda();
+        let k_coeff_cuda = k_coeff_cpu.to_cuda();
+        let v_coeff_cuda = v_coeff_cpu.to_cuda();
+
+        for tensor in [&input_cuda, &q_w_cuda, &k_w_cuda, &v_w_cuda] {
+            assert!(tensor.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(tensor.0.borrow().cuda_f32_data.is_none());
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let (q_cuda, k_cuda, v_cuda) = fused_qkv_train_tensors(
+            &input_cuda,
+            &q_w_cuda,
+            &k_w_cuda,
+            &v_w_cuda,
+            None,
+            None,
+            None,
+            n_head,
+            n_kv_head,
+        )
+        .expect("CUDA fused QKV train BF16xI8 should be available");
+        crate::ops::arithmetic::sum(&(&q_cuda * &q_coeff_cuda)).backward();
+        crate::ops::arithmetic::sum(&(&k_cuda * &k_coeff_cuda)).backward();
+        crate::ops::arithmetic::sum(&(&v_cuda * &v_coeff_cuda)).backward();
+        for tensor in [&input_cuda, &q_w_cuda, &k_w_cuda, &v_w_cuda] {
+            assert!(tensor.cloned_cuda_f32_grad().is_some());
+            assert!(
+                tensor.0.borrow().cuda_f32_data.is_none(),
+                "BF16xI8 fused QKV train backward should not materialize CUDA f32 parameter data"
+            );
+        }
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let q_cpu = permute(
+            &reshape(
+                &crate::ops::matmul::matmul(&input_cpu, &q_w_cpu),
+                vec![b as i32, s as i32, n_head as i32, d as i32],
+            ),
+            vec![0, 2, 1, 3],
+        );
+        let k_cpu = permute(
+            &reshape(
+                &crate::ops::matmul::matmul(&input_cpu, &k_w_cpu),
+                vec![b as i32, s as i32, n_kv_head as i32, d as i32],
+            ),
+            vec![0, 2, 1, 3],
+        );
+        let v_cpu = permute(
+            &reshape(
+                &crate::ops::matmul::matmul(&input_cpu, &v_w_cpu),
+                vec![b as i32, s as i32, n_kv_head as i32, d as i32],
+            ),
+            vec![0, 2, 1, 3],
+        );
+        crate::ops::arithmetic::sum(&(&q_cpu * &q_coeff_cpu)).backward();
+        crate::ops::arithmetic::sum(&(&k_cpu * &k_coeff_cpu)).backward();
+        crate::ops::arithmetic::sum(&(&v_cpu * &v_coeff_cpu)).backward();
+
+        for (cuda_tensor, cpu_tensor, label) in [
+            (&input_cuda, &input_cpu, "input"),
+            (&q_w_cuda, &q_w_cpu, "q weight"),
+            (&k_w_cuda, &k_w_cpu, "k weight"),
+            (&v_w_cuda, &v_w_cpu, "v weight"),
+        ] {
+            let cuda_grad = cuda_tensor.grad().expect("cuda grad");
+            let cpu_grad = cpu_tensor.grad().expect("cpu grad");
+            for (idx, (&got, &expect)) in cuda_grad.iter().zip(cpu_grad.iter()).enumerate() {
+                assert!(
+                    (got - expect).abs() < 3e-3,
+                    "{label} grad mismatch at {idx}: got {got}, expect {expect}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_qkv_train_with_bias_matches_cpu_reference_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        fn grad_tensor(shape: &[usize], data: Vec<f32>) -> Tensor {
+            Tensor::from_data_with_grad_flag(
+                Array::from_shape_vec(IxDyn(shape), data)
+                    .unwrap()
+                    .into_dyn(),
+                true,
+            )
+        }
+
+        let b = 2usize;
+        let s = 3usize;
+        let k_dim = 4usize;
+        let n_head = 2usize;
+        let n_kv_head = 1usize;
+        let d = 4usize;
+        let q_n = n_head * d;
+        let k_n = n_kv_head * d;
+
+        let input_cpu = grad_tensor(&[b, s, k_dim], sample_f32(b * s * k_dim));
+        let q_w_cpu = grad_tensor(&[q_n, k_dim], sample_f32(q_n * k_dim));
+        let k_w_cpu = grad_tensor(&[k_n, k_dim], sample_f32(k_n * k_dim));
+        let v_w_cpu = grad_tensor(&[k_n, k_dim], sample_f32(k_n * k_dim));
+        let q_b_cpu = grad_tensor(&[q_n], sample_f32(q_n));
+        let k_b_cpu = grad_tensor(&[k_n], sample_f32(k_n));
+        let v_b_cpu = grad_tensor(&[k_n], sample_f32(k_n));
+        let q_coeff_cpu = make_tensor(
+            &[b, n_head, s, d],
+            sample_f32(b * n_head * s * d),
+            DType::F32,
+        );
+        let k_coeff_cpu = make_tensor(
+            &[b, n_kv_head, s, d],
+            sample_f32(b * n_kv_head * s * d),
+            DType::F32,
+        );
+        let v_coeff_cpu = make_tensor(
+            &[b, n_kv_head, s, d],
+            sample_f32(b * n_kv_head * s * d),
+            DType::F32,
+        );
+
+        let input_cuda = input_cpu.to_cuda();
+        let q_w_cuda = q_w_cpu.to_cuda();
+        let k_w_cuda = k_w_cpu.to_cuda();
+        let v_w_cuda = v_w_cpu.to_cuda();
+        let q_b_cuda = q_b_cpu.to_cuda();
+        let k_b_cuda = k_b_cpu.to_cuda();
+        let v_b_cuda = v_b_cpu.to_cuda();
+        let q_coeff_cuda = q_coeff_cpu.to_cuda();
+        let k_coeff_cuda = k_coeff_cpu.to_cuda();
+        let v_coeff_cuda = v_coeff_cpu.to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let (q_cuda, k_cuda, v_cuda) = fused_qkv_train_tensors(
+            &input_cuda,
+            &q_w_cuda,
+            &k_w_cuda,
+            &v_w_cuda,
+            Some(&q_b_cuda),
+            Some(&k_b_cuda),
+            Some(&v_b_cuda),
+            n_head,
+            n_kv_head,
+        )
+        .expect("CUDA fused QKV train with bias should be available");
+        crate::ops::arithmetic::sum(&(&q_cuda * &q_coeff_cuda)).backward();
+        crate::ops::arithmetic::sum(&(&k_cuda * &k_coeff_cuda)).backward();
+        crate::ops::arithmetic::sum(&(&v_cuda * &v_coeff_cuda)).backward();
+        assert!(q_b_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(k_b_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(v_b_cuda.cloned_cuda_f32_grad().is_some());
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let q_cpu = permute(
+            &reshape(
+                &(crate::ops::matmul::matmul(&input_cpu, &q_w_cpu) + q_b_cpu.clone()),
+                vec![b as i32, s as i32, n_head as i32, d as i32],
+            ),
+            vec![0, 2, 1, 3],
+        );
+        let k_cpu = permute(
+            &reshape(
+                &(crate::ops::matmul::matmul(&input_cpu, &k_w_cpu) + k_b_cpu.clone()),
+                vec![b as i32, s as i32, n_kv_head as i32, d as i32],
+            ),
+            vec![0, 2, 1, 3],
+        );
+        let v_cpu = permute(
+            &reshape(
+                &(crate::ops::matmul::matmul(&input_cpu, &v_w_cpu) + v_b_cpu.clone()),
+                vec![b as i32, s as i32, n_kv_head as i32, d as i32],
+            ),
+            vec![0, 2, 1, 3],
+        );
+        crate::ops::arithmetic::sum(&(&q_cpu * &q_coeff_cpu)).backward();
+        crate::ops::arithmetic::sum(&(&k_cpu * &k_coeff_cpu)).backward();
+        crate::ops::arithmetic::sum(&(&v_cpu * &v_coeff_cpu)).backward();
+
+        let pairs = [
+            (&input_cuda, &input_cpu, "input"),
+            (&q_w_cuda, &q_w_cpu, "q weight"),
+            (&k_w_cuda, &k_w_cpu, "k weight"),
+            (&v_w_cuda, &v_w_cpu, "v weight"),
+            (&q_b_cuda, &q_b_cpu, "q bias"),
+            (&k_b_cuda, &k_b_cpu, "k bias"),
+            (&v_b_cuda, &v_b_cpu, "v bias"),
+        ];
+        for (cuda_tensor, cpu_tensor, label) in pairs {
+            let cuda_grad = cuda_tensor.grad().expect("cuda grad");
+            let cpu_grad = cpu_tensor.grad().expect("cpu grad");
+            for (idx, (&got, &expect)) in cuda_grad.iter().zip(cpu_grad.iter()).enumerate() {
+                assert!(
+                    (got - expect).abs() < 2e-4,
+                    "{label} grad mismatch at {idx}: got {got}, expect {expect}"
+                );
+            }
+        }
     }
 }

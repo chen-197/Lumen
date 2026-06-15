@@ -14,14 +14,61 @@ use std::rc::Rc;
 
 thread_local! {
     // conv2d forward: per-thread im2col buffer (K_dim * Out_pixels)
-    static IM2COL_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static IM2COL_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // conv2d forward: per-thread output GEMM buffer (OutC * Out_pixels)
-    static OUT_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static OUT_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 
     // backward: d_col buffer (K_dim * Out_pixels)
-    static DCOL_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static DCOL_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // backward: dW buffer (OutC * K_dim)
-    static DW_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static DW_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn cuda_conv_storage(tensor: &Tensor) -> Option<(cuda::CudaBuffer, DType, Option<f32>)> {
+    tensor
+        .cloned_cuda_native_lowp_buffer()
+        .map(|(dtype, buffer, scale)| (buffer, dtype, scale))
+        .or_else(|| {
+            if tensor.dtype() == DType::F32 && tensor.is_cuda() {
+                tensor
+                    .cloned_cuda_f32_buffer()
+                    .map(|buffer| (buffer, DType::F32, None))
+            } else {
+                None
+            }
+        })
+}
+
+fn checked_padded_dim(input: usize, padding: usize, axis: &str) -> usize {
+    padding
+        .checked_mul(2)
+        .and_then(|padding| input.checked_add(padding))
+        .unwrap_or_else(|| panic!("conv2d padded {axis} overflow"))
+}
+
+fn checked_dim_product(factors: &[usize], label: &str) -> usize {
+    factors
+        .iter()
+        .try_fold(1usize, |product, &factor| product.checked_mul(factor))
+        .unwrap_or_else(|| panic!("conv2d {label} size overflow"))
+}
+
+fn conv_output_dim(
+    input: usize,
+    kernel: usize,
+    padding: usize,
+    stride: usize,
+    axis: &str,
+) -> usize {
+    assert!(stride > 0, "conv2d stride must be greater than zero");
+    let padded = checked_padded_dim(input, padding, axis);
+    assert!(
+        padded >= kernel,
+        "conv2d kernel is larger than the padded input"
+    );
+    ((padded - kernel) / stride)
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("conv2d output {axis} overflow"))
 }
 
 //填充
@@ -37,7 +84,9 @@ where
 
     let input_view = input.view().into_dimensionality::<ndarray::Ix4>().unwrap();
     let (b, c, h, w) = input_view.dim();
-    let mut padded = Array::zeros((b, c, h + 2 * pad_h, w + 2 * pad_w));
+    let padded_h = checked_padded_dim(h, pad_h, "height");
+    let padded_w = checked_padded_dim(w, pad_w, "width");
+    let mut padded = Array::zeros((b, c, padded_h, padded_w));
     padded
         .slice_mut(s![.., .., pad_h..pad_h + h, pad_w..pad_w + w])
         .assign(&input_view);
@@ -183,18 +232,19 @@ pub fn conv2d(
     );
     let (pad_h, pad_w) = padding;
     let (stride_h, stride_w) = stride;
-    assert!(
-        stride_h > 0 && stride_w > 0,
-        "conv2d stride must be greater than zero"
+    let out_h = conv_output_dim(in_h, k_h, pad_h, stride_h, "height");
+    let out_w = conv_output_dim(in_w, k_w, pad_w, stride_w, "width");
+    let padded_h = checked_padded_dim(in_h, pad_h, "height");
+    let padded_w = checked_padded_dim(in_w, pad_w, "width");
+    checked_dim_product(
+        &[batch_size, in_channels, padded_h, padded_w],
+        "padded input",
     );
-    assert!(
-        in_h + 2 * pad_h >= k_h && in_w + 2 * pad_w >= k_w,
-        "conv2d kernel is larger than the padded input"
-    );
-    let out_h = (in_h + 2 * pad_h - k_h) / stride_h + 1;
-    let out_w = (in_w + 2 * pad_w - k_w) / stride_w + 1;
+    checked_dim_product(&[batch_size, out_channels, out_h, out_w], "output");
+    checked_dim_product(&[in_channels, k_h, k_w], "kernel");
+    checked_dim_product(&[out_h, out_w], "output pixels");
 
-    if output_device == crate::autograd::Device::Cuda && input.len() > 0 && build_graph {
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() && build_graph {
         let bias_buffer = bias.and_then(|tensor| tensor.cloned_cuda_f32_buffer());
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             weight.with_cuda_f32_buffer(|weight_buf| {
@@ -229,6 +279,9 @@ pub fn conv2d(
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: Some(buffer),
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: false,
                 storage_dtype: crate::precision::DType::F32,
@@ -334,7 +387,77 @@ pub fn conv2d(
         }
     }
 
-    if output_device == crate::autograd::Device::Cuda && input.len() > 0 && !build_graph {
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() && !build_graph {
+        let use_typed_conv = input.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || bias.is_some_and(|b| b.dtype() != DType::F32);
+        if use_typed_conv
+            && let (
+                Some((input_buffer, input_dtype, input_scale)),
+                Some((weight_buffer, weight_dtype, weight_scale)),
+            ) = (cuda_conv_storage(input), cuda_conv_storage(weight))
+        {
+            let bias_storage = match bias {
+                Some(tensor) => match cuda_conv_storage(tensor) {
+                    Some((buffer, dtype, scale)) => Some((buffer, dtype, scale)),
+                    None => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "CUDA typed conv2d missing resident bias buffer in strict device execution mode"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            if bias.is_none() || bias_storage.is_some() {
+                let cuda_out = cuda::conv2d_typed(
+                    &input_buffer,
+                    input_dtype,
+                    input_scale,
+                    &weight_buffer,
+                    weight_dtype,
+                    weight_scale,
+                    bias_storage
+                        .as_ref()
+                        .map(|(buffer, dtype, scale)| (buffer, *dtype, *scale)),
+                    batch_size,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    k_h,
+                    k_w,
+                    pad_h,
+                    pad_w,
+                    stride_h,
+                    stride_w,
+                );
+                match cuda_out {
+                    Ok((buffer, out, cuda_out_h, cuda_out_w)) => {
+                        let out = Array::from_shape_vec(
+                            (batch_size, out_channels, cuda_out_h, cuda_out_w),
+                            out,
+                        )
+                        .expect("CUDA typed conv2d output shape build failed")
+                        .into_dyn();
+                        return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
+                            out,
+                            DType::F32,
+                            output_device,
+                            Some(buffer),
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "CUDA typed conv2d failed in strict device execution mode: {err}"
+                        );
+                    }
+                }
+            }
+        }
+
         let bias_buffer = bias.and_then(|tensor| tensor.cloned_cuda_f32_buffer());
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             weight.with_cuda_f32_buffer(|weight_buf| {
@@ -460,7 +583,7 @@ pub fn conv2d(
 
     let input_clone = input.clone();
     let weight_clone = weight.clone();
-    let bias_clone = bias.map(|t| t.clone());
+    let bias_clone = bias.cloned();
 
     Tensor(Rc::new(RefCell::new(TensorData {
         data: output_dyn.into_shared(),
@@ -468,6 +591,9 @@ pub fn conv2d(
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -638,7 +764,7 @@ fn run_backward_conv2d_gemm(
     if !grad_weight_sum.is_empty() {
         let mut final_grad_w = grad_weight_sum[0].clone();
         for i in 1..grad_weight_sum.len() {
-            final_grad_w = final_grad_w + &grad_weight_sum[i];
+            final_grad_w += &grad_weight_sum[i];
         }
         // Reshape 回 [OutC, InC, KH, KW]
         let final_grad_w_reshaped = final_grad_w.into_shape(w_dat.shape()).unwrap().into_dyn();
@@ -681,10 +807,15 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
     let out_h = (h - kh) / sh + 1;
     let out_w = (w - kw) / sw + 1;
 
-    if output_device == crate::autograd::Device::Cuda && input.len() > 0 {
-        let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-            cuda::max_pool2d_f32(input_buf, b, c, h, w, kh, kw, sh, sw)
-        });
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        let cuda_out =
+            if let Some((dtype, input_buf, scale)) = input.cloned_cuda_native_lowp_buffer() {
+                cuda::max_pool2d_typed(&input_buf, dtype, scale, b, c, h, w, kh, kw, sh, sw)
+            } else {
+                input.with_cuda_f32_buffer(|input_buf| {
+                    cuda::max_pool2d_f32(input_buf, b, c, h, w, kh, kw, sh, sw)
+                })
+            };
         if let Ok((buffer, out_host, cuda_out_h, cuda_out_w)) = cuda_out {
             let out = Array::from_shape_vec((b, c, cuda_out_h, cuda_out_w), out_host)
                 .expect("CUDA max_pool2d output shape build failed")
@@ -707,6 +838,9 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
                 bf16_data: None,
                 i8_data: None,
                 cuda_f32_data: Some(buffer),
+                cuda_f16_data: None,
+                cuda_bf16_data: None,
+                cuda_i8_data: None,
                 i8_scale: None,
                 has_f32_data: true,
                 storage_dtype: crate::precision::DType::F32,
@@ -716,9 +850,6 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
                 cuda_f32_grad: None,
                 parents: vec![input.clone()],
                 backward_op: Some(std::rc::Rc::new(move |grad_output| {
-                    let input_buffer = input_clone
-                        .cloned_cuda_f32_buffer()
-                        .expect("CUDA max_pool2d input missing resident buffer");
                     let grad_output_buffer = output_self_for_backward
                         .borrow()
                         .as_ref()
@@ -729,8 +860,54 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
                             cuda::upload_f32(&grad_host)
                                 .expect("CUDA max_pool2d grad upload failed")
                         });
+                    let typed_grad_input = input_clone.cloned_cuda_native_lowp_buffer().and_then(
+                        |(dtype, input_buffer, scale)| {
+                            cuda::max_pool2d_backward_typed_buffer(
+                                &input_buffer,
+                                dtype,
+                                scale,
+                                &grad_output_buffer,
+                                b,
+                                c,
+                                h,
+                                w,
+                                kh,
+                                kw,
+                                sh,
+                                sw,
+                            )
+                            .ok()
+                        },
+                    );
                     if is_strict_device_execution() {
-                        let grad_input_buffer = cuda::max_pool2d_backward_f32_buffer(
+                        let grad_input_buffer = typed_grad_input.unwrap_or_else(|| {
+                            let input_buffer = input_clone
+                                .cloned_cuda_f32_buffer()
+                                .expect("CUDA max_pool2d input missing resident buffer");
+                            cuda::max_pool2d_backward_f32_buffer(
+                                &input_buffer,
+                                &grad_output_buffer,
+                                b,
+                                c,
+                                h,
+                                w,
+                                kh,
+                                kw,
+                                sh,
+                                sw,
+                            )
+                            .expect("CUDA max_pool2d backward failed")
+                        });
+                        input_clone.add_cuda_grad_buffer_only(grad_input_buffer);
+                        return;
+                    }
+                    let grad_input_buffer = if let Some(buffer) = typed_grad_input {
+                        buffer
+                    } else {
+                        let input_buffer = input_clone
+                            .cloned_cuda_f32_buffer()
+                            .expect("CUDA max_pool2d input missing resident buffer");
+                        cuda::max_pool2d_backward_f32_buffer(
                             &input_buffer,
                             &grad_output_buffer,
                             b,
@@ -742,23 +919,10 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
                             sh,
                             sw,
                         )
-                        .expect("CUDA max_pool2d backward failed");
-                        input_clone.add_cuda_grad_buffer_only(grad_input_buffer);
-                        return;
-                    }
-                    let (grad_input_buffer, grad_input) = cuda::max_pool2d_backward_f32(
-                        &input_buffer,
-                        &grad_output_buffer,
-                        b,
-                        c,
-                        h,
-                        w,
-                        kh,
-                        kw,
-                        sh,
-                        sw,
-                    )
-                    .expect("CUDA max_pool2d backward failed");
+                        .expect("CUDA max_pool2d backward failed")
+                    };
+                    let grad_input = cuda::download_f32(&grad_input_buffer)
+                        .expect("CUDA max_pool2d grad download failed");
                     let grad_input = Array::from_shape_vec((b, c, h, w), grad_input)
                         .expect("CUDA max_pool2d input grad shape build failed")
                         .into_dyn();
@@ -835,6 +999,9 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -914,6 +1081,18 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "cuda")]
+    fn assert_cuda_native_resident_without_f32(tensor: &Tensor, dtype: DType) {
+        let inner = tensor.0.borrow();
+        assert!(inner.cuda_f32_data.is_none());
+        match dtype {
+            DType::F16 => assert!(inner.cuda_f16_data.is_some()),
+            DType::BF16 => assert!(inner.cuda_bf16_data.is_some()),
+            DType::I8 => assert!(inner.cuda_i8_data.is_some()),
+            DType::F32 => assert!(inner.cuda_f32_data.is_some()),
+        }
+    }
+
     #[test]
     #[should_panic(expected = "kernel dimensions must be greater than zero")]
     fn conv2d_rejects_zero_sized_kernel() {
@@ -928,6 +1107,31 @@ mod tests {
         let input = make_tensor(&[1, 0, 4, 4], vec![], DType::F32);
         let weight = make_tensor(&[1, 0, 3, 3], vec![], DType::F32);
         let _ = no_grad(|| conv2d(&input, &weight, None, (1, 1), (0, 0)));
+    }
+
+    #[test]
+    #[should_panic(expected = "stride must be greater than zero")]
+    fn conv2d_rejects_zero_stride() {
+        let input = make_tensor(&[1, 1, 4, 4], vec![0.0; 16], DType::F32);
+        let weight = make_tensor(&[1, 1, 3, 3], vec![0.0; 9], DType::F32);
+        let _ = no_grad(|| conv2d(&input, &weight, None, (0, 1), (0, 0)));
+    }
+
+    #[test]
+    #[should_panic(expected = "padded height overflow")]
+    fn conv2d_rejects_padding_overflow() {
+        let input = make_tensor(&[1, 1, 1, 1], vec![0.0], DType::F32);
+        let weight = make_tensor(&[1, 1, 1, 1], vec![0.0], DType::F32);
+        let _ = no_grad(|| conv2d(&input, &weight, None, (1, 1), (usize::MAX, 0)));
+    }
+
+    #[test]
+    #[should_panic(expected = "size overflow")]
+    fn conv2d_rejects_aggregate_size_overflow() {
+        let input = make_tensor(&[1, 1, 1, 1], vec![0.0], DType::F32);
+        let weight = make_tensor(&[1, 1, 1, 1], vec![0.0], DType::F32);
+        let padding = usize::MAX / 4;
+        let _ = no_grad(|| conv2d(&input, &weight, None, (1, 1), (padding, padding)));
     }
 
     #[cfg(feature = "cuda")]
@@ -1121,6 +1325,42 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_max_pool2d_bf16_reads_native_input_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let input = make_tensor(
+            &[1, 1, 4, 4],
+            vec![
+                1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 1.5, -0.25, 0.5, 1.25, -0.75, 0.0, 2.5, -1.5,
+                0.5, 1.0,
+            ],
+            DType::BF16,
+        )
+        .to_cuda();
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(input.0.borrow().cuda_bf16_data.is_some());
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let cuda_out = no_grad(|| max_pool2d(&input, (2, 2), (1, 1)));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        assert!(input.0.borrow().cuda_f32_data.is_none());
+        assert!(input.0.borrow().cuda_bf16_data.is_some());
+        let cpu_out = no_grad(|| max_pool2d(&input.to_cpu(), (2, 2), (1, 1)));
+        assert!(cuda_out.is_cuda());
+        assert_eq!(cuda_out.dtype(), DType::F32);
+        assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
+        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
+            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_max_pool2d_backward_matches_cpu_reference_in_strict_mode() {
         if !crate::ops::cuda::is_available() {
             return;
@@ -1163,48 +1403,111 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn cuda_conv2d_accepts_bf16_inputs_in_strict_mode() {
+    fn cuda_max_pool2d_backward_bf16_reads_native_input_in_strict_mode() {
         if !crate::ops::cuda::is_available() {
             return;
         }
 
-        let input = make_tensor(
-            &[1, 1, 4, 4],
-            vec![
-                1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 1.5, -0.25, 0.5, 1.25, -0.75, 0.0, 2.5, -1.5,
-                0.5, 1.0,
-            ],
+        let input_data = vec![
+            1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 1.5, -0.25, 0.5, 1.25, -0.75, 0.0, 2.5, -1.5, 0.5,
+            1.0,
+        ];
+        let input_cpu = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[1, 1, 4, 4]), input_data.clone())
+                .expect("tensor shape mismatch")
+                .into_dyn(),
             DType::BF16,
         );
-        let weight = make_tensor(
-            &[2, 1, 3, 3],
-            vec![
-                0.5, -0.25, 1.0, -0.75, 0.25, 0.5, 1.25, -1.0, 0.0, -0.5, 1.0, 0.25, 0.75, -0.5,
-                0.0, 0.5, -0.25, 1.5,
-            ],
+        let input_cuda = Tensor::parameter_with_dtype(
+            Array::from_shape_vec(IxDyn(&[1, 1, 4, 4]), input_data)
+                .expect("tensor shape mismatch")
+                .into_dyn(),
             DType::BF16,
+        )
+        .to_cuda();
+        let coeff_cpu = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(IxDyn(&[1, 1, 3, 3]), sample_f32(9))
+                .expect("tensor shape mismatch")
+                .into_dyn(),
+            false,
         );
-        let bias = make_tensor(&[2], vec![0.1, -0.15], DType::BF16);
+        let coeff_cuda = coeff_cpu.to_cuda();
+        assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
+        assert!(input_cuda.0.borrow().cuda_bf16_data.is_some());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
-        let cuda_out = no_grad(|| {
-            conv2d(
-                &input.to_cuda(),
-                &weight.to_cuda(),
-                Some(&bias.to_cuda()),
-                (1, 1),
-                (1, 1),
-            )
-        });
+        let cuda_out = max_pool2d(&input_cuda, (2, 2), (1, 1));
+        let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
+        cuda_loss.backward();
+        assert!(input_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(!input_cuda.has_host_grad());
+        assert!(input_cuda.0.borrow().cuda_bf16_data.is_some());
         crate::autograd::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
 
-        let cpu_out = no_grad(|| conv2d(&input, &weight, Some(&bias), (1, 1), (1, 1)));
-        assert!(cuda_out.is_cuda());
-        assert_eq!(cuda_out.dtype(), DType::F32);
-        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 3e-2, "got {got}, expect {expect}");
+        let cpu_out = max_pool2d(&input_cpu, (2, 2), (1, 1));
+        let cpu_loss = crate::ops::arithmetic::sum(&(&cpu_out * &coeff_cpu));
+        cpu_loss.backward();
+
+        let cuda_grad = input_cuda.grad().expect("cuda bf16 max_pool2d input grad");
+        let cpu_grad = input_cpu.grad().expect("cpu bf16 max_pool2d input grad");
+        for (got, expect) in cuda_grad.iter().zip(cpu_grad.iter()) {
+            assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_conv2d_accepts_lowp_inputs_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let input = make_tensor(
+                &[1, 1, 4, 4],
+                vec![
+                    1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 1.5, -0.25, 0.5, 1.25, -0.75, 0.0, 2.5, -1.5,
+                    0.5, 1.0,
+                ],
+                dtype,
+            );
+            let weight = make_tensor(
+                &[2, 1, 3, 3],
+                vec![
+                    0.5, -0.25, 1.0, -0.75, 0.25, 0.5, 1.25, -1.0, 0.0, -0.5, 1.0, 0.25, 0.75,
+                    -0.5, 0.0, 0.5, -0.25, 1.5,
+                ],
+                dtype,
+            );
+            let bias = make_tensor(&[2], vec![0.1, -0.15], dtype);
+            let input_cuda = input.to_cuda();
+            let weight_cuda = weight.to_cuda();
+            let bias_cuda = bias.to_cuda();
+            assert_cuda_native_resident_without_f32(&input_cuda, dtype);
+            assert_cuda_native_resident_without_f32(&weight_cuda, dtype);
+            assert_cuda_native_resident_without_f32(&bias_cuda, dtype);
+
+            crate::ops::cuda::set_enabled(true);
+            crate::autograd::set_strict_device_execution(true);
+            let cuda_out =
+                no_grad(|| conv2d(&input_cuda, &weight_cuda, Some(&bias_cuda), (1, 1), (1, 1)));
+            crate::autograd::set_strict_device_execution(false);
+            crate::ops::cuda::set_enabled(false);
+            assert_cuda_native_resident_without_f32(&input_cuda, dtype);
+            assert_cuda_native_resident_without_f32(&weight_cuda, dtype);
+            assert_cuda_native_resident_without_f32(&bias_cuda, dtype);
+
+            let cpu_out = no_grad(|| conv2d(&input, &weight, Some(&bias), (1, 1), (1, 1)));
+            assert!(cuda_out.is_cuda());
+            assert_eq!(cuda_out.dtype(), DType::F32);
+            for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() < 3e-2,
+                    "dtype {dtype:?}: got {got}, expect {expect}"
+                );
+            }
         }
     }
 }

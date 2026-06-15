@@ -1,14 +1,23 @@
 use half::{bf16, f16};
+use lumen::arch;
 use lumen::autograd::{Tensor, no_grad};
-use lumen::ops::fp_kernels::active_float_backend_name;
+use lumen::ops::fp_kernels::{
+    active_bf16_bf16_backend_name, active_f16_f16_backend_name, active_float_backend_name,
+    dot_bf16_bf16_arch, dot_f16_f16_arch, dot2_bf16_bf16_arch, dot2_f16_f16_arch,
+    dot3_bf16_bf16_arch, dot3_f16_f16_arch,
+};
 use lumen::ops::fused::{fused_gate_up_silu_infer_into, fused_qkv_decode_infer_into};
-use lumen::ops::int8_kernels::active_int8_backend_name;
+use lumen::ops::int8_kernels::{
+    I8ScaledRow, active_i8_i8_backend_name, active_int8_backend_name, dot2_i8_i8_arch,
+    dot3_i8_i8_arch,
+};
 use lumen::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel, dual_matvec_rowmajor_parallel_mixed,
     dual_matvec_silu_mul_rowmajor_parallel, dual_matvec_silu_mul_rowmajor_parallel_mixed, matmul,
     matvec_argmax_rowmajor_parallel, matvec_argmax_rowmajor_parallel_mixed,
     matvec_rowmajor_parallel, matvec_rowmajor_parallel_mixed,
 };
+use lumen::optim::{Adam, Optimizer, SGD};
 use lumen::precision::{DType, set_allow_parameter_dtype_copies, set_default_parameter_dtype};
 use ndarray::Array;
 use std::env;
@@ -115,6 +124,15 @@ fn make_f16(src: &[f32]) -> Vec<f16> {
     src.iter().map(|&v| f16::from_f32(v)).collect()
 }
 
+fn make_i8(len: usize, seed: usize) -> Vec<i8> {
+    (0..len)
+        .map(|i| {
+            let v = ((i.wrapping_mul(1103515245usize) ^ seed).rotate_left(7) & 255) as i32 - 128;
+            v.clamp(-127, 127) as i8
+        })
+        .collect()
+}
+
 fn elapsed_per_iter(total: Duration, iters: usize) -> Duration {
     Duration::from_secs_f64(total.as_secs_f64() / iters as f64)
 }
@@ -137,9 +155,16 @@ fn bench_sampled(samples: usize, iters: usize, mut f: impl FnMut()) -> Duration 
 }
 
 fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
+    assert_eq!(lhs.len(), rhs.len(), "benchmark vector length mismatch");
     lhs.iter()
         .zip(rhs.iter())
-        .map(|(&a, &b)| (a - b).abs())
+        .map(|(&a, &b)| {
+            if a.is_finite() && b.is_finite() {
+                (a - b).abs()
+            } else {
+                f32::INFINITY
+            }
+        })
         .fold(0.0f32, f32::max)
 }
 
@@ -177,6 +202,26 @@ fn print_pair_named(
     );
 }
 
+fn print_single(name: &str, total: Duration, iters: usize) {
+    let us = elapsed_per_iter(total, iters).as_secs_f64() * 1e6;
+    println!("{name:<18} time={us:>9.2} us");
+}
+
+fn print_arch_case(
+    name: &str,
+    scalar_total: Duration,
+    arch_total: Duration,
+    diff: f32,
+    iters: usize,
+) {
+    let scalar_us = elapsed_per_iter(scalar_total, iters).as_secs_f64() * 1e6;
+    let arch_us = elapsed_per_iter(arch_total, iters).as_secs_f64() * 1e6;
+    let speedup = scalar_us / arch_us;
+    println!(
+        "{name:<18} scalar={scalar_us:>9.2} us  arch={arch_us:>9.2} us  speedup={speedup:>5.2}x  max_abs_diff={diff:.6}"
+    );
+}
+
 fn make_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
     let tensor = Tensor::from_array_no_grad(
         Array::from_shape_vec(shape.to_vec(), data)
@@ -203,6 +248,177 @@ fn make_quantized_f32_tensor(shape: &[usize], data: Vec<f32>, quantized_dtype: D
     make_tensor(shape, quantized_f32, DType::F32)
 }
 
+fn grad_array(shape: &[usize], data: &[f32]) -> ndarray::ArrayD<f32> {
+    Array::from_shape_vec(shape.to_vec(), data.to_vec())
+        .expect("grad shape mismatch")
+        .into_dyn()
+}
+
+fn scalar_dot_f16_f16(x: &[f16], row: &[f16]) -> f32 {
+    x.iter()
+        .zip(row.iter())
+        .map(|(&xv, &rv)| xv.to_f32() * rv.to_f32())
+        .sum()
+}
+
+fn scalar_dot2_f16_f16(x: &[f16], row0: &[f16], row1: &[f16]) -> (f32, f32) {
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    for ((&xv, &r0), &r1) in x.iter().zip(row0.iter()).zip(row1.iter()) {
+        let xv = xv.to_f32();
+        sum0 += xv * r0.to_f32();
+        sum1 += xv * r1.to_f32();
+    }
+    (sum0, sum1)
+}
+
+fn scalar_dot3_f16_f16(x: &[f16], row0: &[f16], row1: &[f16], row2: &[f16]) -> (f32, f32, f32) {
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    for (((&xv, &r0), &r1), &r2) in x.iter().zip(row0.iter()).zip(row1.iter()).zip(row2.iter()) {
+        let xv = xv.to_f32();
+        sum0 += xv * r0.to_f32();
+        sum1 += xv * r1.to_f32();
+        sum2 += xv * r2.to_f32();
+    }
+    (sum0, sum1, sum2)
+}
+
+fn scalar_dot_bf16_bf16(x: &[bf16], row: &[bf16]) -> f32 {
+    x.iter()
+        .zip(row.iter())
+        .map(|(&xv, &rv)| xv.to_f32() * rv.to_f32())
+        .sum()
+}
+
+fn scalar_dot2_bf16_bf16(x: &[bf16], row0: &[bf16], row1: &[bf16]) -> (f32, f32) {
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    for ((&xv, &r0), &r1) in x.iter().zip(row0.iter()).zip(row1.iter()) {
+        let xv = xv.to_f32();
+        sum0 += xv * r0.to_f32();
+        sum1 += xv * r1.to_f32();
+    }
+    (sum0, sum1)
+}
+
+fn scalar_dot3_bf16_bf16(
+    x: &[bf16],
+    row0: &[bf16],
+    row1: &[bf16],
+    row2: &[bf16],
+) -> (f32, f32, f32) {
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    for (((&xv, &r0), &r1), &r2) in x.iter().zip(row0.iter()).zip(row1.iter()).zip(row2.iter()) {
+        let xv = xv.to_f32();
+        sum0 += xv * r0.to_f32();
+        sum1 += xv * r1.to_f32();
+        sum2 += xv * r2.to_f32();
+    }
+    (sum0, sum1, sum2)
+}
+
+fn scalar_dot2_i8_i8(
+    x: &[i8],
+    x_scale: f32,
+    row0: &[i8],
+    scale0: f32,
+    row1: &[i8],
+    scale1: f32,
+) -> (f32, f32) {
+    let mut sum0 = 0i32;
+    let mut sum1 = 0i32;
+    for ((&xv, &r0), &r1) in x.iter().zip(row0.iter()).zip(row1.iter()) {
+        let xv = xv as i32;
+        sum0 += r0 as i32 * xv;
+        sum1 += r1 as i32 * xv;
+    }
+    (
+        sum0 as f32 * x_scale * scale0,
+        sum1 as f32 * x_scale * scale1,
+    )
+}
+
+fn scalar_dot3_i8_i8(x: &[i8], x_scale: f32, rows: [I8ScaledRow<'_>; 3]) -> (f32, f32, f32) {
+    let [row0, row1, row2] = rows;
+    let mut sum0 = 0i32;
+    let mut sum1 = 0i32;
+    let mut sum2 = 0i32;
+    for (((&xv, &r0), &r1), &r2) in x
+        .iter()
+        .zip(row0.values.iter())
+        .zip(row1.values.iter())
+        .zip(row2.values.iter())
+    {
+        let xv = xv as i32;
+        sum0 += r0 as i32 * xv;
+        sum1 += r1 as i32 * xv;
+        sum2 += r2 as i32 * xv;
+    }
+    (
+        sum0 as f32 * x_scale * row0.scale,
+        sum1 as f32 * x_scale * row1.scale,
+        sum2 as f32 * x_scale * row2.scale,
+    )
+}
+
+fn bench_sgd_update(samples: usize, iters: usize, dtype: DType, len: usize) -> Duration {
+    let shape = [len];
+    let param = make_parameter(&shape, make_f32(len), dtype);
+    let grad = make_f32(len)
+        .into_iter()
+        .map(|v| v * 0.001)
+        .collect::<Vec<_>>();
+    let grad_template = grad_array(&shape, &grad);
+    let mut opt = SGD::new_with_dtype(vec![param.clone()], 0.0001, DType::F32);
+
+    bench_sampled(samples, iters, || {
+        param.zero_grad();
+        param.add_grad(grad_template.clone());
+        opt.step();
+        black_box(param.shape_vec());
+    })
+}
+
+fn bench_sgd_momentum_update(samples: usize, iters: usize, dtype: DType, len: usize) -> Duration {
+    let shape = [len];
+    let param = make_parameter(&shape, make_f32(len), dtype);
+    let grad = make_f32(len)
+        .into_iter()
+        .map(|v| v * 0.001)
+        .collect::<Vec<_>>();
+    let grad_template = grad_array(&shape, &grad);
+    let mut opt = SGD::new_with_dtype(vec![param.clone()], 0.0001, DType::F32).with_momentum(0.9);
+
+    bench_sampled(samples, iters, || {
+        param.zero_grad();
+        param.add_grad(grad_template.clone());
+        opt.step();
+        black_box(param.shape_vec());
+    })
+}
+
+fn bench_adam_update(samples: usize, iters: usize, dtype: DType, len: usize) -> Duration {
+    let shape = [len];
+    let param = make_parameter(&shape, make_f32(len), dtype);
+    let grad = make_f32(len)
+        .into_iter()
+        .map(|v| v * 0.001)
+        .collect::<Vec<_>>();
+    let grad_template = grad_array(&shape, &grad);
+    let mut opt = Adam::new_with_dtype(vec![param.clone()], 0.0001, DType::F32);
+
+    bench_sampled(samples, iters, || {
+        param.zero_grad();
+        param.add_grad(grad_template.clone());
+        opt.step();
+        black_box(param.shape_vec());
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| format!("参数错误: {e}"))?;
     println!(
@@ -210,14 +426,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.iters, args.samples, args.hidden, args.inter, args.vocab
     );
     println!(
-        "backend: float={} int8={}",
+        "backend: float={} bf16_bf16={} f16_f16={} int8={} i8_i8={} avx512fp16={}",
         active_float_backend_name(),
-        active_int8_backend_name()
+        active_bf16_bf16_backend_name(),
+        active_f16_f16_backend_name(),
+        active_int8_backend_name(),
+        active_i8_i8_backend_name(),
+        if arch::x86_avx512_fp16_kernel_runtime_available() {
+            "nightly-enabled"
+        } else {
+            "unavailable-or-stable-build"
+        }
     );
 
     let x = make_f32(args.hidden);
     let x_bf16 = make_bf16(&x);
     let x_f16 = make_f16(&x);
+    let x_i8 = make_i8(args.hidden, 0x1234);
+    let row0_i8 = make_i8(args.hidden, 0x2345);
+    let row1_i8 = make_i8(args.hidden, 0x3456);
+    let row2_i8 = make_i8(args.hidden, 0x4567);
     let w_f32 = make_f32(args.inter * args.hidden);
     let w_bf16 = make_bf16(&w_f32);
     let w_f16 = make_f16(&w_f32);
@@ -230,6 +458,324 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vocab_w_bf16 = make_bf16(&vocab_w_f32);
     let vocab_w_f16 = make_f16(&vocab_w_f32);
 
+    let x_scale = 0.03125f32;
+    let scale0 = 0.015625f32;
+    let scale1 = 0.0078125f32;
+    let scale2 = 0.00390625f32;
+
+    let dot_row0_f32 = make_f32(args.hidden);
+    let dot_row1_f32 = dot_row0_f32
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v.mul_add(-0.5, ((i & 7) as f32 - 3.0) * 0.01))
+        .collect::<Vec<_>>();
+    let dot_row2_f32 = dot_row0_f32
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v.mul_add(0.25, ((i & 15) as f32 - 7.0) * 0.005))
+        .collect::<Vec<_>>();
+    let dot_row0_f16 = make_f16(&dot_row0_f32);
+    let dot_row1_f16 = make_f16(&dot_row1_f32);
+    let dot_row2_f16 = make_f16(&dot_row2_f32);
+    let dot_row0_bf16 = make_bf16(&dot_row0_f32);
+    let dot_row1_bf16 = make_bf16(&dot_row1_f32);
+    let dot_row2_bf16 = make_bf16(&dot_row2_f32);
+
+    let scalar_dot_bf16 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot_bf16_bf16(
+            black_box(&x_bf16),
+            black_box(&dot_row0_bf16),
+        ));
+    });
+    if dot_bf16_bf16_arch(&x_bf16, &dot_row0_bf16).is_some() {
+        let arch_dot_bf16 = bench_sampled(args.samples, args.iters, || {
+            let out = dot_bf16_bf16_arch(black_box(&x_bf16), black_box(&dot_row0_bf16))
+                .expect("bf16 dot arch path should stay available during bench");
+            black_box(out);
+        });
+        let scalar = scalar_dot_bf16_bf16(&x_bf16, &dot_row0_bf16);
+        let arch = dot_bf16_bf16_arch(&x_bf16, &dot_row0_bf16).expect("bf16 dot arch");
+        print_arch_case(
+            "dot_bf16_bf16",
+            scalar_dot_bf16,
+            arch_dot_bf16,
+            (scalar - arch).abs(),
+            args.iters,
+        );
+    } else {
+        print_single("dot_bf16_bf16_scalar", scalar_dot_bf16, args.iters);
+        println!("dot_bf16_bf16    arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot2_bf16 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot2_bf16_bf16(
+            black_box(&x_bf16),
+            black_box(&dot_row0_bf16),
+            black_box(&dot_row1_bf16),
+        ));
+    });
+    if dot2_bf16_bf16_arch(&x_bf16, &dot_row0_bf16, &dot_row1_bf16).is_some() {
+        let arch_dot2_bf16 = bench_sampled(args.samples, args.iters, || {
+            let out = dot2_bf16_bf16_arch(
+                black_box(&x_bf16),
+                black_box(&dot_row0_bf16),
+                black_box(&dot_row1_bf16),
+            )
+            .expect("bf16 dot2 arch path should stay available during bench");
+            black_box(out);
+        });
+        let scalar = scalar_dot2_bf16_bf16(&x_bf16, &dot_row0_bf16, &dot_row1_bf16);
+        let arch =
+            dot2_bf16_bf16_arch(&x_bf16, &dot_row0_bf16, &dot_row1_bf16).expect("bf16 dot2 arch");
+        print_arch_case(
+            "dot2_bf16_bf16",
+            scalar_dot2_bf16,
+            arch_dot2_bf16,
+            (scalar.0 - arch.0).abs().max((scalar.1 - arch.1).abs()),
+            args.iters,
+        );
+    } else {
+        print_single("dot2_bf16_bf16_scalar", scalar_dot2_bf16, args.iters);
+        println!("dot2_bf16_bf16   arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot3_bf16 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot3_bf16_bf16(
+            black_box(&x_bf16),
+            black_box(&dot_row0_bf16),
+            black_box(&dot_row1_bf16),
+            black_box(&dot_row2_bf16),
+        ));
+    });
+    if dot3_bf16_bf16_arch(&x_bf16, &dot_row0_bf16, &dot_row1_bf16, &dot_row2_bf16).is_some() {
+        let arch_dot3_bf16 = bench_sampled(args.samples, args.iters, || {
+            let out = dot3_bf16_bf16_arch(
+                black_box(&x_bf16),
+                black_box(&dot_row0_bf16),
+                black_box(&dot_row1_bf16),
+                black_box(&dot_row2_bf16),
+            )
+            .expect("bf16 dot3 arch path should stay available during bench");
+            black_box(out);
+        });
+        let scalar = scalar_dot3_bf16_bf16(&x_bf16, &dot_row0_bf16, &dot_row1_bf16, &dot_row2_bf16);
+        let arch = dot3_bf16_bf16_arch(&x_bf16, &dot_row0_bf16, &dot_row1_bf16, &dot_row2_bf16)
+            .expect("bf16 dot3 arch");
+        print_arch_case(
+            "dot3_bf16_bf16",
+            scalar_dot3_bf16,
+            arch_dot3_bf16,
+            (scalar.0 - arch.0)
+                .abs()
+                .max((scalar.1 - arch.1).abs())
+                .max((scalar.2 - arch.2).abs()),
+            args.iters,
+        );
+    } else {
+        print_single("dot3_bf16_bf16_scalar", scalar_dot3_bf16, args.iters);
+        println!("dot3_bf16_bf16   arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot_f16 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot_f16_f16(
+            black_box(&x_f16),
+            black_box(&dot_row0_f16),
+        ));
+    });
+    if dot_f16_f16_arch(&x_f16, &dot_row0_f16).is_some() {
+        let arch_dot_f16 = bench_sampled(args.samples, args.iters, || {
+            let out = dot_f16_f16_arch(black_box(&x_f16), black_box(&dot_row0_f16))
+                .expect("f16 dot arch path should stay available during bench");
+            black_box(out);
+        });
+        let scalar = scalar_dot_f16_f16(&x_f16, &dot_row0_f16);
+        let arch = dot_f16_f16_arch(&x_f16, &dot_row0_f16).expect("f16 dot arch");
+        print_arch_case(
+            "dot_f16_f16",
+            scalar_dot_f16,
+            arch_dot_f16,
+            (scalar - arch).abs(),
+            args.iters,
+        );
+    } else {
+        print_single("dot_f16_f16_scalar", scalar_dot_f16, args.iters);
+        println!("dot_f16_f16      arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot2_f16 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot2_f16_f16(
+            black_box(&x_f16),
+            black_box(&dot_row0_f16),
+            black_box(&dot_row1_f16),
+        ));
+    });
+    if dot2_f16_f16_arch(&x_f16, &dot_row0_f16, &dot_row1_f16).is_some() {
+        let arch_dot2_f16 = bench_sampled(args.samples, args.iters, || {
+            let out = dot2_f16_f16_arch(
+                black_box(&x_f16),
+                black_box(&dot_row0_f16),
+                black_box(&dot_row1_f16),
+            )
+            .expect("f16 dot2 arch path should stay available during bench");
+            black_box(out);
+        });
+        let scalar = scalar_dot2_f16_f16(&x_f16, &dot_row0_f16, &dot_row1_f16);
+        let arch = dot2_f16_f16_arch(&x_f16, &dot_row0_f16, &dot_row1_f16).expect("f16 dot2 arch");
+        print_arch_case(
+            "dot2_f16_f16",
+            scalar_dot2_f16,
+            arch_dot2_f16,
+            (scalar.0 - arch.0).abs().max((scalar.1 - arch.1).abs()),
+            args.iters,
+        );
+    } else {
+        print_single("dot2_f16_f16_scalar", scalar_dot2_f16, args.iters);
+        println!("dot2_f16_f16     arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot3_f16 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot3_f16_f16(
+            black_box(&x_f16),
+            black_box(&dot_row0_f16),
+            black_box(&dot_row1_f16),
+            black_box(&dot_row2_f16),
+        ));
+    });
+    if dot3_f16_f16_arch(&x_f16, &dot_row0_f16, &dot_row1_f16, &dot_row2_f16).is_some() {
+        let arch_dot3_f16 = bench_sampled(args.samples, args.iters, || {
+            let out = dot3_f16_f16_arch(
+                black_box(&x_f16),
+                black_box(&dot_row0_f16),
+                black_box(&dot_row1_f16),
+                black_box(&dot_row2_f16),
+            )
+            .expect("f16 dot3 arch path should stay available during bench");
+            black_box(out);
+        });
+        let scalar = scalar_dot3_f16_f16(&x_f16, &dot_row0_f16, &dot_row1_f16, &dot_row2_f16);
+        let arch = dot3_f16_f16_arch(&x_f16, &dot_row0_f16, &dot_row1_f16, &dot_row2_f16)
+            .expect("f16 dot3 arch");
+        print_arch_case(
+            "dot3_f16_f16",
+            scalar_dot3_f16,
+            arch_dot3_f16,
+            (scalar.0 - arch.0)
+                .abs()
+                .max((scalar.1 - arch.1).abs())
+                .max((scalar.2 - arch.2).abs()),
+            args.iters,
+        );
+    } else {
+        print_single("dot3_f16_f16_scalar", scalar_dot3_f16, args.iters);
+        println!("dot3_f16_f16     arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot2 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot2_i8_i8(
+            &x_i8, x_scale, &row0_i8, scale0, &row1_i8, scale1,
+        ));
+    });
+    if dot2_i8_i8_arch(&x_i8, x_scale, &row0_i8, scale0, &row1_i8, scale1).is_some() {
+        let arch_dot2 = bench_sampled(args.samples, args.iters, || {
+            let out = dot2_i8_i8_arch(
+                black_box(&x_i8),
+                x_scale,
+                black_box(&row0_i8),
+                scale0,
+                black_box(&row1_i8),
+                scale1,
+            )
+            .expect("i8 dot2 arch path should stay available during bench");
+            black_box(out);
+        });
+        print_pair_named(
+            "dot2_i8_i8",
+            "scalar",
+            "arch",
+            scalar_dot2,
+            arch_dot2,
+            args.iters,
+        );
+    } else {
+        print_single("dot2_i8_i8_scalar", scalar_dot2, args.iters);
+        println!("dot2_i8_i8        arch=skipped (runtime feature unavailable)");
+    }
+
+    let scalar_dot3 = bench_sampled(args.samples, args.iters, || {
+        black_box(scalar_dot3_i8_i8(
+            &x_i8,
+            x_scale,
+            [
+                I8ScaledRow {
+                    values: &row0_i8,
+                    scale: scale0,
+                },
+                I8ScaledRow {
+                    values: &row1_i8,
+                    scale: scale1,
+                },
+                I8ScaledRow {
+                    values: &row2_i8,
+                    scale: scale2,
+                },
+            ],
+        ));
+    });
+    if dot3_i8_i8_arch(
+        &x_i8,
+        x_scale,
+        [
+            I8ScaledRow {
+                values: &row0_i8,
+                scale: scale0,
+            },
+            I8ScaledRow {
+                values: &row1_i8,
+                scale: scale1,
+            },
+            I8ScaledRow {
+                values: &row2_i8,
+                scale: scale2,
+            },
+        ],
+    )
+    .is_some()
+    {
+        let arch_dot3 = bench_sampled(args.samples, args.iters, || {
+            let out = dot3_i8_i8_arch(
+                black_box(&x_i8),
+                x_scale,
+                [
+                    I8ScaledRow {
+                        values: black_box(&row0_i8),
+                        scale: scale0,
+                    },
+                    I8ScaledRow {
+                        values: black_box(&row1_i8),
+                        scale: scale1,
+                    },
+                    I8ScaledRow {
+                        values: black_box(&row2_i8),
+                        scale: scale2,
+                    },
+                ],
+            )
+            .expect("i8 dot3 arch path should stay available during bench");
+            black_box(out);
+        });
+        print_pair_named(
+            "dot3_i8_i8",
+            "scalar",
+            "arch",
+            scalar_dot3,
+            arch_dot3,
+            args.iters,
+        );
+    } else {
+        print_single("dot3_i8_i8_scalar", scalar_dot3, args.iters);
+        println!("dot3_i8_i8        arch=skipped (runtime feature unavailable)");
+    }
+
     let mut out_f32 = vec![0.0f32; args.inter];
     let mut out_mixed = vec![0.0f32; args.inter];
     let mut out0_f32 = vec![0.0f32; args.inter];
@@ -237,7 +783,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out0_mixed = vec![0.0f32; args.inter];
     let mut out1_mixed = vec![0.0f32; args.inter];
 
-    let warmup = args.iters.min(16).max(4);
+    let warmup = args.iters.clamp(4, 16);
     for _ in 0..warmup {
         matvec_rowmajor_parallel(&x, &w_f32, args.inter, args.hidden, &mut out_f32);
         matvec_rowmajor_parallel_mixed(
@@ -1401,5 +1947,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.iters,
     );
 
+    let opt_len = args.hidden.saturating_mul(8).max(1024);
+    let sgd_f32 = bench_sgd_update(args.samples, args.iters, DType::F32, opt_len);
+    let sgd_bf16 = bench_sgd_update(args.samples, args.iters, DType::BF16, opt_len);
+    let sgd_f16 = bench_sgd_update(args.samples, args.iters, DType::F16, opt_len);
+    let sgd_i8 = bench_sgd_update(args.samples, args.iters, DType::I8, opt_len);
+    print_case("sgd_bf16", sgd_f32, sgd_bf16, 0.0, args.iters);
+    print_case("sgd_f16", sgd_f32, sgd_f16, 0.0, args.iters);
+    print_case("sgd_i8", sgd_f32, sgd_i8, 0.0, args.iters);
+
+    let sgd_momentum_f32 = bench_sgd_momentum_update(args.samples, args.iters, DType::F32, opt_len);
+    let sgd_momentum_bf16 =
+        bench_sgd_momentum_update(args.samples, args.iters, DType::BF16, opt_len);
+    let sgd_momentum_f16 = bench_sgd_momentum_update(args.samples, args.iters, DType::F16, opt_len);
+    let sgd_momentum_i8 = bench_sgd_momentum_update(args.samples, args.iters, DType::I8, opt_len);
+    print_case(
+        "sgd_momentum_bf16",
+        sgd_momentum_f32,
+        sgd_momentum_bf16,
+        0.0,
+        args.iters,
+    );
+    print_case(
+        "sgd_momentum_f16",
+        sgd_momentum_f32,
+        sgd_momentum_f16,
+        0.0,
+        args.iters,
+    );
+    print_case(
+        "sgd_momentum_i8",
+        sgd_momentum_f32,
+        sgd_momentum_i8,
+        0.0,
+        args.iters,
+    );
+
+    let adam_f32 = bench_adam_update(args.samples, args.iters, DType::F32, opt_len);
+    let adam_bf16 = bench_adam_update(args.samples, args.iters, DType::BF16, opt_len);
+    let adam_f16 = bench_adam_update(args.samples, args.iters, DType::F16, opt_len);
+    let adam_i8 = bench_adam_update(args.samples, args.iters, DType::I8, opt_len);
+    print_case("adam_bf16", adam_f32, adam_bf16, 0.0, args.iters);
+    print_case("adam_f16", adam_f32, adam_f16, 0.0, args.iters);
+    print_case("adam_i8", adam_f32, adam_i8, 0.0, args.iters);
+
     Ok(())
+}
+
+#[cfg(test)]
+mod accuracy_tests {
+    use super::max_abs_diff;
+
+    #[test]
+    fn max_abs_diff_rejects_non_finite_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(max_abs_diff(&[value], &[value]).is_infinite());
+        }
+    }
 }

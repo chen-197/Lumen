@@ -1,5 +1,6 @@
 use mimalloc::MiMalloc;
 
+use lumen::arch;
 use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
@@ -15,7 +16,7 @@ use lumen::tokenizer::LlamaTokenizer;
 
 use ndarray::{Array, Array1, Ix3, s};
 use ndarray_rand::RandomExt;
-use rand_distr::Uniform;
+use ndarray_rand::rand_distr::Uniform;
 
 use std::env;
 use std::path::Path;
@@ -383,10 +384,10 @@ fn parse_args() -> Result<Args, String> {
     if repetition_penalty < 1.0 {
         return Err("--repetition-penalty 不能小于 1.0".to_string());
     }
-    if let Some(scale) = quant_scale {
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err("--quant-scale 必须是有限且 > 0 的 f32".to_string());
-        }
+    if let Some(scale) = quant_scale
+        && (!scale.is_finite() || scale <= 0.0)
+    {
+        return Err("--quant-scale 必须是有限且 > 0 的 f32".to_string());
     }
     if let Some(dtype) = quantize_dtype {
         if !dtype.is_integer() {
@@ -609,6 +610,44 @@ fn trim_chat_markers(text: &str) -> &str {
     }
 }
 
+fn max_repeated_char_run(text: &str) -> usize {
+    let mut prev = None;
+    let mut cur = 0usize;
+    let mut best = 0usize;
+    for ch in text.chars() {
+        if Some(ch) == prev {
+            cur += 1;
+        } else {
+            prev = Some(ch);
+            cur = 1;
+        }
+        best = best.max(cur);
+    }
+    best
+}
+
+fn print_text_quality(text: &str) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let replacement = chars.iter().filter(|&&ch| ch == '\u{FFFD}').count();
+    let trailing_replacement = chars
+        .iter()
+        .rev()
+        .take_while(|&&ch| ch == '\u{FFFD}')
+        .count();
+    let control = chars
+        .iter()
+        .filter(|&&ch| ch.is_control() && !ch.is_whitespace())
+        .count();
+    println!(
+        "generated_text_quality: chars={} replacement={} trailing_replacement={} control={} repeat_run={}",
+        chars.len(),
+        replacement,
+        trailing_replacement,
+        control,
+        max_repeated_char_run(text)
+    );
+}
+
 fn first_token_mismatch(lhs: &[usize], rhs: &[usize]) -> Option<usize> {
     let shared = lhs.len().min(rhs.len());
     for idx in 0..shared {
@@ -674,13 +713,26 @@ fn run_once(
         let prefill_input = tensor_from_token_ids(prompt_tokens, args.device);
         stats.prefill_input_build = build_start.elapsed();
 
-        let forward_start = Instant::now();
-        let prefill_logits = model.forward_last_logits(prefill_input, &mut kv_caches, 0);
-        stats.prefill_forward = forward_start.elapsed();
+        let mut logits_vec = vec![f32::NEG_INFINITY; config.vocab_size];
+        match args.mode {
+            DecodeMode::Greedy => {
+                let forward_start = Instant::now();
+                let next = model.forward_last_argmax(prefill_input, &mut kv_caches, 0);
+                stats.prefill_forward = forward_start.elapsed();
+                if next < logits_vec.len() {
+                    logits_vec[next] = 0.0;
+                }
+            }
+            DecodeMode::Sample => {
+                let forward_start = Instant::now();
+                let prefill_logits = model.forward_last_logits(prefill_input, &mut kv_caches, 0);
+                stats.prefill_forward = forward_start.elapsed();
 
-        let logits_extract_start = Instant::now();
-        let mut logits_vec = last_step_logits_vec(&prefill_logits);
-        stats.prefill_logits_extract = logits_extract_start.elapsed();
+                let logits_extract_start = Instant::now();
+                logits_vec = last_step_logits_vec(&prefill_logits);
+                stats.prefill_logits_extract = logits_extract_start.elapsed();
+            }
+        }
 
         for _ in 0..args.max_gen {
             let next_token = match args.mode {
@@ -860,9 +912,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.mode
     );
     println!(
-        "backend: float={} int8={}",
+        "backend: float={} int8={} avx512fp16={}",
         active_float_backend_name(),
-        active_int8_backend_name()
+        active_int8_backend_name(),
+        if arch::x86_avx512_fp16_kernel_runtime_available() {
+            "nightly-enabled"
+        } else {
+            "unavailable-or-stable-build"
+        }
     );
     println!(
         "dtype: parameter={:?} runtime={:?} activation={:?} kv_cache={:?} quantization={:?} allow_parameter_copies={} stream_weights={} decode_text_each_step={} stop_on_eos={} stop_on_chat_marker={} device={:?} show_output={} show_token_ids={} compare_cpu={} fail_on_mismatch={}",
@@ -918,17 +975,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &args,
         ));
     }
-    if args.show_output {
-        if let Some(text) = runs.iter().find_map(|run| run.generated_text.as_deref()) {
-            println!();
-            println!("generated_text:\n{}", trim_chat_markers(text));
-        }
+    if args.show_output
+        && let Some(text) = runs.iter().find_map(|run| run.generated_text.as_deref())
+    {
+        println!();
+        println!("generated_text:\n{}", trim_chat_markers(text));
+        print_text_quality(text);
     }
-    if args.show_token_ids {
-        if let Some(ids) = runs.first().map(|run| run.generated_token_ids.as_slice()) {
-            println!();
-            println!("generated_token_ids: {:?}", ids);
-        }
+    if args.show_token_ids
+        && let Some(ids) = runs.first().map(|run| run.generated_token_ids.as_slice())
+    {
+        println!();
+        println!("generated_token_ids: {:?}", ids);
     }
     if args.compare_cpu {
         let cuda_ids = runs

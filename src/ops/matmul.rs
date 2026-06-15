@@ -1,17 +1,21 @@
 use crate::autograd::{
-    KernelRouteClass, StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
     assert_native_device_support, assert_same_device, is_no_grad, is_strict_device_execution,
 };
 use crate::ops::cuda;
 use crate::ops::fp_kernels::{
-    dot_f32_arch, dot_f32_bf16_arch, dot_f32_f16_arch, dot2_f32_arch, dot2_f32_bf16_arch,
-    dot2_f32_f16_arch, dot3_f32_arch, dot3_f32_bf16_arch, dot3_f32_f16_arch,
+    dot_bf16_bf16_arch, dot_f16_f16_arch, dot_f32_arch, dot_f32_bf16_arch, dot_f32_f16_arch,
+    dot2_bf16_bf16_arch, dot2_f16_f16_arch, dot2_f32_arch, dot2_f32_bf16_arch, dot2_f32_f16_arch,
+    dot3_bf16_bf16_arch, dot3_f16_f16_arch, dot3_f32_arch, dot3_f32_bf16_arch, dot3_f32_f16_arch,
 };
-use crate::ops::int8_kernels::{dot_f32_i8_arch, dot2_f32_i8_arch, dot3_f32_i8_arch};
+use crate::ops::int8_kernels::{
+    I8ScaledRow, dot_f32_i8_arch, dot_i8_i8_arch, dot2_f32_i8_arch, dot2_i8_i8_arch,
+    dot3_f32_i8_arch, dot3_i8_i8_arch,
+};
 use crate::precision::DType;
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use ndarray::linalg::general_mat_mul;
-use ndarray::{Array2, Array4, Ix2, Ix4, Zip};
+use ndarray::{Array2, Array4, ArrayD, Ix2, Ix4, IxDyn, Zip};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,6 +52,62 @@ const MATVEC_BLOCK_THRESHOLD: usize = 16384;
 const MATVEC_PAR_THRESHOLD: usize = 1024;
 #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const MATVEC_PAR_THRESHOLD: usize = 256;
+
+type CudaMatmulBackwardHostDevice = (
+    (ndarray::ArrayD<f32>, cuda::CudaBuffer),
+    (ndarray::ArrayD<f32>, cuda::CudaBuffer),
+);
+
+#[derive(Clone, Copy)]
+struct BatchMatmulDims {
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+}
+
+impl BatchMatmulDims {
+    #[inline]
+    fn batch_count(self) -> Option<usize> {
+        self.b.checked_mul(self.h)
+    }
+
+    #[inline]
+    fn out_shape(self) -> [usize; 4] {
+        [self.b, self.h, self.m, self.n]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct I8ScaledSlice<'a> {
+    values: &'a [i8],
+    scale: f32,
+}
+
+#[derive(Clone, Copy)]
+struct I8QkvBlock<'a> {
+    q: I8ScaledSlice<'a>,
+    k: I8ScaledSlice<'a>,
+    v: I8ScaledSlice<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct I8DualBlock<'a> {
+    left: I8ScaledSlice<'a>,
+    right: I8ScaledSlice<'a>,
+}
+
+struct DualOutMut<'a> {
+    left: &'a mut [f32],
+    right: &'a mut [f32],
+}
+
+struct QkvOutMut<'a> {
+    q: &'a mut [f32],
+    k: &'a mut [f32],
+    v: &'a mut [f32],
+}
 
 #[inline]
 fn should_use_mixed_matvec_block_kernel(n_rows: usize) -> bool {
@@ -406,6 +466,10 @@ fn dot_unrolled_f32_i8_portable(x: &[f32], row: &[i8], scale: f32) -> f32 {
 
 #[inline]
 fn dot_unrolled_i8_i8(x: &[i8], x_scale: f32, row: &[i8], w_scale: f32) -> f32 {
+    if let Some(sum) = dot_i8_i8_arch(x, x_scale, row, w_scale) {
+        return sum;
+    }
+
     let mut s0 = 0i32;
     let mut s1 = 0i32;
     let mut s2 = 0i32;
@@ -454,6 +518,56 @@ fn dot_unrolled_i8_i8(x: &[i8], x_scale: f32, row: &[i8], w_scale: f32) -> f32 {
 }
 
 #[inline]
+fn dot_unrolled_bf16_bf16_scalar(x: &[bf16], row: &[bf16]) -> f32 {
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut kk = 0usize;
+    let k_dim = x.len();
+
+    while kk + 4 <= k_dim {
+        s0 += row[kk].to_f32() * x[kk].to_f32();
+        s1 += row[kk + 1].to_f32() * x[kk + 1].to_f32();
+        s2 += row[kk + 2].to_f32() * x[kk + 2].to_f32();
+        s3 += row[kk + 3].to_f32() * x[kk + 3].to_f32();
+        kk += 4;
+    }
+
+    let mut sum = s0 + s1 + s2 + s3;
+    while kk < k_dim {
+        sum += row[kk].to_f32() * x[kk].to_f32();
+        kk += 1;
+    }
+    sum
+}
+
+#[inline]
+fn dot_unrolled_f16_f16_scalar(x: &[f16], row: &[f16]) -> f32 {
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut kk = 0usize;
+    let k_dim = x.len();
+
+    while kk + 4 <= k_dim {
+        s0 += row[kk].to_f32() * x[kk].to_f32();
+        s1 += row[kk + 1].to_f32() * x[kk + 1].to_f32();
+        s2 += row[kk + 2].to_f32() * x[kk + 2].to_f32();
+        s3 += row[kk + 3].to_f32() * x[kk + 3].to_f32();
+        kk += 4;
+    }
+
+    let mut sum = s0 + s1 + s2 + s3;
+    while kk < k_dim {
+        sum += row[kk].to_f32() * x[kk].to_f32();
+        kk += 1;
+    }
+    sum
+}
+
+#[inline]
 fn dot2_unrolled_i8_i8(
     x: &[i8],
     x_scale: f32,
@@ -462,6 +576,10 @@ fn dot2_unrolled_i8_i8(
     row1: &[i8],
     scale1: f32,
 ) -> (f32, f32) {
+    if let Some(sum) = dot2_i8_i8_arch(x, x_scale, row0, scale0, row1, scale1) {
+        return sum;
+    }
+
     let mut a0 = 0i32;
     let mut a1 = 0i32;
     let mut b0 = 0i32;
@@ -586,16 +704,35 @@ fn dot2_unrolled_i8_i8(
 }
 
 #[inline]
-fn dot3_unrolled_i8_i8(
-    x: &[i8],
-    x_scale: f32,
-    row0: &[i8],
-    scale0: f32,
-    row1: &[i8],
-    scale1: f32,
-    row2: &[i8],
-    scale2: f32,
-) -> (f32, f32, f32) {
+fn dot3_unrolled_i8_i8(x: &[i8], x_scale: f32, rows: [I8ScaledSlice<'_>; 3]) -> (f32, f32, f32) {
+    let [row0, row1, row2] = rows;
+    if let Some(sum) = dot3_i8_i8_arch(
+        x,
+        x_scale,
+        [
+            I8ScaledRow {
+                values: row0.values,
+                scale: row0.scale,
+            },
+            I8ScaledRow {
+                values: row1.values,
+                scale: row1.scale,
+            },
+            I8ScaledRow {
+                values: row2.values,
+                scale: row2.scale,
+            },
+        ],
+    ) {
+        return sum;
+    }
+    let scale0 = row0.scale;
+    let scale1 = row1.scale;
+    let scale2 = row2.scale;
+    let row0 = row0.values;
+    let row1 = row1.values;
+    let row2 = row2.values;
+
     let mut a0 = 0i32;
     let mut a1 = 0i32;
     let mut a2 = 0i32;
@@ -987,9 +1124,9 @@ fn matvec_rowmajor_block_parallel(
                 let x5 = x[kk + 5];
                 let x6 = x[kk + 6];
                 let x7 = x[kk + 7];
-                for r in 0..rows {
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
                     let base = r * k_dim + kk;
-                    acc[r] += w_block[base] * x0
+                    *acc_r += w_block[base] * x0
                         + w_block[base + 1] * x1
                         + w_block[base + 2] * x2
                         + w_block[base + 3] * x3
@@ -1003,8 +1140,8 @@ fn matvec_rowmajor_block_parallel(
 
             while kk < k_dim {
                 let xv = x[kk];
-                for r in 0..rows {
-                    acc[r] += w_block[r * k_dim + kk] * xv;
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
+                    *acc_r += w_block[r * k_dim + kk] * xv;
                 }
                 kk += 1;
             }
@@ -1039,9 +1176,9 @@ fn matvec_rowmajor_block_parallel_f32_bf16(
                 let x5 = x[kk + 5];
                 let x6 = x[kk + 6];
                 let x7 = x[kk + 7];
-                for r in 0..rows {
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
                     let base = r * k_dim + kk;
-                    acc[r] += w_block[base].to_f32() * x0
+                    *acc_r += w_block[base].to_f32() * x0
                         + w_block[base + 1].to_f32() * x1
                         + w_block[base + 2].to_f32() * x2
                         + w_block[base + 3].to_f32() * x3
@@ -1055,8 +1192,8 @@ fn matvec_rowmajor_block_parallel_f32_bf16(
 
             while kk < k_dim {
                 let xv = x[kk];
-                for r in 0..rows {
-                    acc[r] += w_block[r * k_dim + kk].to_f32() * xv;
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
+                    *acc_r += w_block[r * k_dim + kk].to_f32() * xv;
                 }
                 kk += 1;
             }
@@ -1099,9 +1236,9 @@ fn matvec_rowmajor_block_parallel_f32_i8(
                 let x13 = x[kk + 13];
                 let x14 = x[kk + 14];
                 let x15 = x[kk + 15];
-                for r in 0..rows {
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
                     let base = r * k_dim + kk;
-                    acc[r] += w_block[base] as f32 * x0
+                    *acc_r += w_block[base] as f32 * x0
                         + w_block[base + 1] as f32 * x1
                         + w_block[base + 2] as f32 * x2
                         + w_block[base + 3] as f32 * x3
@@ -1130,9 +1267,9 @@ fn matvec_rowmajor_block_parallel_f32_i8(
                 let x5 = x[kk + 5];
                 let x6 = x[kk + 6];
                 let x7 = x[kk + 7];
-                for r in 0..rows {
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
                     let base = r * k_dim + kk;
-                    acc[r] += w_block[base] as f32 * x0
+                    *acc_r += w_block[base] as f32 * x0
                         + w_block[base + 1] as f32 * x1
                         + w_block[base + 2] as f32 * x2
                         + w_block[base + 3] as f32 * x3
@@ -1146,8 +1283,8 @@ fn matvec_rowmajor_block_parallel_f32_i8(
 
             while kk < k_dim {
                 let xv = x[kk];
-                for r in 0..rows {
-                    acc[r] += w_block[r * k_dim + kk] as f32 * xv;
+                for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
+                    *acc_r += w_block[r * k_dim + kk] as f32 * xv;
                 }
                 kk += 1;
             }
@@ -1283,8 +1420,127 @@ pub fn matvec_rowmajor_parallel_bf16_bf16(
     k_dim: usize,
     out: &mut [f32],
 ) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
+    assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    if crate::arch::x86_avx512_bf16_kernel_runtime_available() {
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            let mut i = 0usize;
+            while i + 2 < n_rows {
+                let row0 = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w_rowmajor[(i + 1) * k_dim..(i + 2) * k_dim];
+                let row2 = &w_rowmajor[(i + 2) * k_dim..(i + 3) * k_dim];
+                if let Some((s0, s1, s2)) = dot3_bf16_bf16_arch(x, row0, row1, row2) {
+                    out[i] = s0;
+                    out[i + 1] = s1;
+                    out[i + 2] = s2;
+                    i += 3;
+                    continue;
+                }
+                break;
+            }
+            while i + 1 < n_rows {
+                let row0 = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w_rowmajor[(i + 1) * k_dim..(i + 2) * k_dim];
+                if let Some((s0, s1)) = dot2_bf16_bf16_arch(x, row0, row1) {
+                    out[i] = s0;
+                    out[i + 1] = s1;
+                    i += 2;
+                    continue;
+                }
+                break;
+            }
+            while i < n_rows {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                if let Some(sum) = dot_bf16_bf16_arch(x, row) {
+                    out[i] = sum;
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if i == n_rows {
+                return;
+            }
+        } else {
+            out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                *out_val = dot_bf16_bf16_arch(x, row)
+                    .unwrap_or_else(|| dot_unrolled_bf16_bf16_scalar(x, row));
+            });
+            return;
+        }
+    }
+
     with_bf16_input_as_f32(x, |x_f32| {
         matvec_rowmajor_parallel_f32_bf16(x_f32, w_rowmajor, n_rows, k_dim, out);
+    });
+}
+
+#[inline]
+pub fn matvec_rowmajor_parallel_f16_f16(
+    x: &[f16],
+    w_rowmajor: &[f16],
+    n_rows: usize,
+    k_dim: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
+    assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    if crate::arch::x86_avx512_fp16_kernel_runtime_available() {
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            let mut i = 0usize;
+            while i + 2 < n_rows {
+                let row0 = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w_rowmajor[(i + 1) * k_dim..(i + 2) * k_dim];
+                let row2 = &w_rowmajor[(i + 2) * k_dim..(i + 3) * k_dim];
+                if let Some((s0, s1, s2)) = dot3_f16_f16_arch(x, row0, row1, row2) {
+                    out[i] = s0;
+                    out[i + 1] = s1;
+                    out[i + 2] = s2;
+                    i += 3;
+                    continue;
+                }
+                break;
+            }
+            while i + 1 < n_rows {
+                let row0 = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w_rowmajor[(i + 1) * k_dim..(i + 2) * k_dim];
+                if let Some((s0, s1)) = dot2_f16_f16_arch(x, row0, row1) {
+                    out[i] = s0;
+                    out[i + 1] = s1;
+                    i += 2;
+                    continue;
+                }
+                break;
+            }
+            while i < n_rows {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                if let Some(sum) = dot_f16_f16_arch(x, row) {
+                    out[i] = sum;
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if i == n_rows {
+                return;
+            }
+        } else {
+            out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                *out_val =
+                    dot_f16_f16_arch(x, row).unwrap_or_else(|| dot_unrolled_f16_f16_scalar(x, row));
+            });
+            return;
+        }
+    }
+
+    with_f16_input_as_f32(x, |x_f32| {
+        matvec_rowmajor_parallel_f32_f16(x_f32, w_rowmajor, n_rows, k_dim, out);
     });
 }
 
@@ -1435,9 +1691,7 @@ pub fn matvec_rowmajor_parallel_mixed(
             });
         }
         (SliceRef::F16(x), SliceRef::F16(w)) => {
-            with_f16_input_as_f32(x, |x_f32| {
-                matvec_rowmajor_parallel_f32_f16(x_f32, w, n_rows, k_dim, out);
-            });
+            matvec_rowmajor_parallel_f16_f16(x, w, n_rows, k_dim, out);
         }
         (SliceRef::F16(x), SliceRef::BF16(w)) => {
             with_f16_input_as_f32(x, |x_f32| {
@@ -2405,18 +2659,23 @@ pub(crate) fn dot3_unrolled_f32_i8(
 #[inline]
 fn dot3_rows_unrolled_f32_i8(
     x: &[f32],
-    q_block: &[i8],
-    q_scale: f32,
-    k_block: &[i8],
-    k_scale: f32,
-    v_block: &[i8],
-    v_scale: f32,
+    weights: I8QkvBlock<'_>,
     k_dim: usize,
     rows: usize,
-    q_out: &mut [f32],
-    k_out: &mut [f32],
-    v_out: &mut [f32],
+    out: QkvOutMut<'_>,
 ) {
+    let I8QkvBlock { q, k, v } = weights;
+    let q_block = q.values;
+    let k_block = k.values;
+    let v_block = v.values;
+    let q_scale = q.scale;
+    let k_scale = k.scale;
+    let v_scale = v.scale;
+    let QkvOutMut {
+        q: q_out,
+        k: k_out,
+        v: v_out,
+    } = out;
     debug_assert!(rows <= 4);
     debug_assert_eq!(q_out.len(), rows);
     debug_assert_eq!(k_out.len(), rows);
@@ -2742,14 +3001,21 @@ pub(crate) fn dual_matvec_rowmajor_parallel_f32_i8(
     } else if should_use_i8_block_kernel(n_rows, k_dim) {
         dual_matvec_rowmajor_block_parallel_f32_i8(
             x,
-            w0_rowmajor,
-            w0_scale,
-            w1_rowmajor,
-            w1_scale,
-            n_rows,
+            I8DualBlock {
+                left: I8ScaledSlice {
+                    values: w0_rowmajor,
+                    scale: w0_scale,
+                },
+                right: I8ScaledSlice {
+                    values: w1_rowmajor,
+                    scale: w1_scale,
+                },
+            },
             k_dim,
-            out0,
-            out1,
+            DualOutMut {
+                left: out0,
+                right: out1,
+            },
         );
     } else {
         out0.par_chunks_mut(MATVEC_I8_PAR_CHUNK_ROWS)
@@ -2841,15 +3107,17 @@ fn dual_matvec_rowmajor_block_parallel_f32_bf16(
 
 fn dual_matvec_rowmajor_block_parallel_f32_i8(
     x: &[f32],
-    w0_rowmajor: &[i8],
-    w0_scale: f32,
-    w1_rowmajor: &[i8],
-    w1_scale: f32,
-    _n_rows: usize,
+    weights: I8DualBlock<'_>,
     k_dim: usize,
-    out0: &mut [f32],
-    out1: &mut [f32],
+    out: DualOutMut<'_>,
 ) {
+    let w0_rowmajor = weights.left.values;
+    let w0_scale = weights.left.scale;
+    let w1_rowmajor = weights.right.values;
+    let w1_scale = weights.right.scale;
+    let out0 = out.left;
+    let out1 = out.right;
+
     out0.par_chunks_mut(MATVEC_BLOCK_ROWS)
         .zip(out1.par_chunks_mut(MATVEC_BLOCK_ROWS))
         .enumerate()
@@ -2935,8 +3203,111 @@ fn dual_matvec_rowmajor_parallel_bf16_bf16(
     out0: &mut [f32],
     out1: &mut [f32],
 ) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w0_rowmajor.len(), n_rows * k_dim, "weight0 size mismatch");
+    assert_eq!(w1_rowmajor.len(), n_rows * k_dim, "weight1 size mismatch");
+    assert_eq!(out0.len(), n_rows, "out0 size mismatch");
+    assert_eq!(out1.len(), n_rows, "out1 size mismatch");
+
+    if crate::arch::x86_avx512_bf16_kernel_runtime_available() {
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            for i in 0..n_rows {
+                let row0 = &w0_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w1_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let (s0, s1) = dot2_bf16_bf16_arch(x, row0, row1).unwrap_or_else(|| {
+                    (
+                        dot_unrolled_bf16_bf16_scalar(x, row0),
+                        dot_unrolled_bf16_bf16_scalar(x, row1),
+                    )
+                });
+                out0[i] = s0;
+                out1[i] = s1;
+            }
+        } else {
+            out0.par_iter_mut()
+                .zip(out1.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (dst0, dst1))| {
+                    let row0 = &w0_rowmajor[i * k_dim..(i + 1) * k_dim];
+                    let row1 = &w1_rowmajor[i * k_dim..(i + 1) * k_dim];
+                    let (s0, s1) = dot2_bf16_bf16_arch(x, row0, row1).unwrap_or_else(|| {
+                        (
+                            dot_unrolled_bf16_bf16_scalar(x, row0),
+                            dot_unrolled_bf16_bf16_scalar(x, row1),
+                        )
+                    });
+                    *dst0 = s0;
+                    *dst1 = s1;
+                });
+        }
+        return;
+    }
+
     with_bf16_input_as_f32(x, |x_f32| {
         dual_matvec_rowmajor_parallel_f32_bf16(
+            x_f32,
+            w0_rowmajor,
+            w1_rowmajor,
+            n_rows,
+            k_dim,
+            out0,
+            out1,
+        );
+    });
+}
+
+#[inline]
+fn dual_matvec_rowmajor_parallel_f16_f16(
+    x: &[f16],
+    w0_rowmajor: &[f16],
+    w1_rowmajor: &[f16],
+    n_rows: usize,
+    k_dim: usize,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w0_rowmajor.len(), n_rows * k_dim, "weight0 size mismatch");
+    assert_eq!(w1_rowmajor.len(), n_rows * k_dim, "weight1 size mismatch");
+    assert_eq!(out0.len(), n_rows, "out0 size mismatch");
+    assert_eq!(out1.len(), n_rows, "out1 size mismatch");
+
+    if crate::arch::x86_avx512_fp16_kernel_runtime_available() {
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            for i in 0..n_rows {
+                let row0 = &w0_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w1_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let (s0, s1) = dot2_f16_f16_arch(x, row0, row1).unwrap_or_else(|| {
+                    (
+                        dot_unrolled_f16_f16_scalar(x, row0),
+                        dot_unrolled_f16_f16_scalar(x, row1),
+                    )
+                });
+                out0[i] = s0;
+                out1[i] = s1;
+            }
+        } else {
+            out0.par_iter_mut()
+                .zip(out1.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (dst0, dst1))| {
+                    let row0 = &w0_rowmajor[i * k_dim..(i + 1) * k_dim];
+                    let row1 = &w1_rowmajor[i * k_dim..(i + 1) * k_dim];
+                    let (s0, s1) = dot2_f16_f16_arch(x, row0, row1).unwrap_or_else(|| {
+                        (
+                            dot_unrolled_f16_f16_scalar(x, row0),
+                            dot_unrolled_f16_f16_scalar(x, row1),
+                        )
+                    });
+                    *dst0 = s0;
+                    *dst1 = s1;
+                });
+        }
+        return;
+    }
+
+    with_f16_input_as_f32(x, |x_f32| {
+        dual_matvec_rowmajor_parallel_f32_f16(
             x_f32,
             w0_rowmajor,
             w1_rowmajor,
@@ -3114,9 +3485,7 @@ pub fn dual_matvec_rowmajor_parallel_mixed(
             })
         }
         (SliceRef::F16(x), SliceRef::F16(w0), SliceRef::F16(w1)) => {
-            with_f16_input_as_f32(x, |x_f32| {
-                dual_matvec_rowmajor_parallel_f32_f16(x_f32, w0, w1, n_rows, k_dim, out0, out1)
-            })
+            dual_matvec_rowmajor_parallel_f16_f16(x, w0, w1, n_rows, k_dim, out0, out1)
         }
         (SliceRef::F16(x), SliceRef::BF16(w0), SliceRef::BF16(w1)) => {
             with_f16_input_as_f32(x, |x_f32| {
@@ -3436,17 +3805,26 @@ pub(crate) fn qkv_matvec_rowmajor_parallel_f32_i8(
     } else if should_use_i8_block_kernel(shared_rows, k_dim) {
         qkv_matvec_rowmajor_block_parallel_f32_i8(
             x,
-            q_rowmajor,
-            q_scale,
-            k_rowmajor,
-            k_scale,
-            v_rowmajor,
-            v_scale,
-            shared_rows,
+            I8QkvBlock {
+                q: I8ScaledSlice {
+                    values: q_rowmajor,
+                    scale: q_scale,
+                },
+                k: I8ScaledSlice {
+                    values: k_rowmajor,
+                    scale: k_scale,
+                },
+                v: I8ScaledSlice {
+                    values: v_rowmajor,
+                    scale: v_scale,
+                },
+            },
             k_dim,
-            &mut q_out[..shared_rows],
-            &mut k_out[..shared_rows],
-            &mut v_out[..shared_rows],
+            QkvOutMut {
+                q: &mut q_out[..shared_rows],
+                k: &mut k_out[..shared_rows],
+                v: &mut v_out[..shared_rows],
+            },
         );
     } else {
         q_out[..shared_rows]
@@ -3462,17 +3840,27 @@ pub(crate) fn qkv_matvec_rowmajor_parallel_f32_i8(
                         let row_idx = row_start + offset;
                         dot3_rows_unrolled_f32_i8(
                             x,
-                            &q_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
-                            q_scale,
-                            &k_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
-                            k_scale,
-                            &v_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
-                            v_scale,
+                            I8QkvBlock {
+                                q: I8ScaledSlice {
+                                    values: &q_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
+                                    scale: q_scale,
+                                },
+                                k: I8ScaledSlice {
+                                    values: &k_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
+                                    scale: k_scale,
+                                },
+                                v: I8ScaledSlice {
+                                    values: &v_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
+                                    scale: v_scale,
+                                },
+                            },
                             k_dim,
                             4,
-                            &mut q_chunk[offset..offset + 4],
-                            &mut k_chunk[offset..offset + 4],
-                            &mut v_chunk[offset..offset + 4],
+                            QkvOutMut {
+                                q: &mut q_chunk[offset..offset + 4],
+                                k: &mut k_chunk[offset..offset + 4],
+                                v: &mut v_chunk[offset..offset + 4],
+                            },
                         );
                         offset += 4;
                     }
@@ -3548,8 +3936,24 @@ pub(crate) fn qkv_matvec_rowmajor_parallel_i8_i8(
             let q_row = &q_rowmajor[i * k_dim..(i + 1) * k_dim];
             let k_row = &k_rowmajor[i * k_dim..(i + 1) * k_dim];
             let v_row = &v_rowmajor[i * k_dim..(i + 1) * k_dim];
-            let (q, k, v) =
-                dot3_unrolled_i8_i8(x, x_scale, q_row, q_scale, k_row, k_scale, v_row, v_scale);
+            let (q, k, v) = dot3_unrolled_i8_i8(
+                x,
+                x_scale,
+                [
+                    I8ScaledSlice {
+                        values: q_row,
+                        scale: q_scale,
+                    },
+                    I8ScaledSlice {
+                        values: k_row,
+                        scale: k_scale,
+                    },
+                    I8ScaledSlice {
+                        values: v_row,
+                        scale: v_scale,
+                    },
+                ],
+            );
             q_out[i] = q;
             k_out[i] = k;
             v_out[i] = v;
@@ -3568,7 +3972,22 @@ pub(crate) fn qkv_matvec_rowmajor_parallel_i8_i8(
                     let k_row = &k_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
                     let v_row = &v_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
                     let (q, k, v) = dot3_unrolled_i8_i8(
-                        x, x_scale, q_row, q_scale, k_row, k_scale, v_row, v_scale,
+                        x,
+                        x_scale,
+                        [
+                            I8ScaledSlice {
+                                values: q_row,
+                                scale: q_scale,
+                            },
+                            I8ScaledSlice {
+                                values: k_row,
+                                scale: k_scale,
+                            },
+                            I8ScaledSlice {
+                                values: v_row,
+                                scale: v_scale,
+                            },
+                        ],
                     );
                     q_chunk[offset] = q;
                     k_chunk[offset] = k;
@@ -3606,18 +4025,20 @@ pub(crate) fn qkv_matvec_rowmajor_parallel_i8_i8(
 
 fn qkv_matvec_rowmajor_block_parallel_f32_i8(
     x: &[f32],
-    q_rowmajor: &[i8],
-    q_scale: f32,
-    k_rowmajor: &[i8],
-    k_scale: f32,
-    v_rowmajor: &[i8],
-    v_scale: f32,
-    _n_rows: usize,
+    weights: I8QkvBlock<'_>,
     k_dim: usize,
-    q_out: &mut [f32],
-    k_out: &mut [f32],
-    v_out: &mut [f32],
+    out: QkvOutMut<'_>,
 ) {
+    let q_rowmajor = weights.q.values;
+    let q_scale = weights.q.scale;
+    let k_rowmajor = weights.k.values;
+    let k_scale = weights.k.scale;
+    let v_rowmajor = weights.v.values;
+    let v_scale = weights.v.scale;
+    let q_out = out.q;
+    let k_out = out.k;
+    let v_out = out.v;
+
     q_out
         .par_chunks_mut(MATVEC_BLOCK_ROWS)
         .zip(k_out.par_chunks_mut(MATVEC_BLOCK_ROWS))
@@ -3933,11 +4354,16 @@ pub(crate) fn dual_matvec_silu_mul_rowmajor_parallel_f32_i8(
     } else if should_use_i8_silu_block_kernel(n_rows, k_dim) {
         dual_matvec_silu_mul_rowmajor_block_parallel_f32_i8(
             x,
-            gate_w_rowmajor,
-            gate_scale,
-            up_w_rowmajor,
-            up_scale,
-            n_rows,
+            I8DualBlock {
+                left: I8ScaledSlice {
+                    values: gate_w_rowmajor,
+                    scale: gate_scale,
+                },
+                right: I8ScaledSlice {
+                    values: up_w_rowmajor,
+                    scale: up_scale,
+                },
+            },
             k_dim,
             out,
         );
@@ -4011,14 +4437,15 @@ pub(crate) fn dual_matvec_silu_mul_rowmajor_parallel_i8_i8(
 
 fn dual_matvec_silu_mul_rowmajor_block_parallel_f32_i8(
     x: &[f32],
-    gate_w_rowmajor: &[i8],
-    gate_scale: f32,
-    up_w_rowmajor: &[i8],
-    up_scale: f32,
-    _n_rows: usize,
+    weights: I8DualBlock<'_>,
     k_dim: usize,
     out: &mut [f32],
 ) {
+    let gate_w_rowmajor = weights.left.values;
+    let gate_scale = weights.left.scale;
+    let up_w_rowmajor = weights.right.values;
+    let up_scale = weights.right.scale;
+
     out.par_chunks_mut(SILU_I8_BLOCK_ROWS)
         .enumerate()
         .for_each(|(block_idx, out_chunk)| {
@@ -4163,8 +4590,107 @@ fn dual_matvec_silu_mul_rowmajor_parallel_bf16_bf16(
     k_dim: usize,
     out: &mut [f32],
 ) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(
+        gate_w_rowmajor.len(),
+        n_rows * k_dim,
+        "gate weight size mismatch"
+    );
+    assert_eq!(
+        up_w_rowmajor.len(),
+        n_rows * k_dim,
+        "up weight size mismatch"
+    );
+    assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    if crate::arch::x86_avx512_bf16_kernel_runtime_available() {
+        let compute = |i: usize| {
+            let gate = &gate_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let up = &up_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let (g, u) = dot2_bf16_bf16_arch(x, gate, up).unwrap_or_else(|| {
+                (
+                    dot_unrolled_bf16_bf16_scalar(x, gate),
+                    dot_unrolled_bf16_bf16_scalar(x, up),
+                )
+            });
+            let sig = 1.0 / (1.0 + (-g).exp());
+            (g * sig) * u
+        };
+
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            for (i, out_val) in out.iter_mut().enumerate() {
+                *out_val = compute(i);
+            }
+        } else {
+            out.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, out_val)| *out_val = compute(i));
+        }
+        return;
+    }
+
     with_bf16_input_as_f32(x, |x_f32| {
         dual_matvec_silu_mul_rowmajor_parallel_f32_bf16(
+            x_f32,
+            gate_w_rowmajor,
+            up_w_rowmajor,
+            n_rows,
+            k_dim,
+            out,
+        );
+    });
+}
+
+#[inline]
+fn dual_matvec_silu_mul_rowmajor_parallel_f16_f16(
+    x: &[f16],
+    gate_w_rowmajor: &[f16],
+    up_w_rowmajor: &[f16],
+    n_rows: usize,
+    k_dim: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(
+        gate_w_rowmajor.len(),
+        n_rows * k_dim,
+        "gate weight size mismatch"
+    );
+    assert_eq!(
+        up_w_rowmajor.len(),
+        n_rows * k_dim,
+        "up weight size mismatch"
+    );
+    assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    if crate::arch::x86_avx512_fp16_kernel_runtime_available() {
+        let compute = |i: usize| {
+            let gate = &gate_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let up = &up_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let (g, u) = dot2_f16_f16_arch(x, gate, up).unwrap_or_else(|| {
+                (
+                    dot_unrolled_f16_f16_scalar(x, gate),
+                    dot_unrolled_f16_f16_scalar(x, up),
+                )
+            });
+            let sig = 1.0 / (1.0 + (-g).exp());
+            (g * sig) * u
+        };
+
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            for (i, out_val) in out.iter_mut().enumerate() {
+                *out_val = compute(i);
+            }
+        } else {
+            out.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, out_val)| *out_val = compute(i));
+        }
+        return;
+    }
+
+    with_f16_input_as_f32(x, |x_f32| {
+        dual_matvec_silu_mul_rowmajor_parallel_f32_f16(
             x_f32,
             gate_w_rowmajor,
             up_w_rowmajor,
@@ -4253,11 +4779,11 @@ fn dual_matvec_silu_mul_rowmajor_parallel_mixed_f32_input(
     out: &mut [f32],
 ) {
     if n_rows < MATVEC_PAR_THRESHOLD {
-        for i in 0..n_rows {
+        for (i, out_val) in out.iter_mut().enumerate().take(n_rows) {
             let g = dot_unrolled_from_slice(x, row_slice(gate_w_rowmajor, i, k_dim));
             let u = dot_unrolled_from_slice(x, row_slice(up_w_rowmajor, i, k_dim));
             let sig = 1.0 / (1.0 + (-g).exp());
-            out[i] = (g * sig) * u;
+            *out_val = (g * sig) * u;
         }
     } else {
         out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
@@ -4297,9 +4823,7 @@ pub fn dual_matvec_silu_mul_rowmajor_parallel_mixed(
             })
         }
         (SliceRef::F16(x), SliceRef::F16(gate), SliceRef::F16(up)) => {
-            with_f16_input_as_f32(x, |x_f32| {
-                dual_matvec_silu_mul_rowmajor_parallel_f32_f16(x_f32, gate, up, n_rows, k_dim, out)
-            })
+            dual_matvec_silu_mul_rowmajor_parallel_f16_f16(x, gate, up, n_rows, k_dim, out)
         }
         (SliceRef::F16(x), SliceRef::BF16(gate), SliceRef::BF16(up)) => {
             with_f16_input_as_f32(x, |x_f32| {
@@ -4381,7 +4905,7 @@ pub fn matvec_argmax_rowmajor_parallel(
     assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
 
     if should_use_argmax_block_kernel(n_rows) {
-        let n_blocks = (n_rows + ARGMAX_BLOCK_ROWS - 1) / ARGMAX_BLOCK_ROWS;
+        let n_blocks = n_rows.div_ceil(ARGMAX_BLOCK_ROWS);
         return (0..n_blocks)
             .into_par_iter()
             .map(|block_idx| {
@@ -4400,9 +4924,9 @@ pub fn matvec_argmax_rowmajor_parallel(
                     let x5 = x[kk + 5];
                     let x6 = x[kk + 6];
                     let x7 = x[kk + 7];
-                    for r in 0..rows {
+                    for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
                         let base = r * k_dim + kk;
-                        acc[r] += w_block[base] * x0
+                        *acc_r += w_block[base] * x0
                             + w_block[base + 1] * x1
                             + w_block[base + 2] * x2
                             + w_block[base + 3] * x3
@@ -4416,15 +4940,15 @@ pub fn matvec_argmax_rowmajor_parallel(
 
                 while kk < k_dim {
                     let xv = x[kk];
-                    for r in 0..rows {
-                        acc[r] += w_block[r * k_dim + kk] * xv;
+                    for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
+                        *acc_r += w_block[r * k_dim + kk] * xv;
                     }
                     kk += 1;
                 }
 
                 let mut best = (row_start, f32::NEG_INFINITY);
-                for r in 0..rows {
-                    let cand = (row_start + r, acc[r]);
+                for (r, &acc_r) in acc.iter().enumerate().take(rows) {
+                    let cand = (row_start + r, acc_r);
                     if cand.1 > best.1 {
                         best = cand;
                     }
@@ -4564,9 +5088,9 @@ fn matvec_argmax_rowmajor_parallel_f32_i8(
                     let x5 = x[kk + 5];
                     let x6 = x[kk + 6];
                     let x7 = x[kk + 7];
-                    for r in 0..rows {
+                    for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
                         let base = r * k_dim + kk;
-                        acc[r] += w_block[base] as f32 * x0
+                        *acc_r += w_block[base] as f32 * x0
                             + w_block[base + 1] as f32 * x1
                             + w_block[base + 2] as f32 * x2
                             + w_block[base + 3] as f32 * x3
@@ -4580,8 +5104,8 @@ fn matvec_argmax_rowmajor_parallel_f32_i8(
 
                 while kk < k_dim {
                     let xv = x[kk];
-                    for r in 0..rows {
-                        acc[r] += w_block[r * k_dim + kk] as f32 * xv;
+                    for (r, acc_r) in acc.iter_mut().enumerate().take(rows) {
+                        *acc_r += w_block[r * k_dim + kk] as f32 * xv;
                     }
                     kk += 1;
                 }
@@ -4646,8 +5170,87 @@ fn matvec_argmax_rowmajor_parallel_bf16_bf16(
     n_rows: usize,
     k_dim: usize,
 ) -> usize {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
+
+    if crate::arch::x86_avx512_bf16_kernel_runtime_available() {
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            let mut best = (0usize, f32::NEG_INFINITY);
+            for i in 0..n_rows {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let score = dot_bf16_bf16_arch(x, row)
+                    .unwrap_or_else(|| dot_unrolled_bf16_bf16_scalar(x, row));
+                if score > best.1 {
+                    best = (i, score);
+                }
+            }
+            return best.0;
+        }
+
+        return (0..n_rows)
+            .into_par_iter()
+            .map(|i| {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                (
+                    i,
+                    dot_bf16_bf16_arch(x, row)
+                        .unwrap_or_else(|| dot_unrolled_bf16_bf16_scalar(x, row)),
+                )
+            })
+            .reduce(
+                || (0usize, f32::NEG_INFINITY),
+                |a, b| if a.1 >= b.1 { a } else { b },
+            )
+            .0;
+    }
+
     with_bf16_input_as_f32(x, |x_f32| {
         matvec_argmax_rowmajor_parallel_f32_bf16(x_f32, w_rowmajor, n_rows, k_dim)
+    })
+}
+
+#[inline]
+fn matvec_argmax_rowmajor_parallel_f16_f16(
+    x: &[f16],
+    w_rowmajor: &[f16],
+    n_rows: usize,
+    k_dim: usize,
+) -> usize {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
+
+    if crate::arch::x86_avx512_fp16_kernel_runtime_available() {
+        if n_rows < MATVEC_PAR_THRESHOLD {
+            let mut best = (0usize, f32::NEG_INFINITY);
+            for i in 0..n_rows {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let score =
+                    dot_f16_f16_arch(x, row).unwrap_or_else(|| dot_unrolled_f16_f16_scalar(x, row));
+                if score > best.1 {
+                    best = (i, score);
+                }
+            }
+            return best.0;
+        }
+
+        return (0..n_rows)
+            .into_par_iter()
+            .map(|i| {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                (
+                    i,
+                    dot_f16_f16_arch(x, row).unwrap_or_else(|| dot_unrolled_f16_f16_scalar(x, row)),
+                )
+            })
+            .reduce(
+                || (0usize, f32::NEG_INFINITY),
+                |a, b| if a.1 >= b.1 { a } else { b },
+            )
+            .0;
+    }
+
+    with_f16_input_as_f32(x, |x_f32| {
+        matvec_argmax_rowmajor_parallel_f32_f16(x_f32, w_rowmajor, n_rows, k_dim)
     })
 }
 
@@ -4753,9 +5356,9 @@ pub fn matvec_argmax_rowmajor_parallel_mixed(
         (SliceRef::F16(x), SliceRef::F32(w)) => with_f16_input_as_f32(x, |x_f32| {
             matvec_argmax_rowmajor_parallel(x_f32, w, n_rows, k_dim)
         }),
-        (SliceRef::F16(x), SliceRef::F16(w)) => with_f16_input_as_f32(x, |x_f32| {
-            matvec_argmax_rowmajor_parallel_f32_f16(x_f32, w, n_rows, k_dim)
-        }),
+        (SliceRef::F16(x), SliceRef::F16(w)) => {
+            matvec_argmax_rowmajor_parallel_f16_f16(x, w, n_rows, k_dim)
+        }
         (SliceRef::F16(x), SliceRef::BF16(w)) => with_f16_input_as_f32(x, |x_f32| {
             matvec_argmax_rowmajor_parallel_f32_bf16(x_f32, w, n_rows, k_dim)
         }),
@@ -4807,7 +5410,6 @@ fn matmul_rows_f32_bf16(
             .expect("standard-layout matmul RHS should be contiguous")
     };
 
-    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
     if m_dim == 1 {
         let a_flat = a_view
             .clone()
@@ -5055,9 +5657,7 @@ fn matmul_rows_f16_f16(
             a_owned.as_slice()
         };
         let mut out_vec = vec![0.0f32; n_dim];
-        with_f16_input_as_f32(a_slice, |a_f32| {
-            matvec_rowmajor_parallel_f32_f16(a_f32, b_slice, n_dim, k_dim, &mut out_vec);
-        });
+        matvec_rowmajor_parallel_f16_f16(a_slice, b_slice, n_dim, k_dim, &mut out_vec);
         return Array2::from_shape_vec((1, n_dim), out_vec)
             .expect("decode matvec shape build failed");
     }
@@ -5077,9 +5677,13 @@ fn matmul_rows_f16_f16(
                 let out_slice = out_row
                     .as_slice_mut()
                     .expect("matmul output row should be contiguous");
-                with_f16_input_as_f32(a_slice, |a_f32| {
-                    matvec_rowmajor_serial_f32_f16(a_f32, b_slice, n_dim, k_dim, out_slice);
-                });
+                if crate::arch::x86_avx512_fp16_kernel_runtime_available() {
+                    matvec_rowmajor_parallel_f16_f16(a_slice, b_slice, n_dim, k_dim, out_slice);
+                } else {
+                    with_f16_input_as_f32(a_slice, |a_f32| {
+                        matvec_rowmajor_serial_f32_f16(a_f32, b_slice, n_dim, k_dim, out_slice);
+                    });
+                }
             });
     } else {
         let a_2d_owned = a_view
@@ -5093,9 +5697,13 @@ fn matmul_rows_f16_f16(
                 let out_slice = out_row
                     .as_slice_mut()
                     .expect("matmul output row should be contiguous");
-                with_f16_input_as_f32(a_slice, |a_f32| {
-                    matvec_rowmajor_serial_f32_f16(a_f32, b_slice, n_dim, k_dim, out_slice);
-                });
+                if crate::arch::x86_avx512_fp16_kernel_runtime_available() {
+                    matvec_rowmajor_parallel_f16_f16(a_slice, b_slice, n_dim, k_dim, out_slice);
+                } else {
+                    with_f16_input_as_f32(a_slice, |a_f32| {
+                        matvec_rowmajor_serial_f32_f16(a_f32, b_slice, n_dim, k_dim, out_slice);
+                    });
+                }
             });
     }
     res
@@ -5616,6 +6224,9 @@ fn try_cuda_matmul_buffer(
     if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
         return None;
     }
+    if let Some(buffer) = try_cuda_matmul_native_low_precision_buffer(a, b, m_dim, k_dim, n_dim) {
+        return Some(buffer);
+    }
     let force_cuda = is_strict_device_execution();
     if !force_cuda && !cuda::should_accelerate_matmul(m_dim, n_dim, k_dim) {
         return None;
@@ -5634,6 +6245,120 @@ fn try_cuda_matmul_buffer(
     })
 }
 
+fn try_cuda_matmul_native_low_precision_buffer(
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Option<cuda::CudaBuffer> {
+    let a_native = a.cloned_cuda_native_lowp_buffer();
+    let b_native = b.cloned_cuda_native_lowp_buffer();
+
+    if let (Some((DType::BF16, a_buffer, _)), Some((DType::I8, b_buffer, Some(b_scale)))) =
+        (&a_native, &b_native)
+    {
+        return cuda::matmul_bf16_i8_buffer_no_host(
+            a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
+        )
+        .ok();
+    }
+
+    if let (Some((DType::F16, a_buffer, _)), Some((DType::I8, b_buffer, Some(b_scale)))) =
+        (&a_native, &b_native)
+    {
+        return cuda::matmul_f16_i8_buffer_no_host(
+            a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
+        )
+        .ok();
+    }
+
+    if a.dtype() == DType::F32
+        && let (Some(a_buffer), Some((DType::I8, b_buffer, Some(b_scale)))) =
+            (a.cloned_cuda_f32_buffer(), &b_native)
+    {
+        return cuda::matmul_f32_i8_buffer_no_host(
+            &a_buffer, b_buffer, *b_scale, m_dim, n_dim, k_dim,
+        )
+        .ok();
+    }
+
+    if let (Some((DType::I8, a_buffer, Some(a_scale))), Some((DType::BF16, b_buffer, _))) =
+        (&a_native, &b_native)
+    {
+        return cuda::matmul_i8_bf16_buffer_no_host(
+            a_buffer, *a_scale, b_buffer, m_dim, n_dim, k_dim,
+        )
+        .ok();
+    }
+
+    if let (Some((DType::I8, a_buffer, Some(a_scale))), Some((DType::F16, b_buffer, _))) =
+        (&a_native, &b_native)
+    {
+        return cuda::matmul_i8_f16_buffer_no_host(
+            a_buffer, *a_scale, b_buffer, m_dim, n_dim, k_dim,
+        )
+        .ok();
+    }
+
+    if b.dtype() == DType::F32
+        && let (Some((DType::I8, a_buffer, Some(a_scale))), Some(b_buffer)) =
+            (&a_native, b.cloned_cuda_f32_buffer())
+    {
+        return cuda::matmul_i8_f32_buffer_no_host(
+            a_buffer, *a_scale, &b_buffer, m_dim, n_dim, k_dim,
+        )
+        .ok();
+    }
+
+    if let (Some((a_dtype, a_buffer, a_scale)), Some((b_dtype, b_buffer, b_scale))) =
+        (&a_native, &b_native)
+        && a_dtype == b_dtype
+    {
+        return match a_dtype {
+            DType::BF16 => {
+                cuda::matmul_bf16_buffer_no_host(a_buffer, b_buffer, m_dim, n_dim, k_dim).ok()
+            }
+            DType::F16 => {
+                cuda::matmul_f16_buffer_no_host(a_buffer, b_buffer, m_dim, n_dim, k_dim).ok()
+            }
+            DType::I8 => cuda::matmul_i8_buffer_no_host(
+                a_buffer,
+                (*a_scale)?,
+                b_buffer,
+                (*b_scale)?,
+                m_dim,
+                n_dim,
+                k_dim,
+            )
+            .ok(),
+            DType::F32 => None,
+        };
+    }
+
+    match (a.native_storage_owned(), b.native_storage_owned()) {
+        (TensorStorageOwned::BF16(a_data), TensorStorageOwned::BF16(b_data)) => {
+            let a_bits = a_data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            let b_bits = b_data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            cuda::matmul_bf16_host_no_host(&a_bits, &b_bits, m_dim, n_dim, k_dim).ok()
+        }
+        (TensorStorageOwned::F16(a_data), TensorStorageOwned::F16(b_data)) => {
+            let a_bits = a_data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            let b_bits = b_data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            cuda::matmul_f16_host_no_host(&a_bits, &b_bits, m_dim, n_dim, k_dim).ok()
+        }
+        (TensorStorageOwned::I8(a_data, a_scale), TensorStorageOwned::I8(b_data, b_scale)) => {
+            let a_values = a_data.iter().copied().collect::<Vec<_>>();
+            let b_values = b_data.iter().copied().collect::<Vec<_>>();
+            cuda::matmul_i8_host_no_host(
+                &a_values, a_scale, &b_values, b_scale, m_dim, n_dim, k_dim,
+            )
+            .ok()
+        }
+        _ => None,
+    }
+}
+
 fn try_cuda_matmul(
     a: &Tensor,
     b: &Tensor,
@@ -5642,10 +6367,43 @@ fn try_cuda_matmul(
     k_dim: usize,
     output_dtype: DType,
 ) -> Option<Tensor> {
-    let buffer = try_cuda_matmul_buffer(a, b, m_dim, k_dim, n_dim)?;
     let mut out_shape = a.shape_vec();
     let last_idx = out_shape.len() - 1;
     out_shape[last_idx] = n_dim;
+
+    if output_dtype == DType::I8
+        && let Some((buffer, scale)) =
+            try_cuda_matmul_i8_typed_output_buffer(a, b, m_dim, k_dim, n_dim)
+    {
+        return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+            &out_shape,
+            buffer,
+            a.device(),
+            output_dtype,
+            Some(scale),
+        ));
+    }
+
+    if matches!(output_dtype, DType::F16 | DType::BF16)
+        && let Some(buffer) = try_cuda_matmul_native_low_precision_typed_output_buffer(
+            a,
+            b,
+            m_dim,
+            k_dim,
+            n_dim,
+            output_dtype,
+        )
+    {
+        return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+            &out_shape,
+            buffer,
+            a.device(),
+            output_dtype,
+            None,
+        ));
+    }
+
+    let buffer = try_cuda_matmul_buffer(a, b, m_dim, k_dim, n_dim)?;
 
     if output_dtype == DType::F32 {
         return Some(Tensor::from_cuda_f32_buffer_no_host(
@@ -5664,19 +6422,74 @@ fn try_cuda_matmul(
         ));
     }
 
-    let out = cuda::download_f32(&buffer).ok()?;
-    Some(
-        Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-            Array2::from_shape_vec((m_dim, n_dim), out)
-                .expect("CUDA matmul output shape build failed")
-                .into_shape(out_shape)
-                .expect("CUDA matmul output reshape failed")
-                .into_dyn(),
-            output_dtype,
+    if output_dtype == DType::I8 {
+        let (i8_buffer, scale) = cuda::quantize_f32_to_i8_dynamic_no_host(&buffer).ok()?;
+        return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+            &out_shape,
+            i8_buffer,
             a.device(),
-            Some(buffer),
-        ),
+            output_dtype,
+            Some(scale),
+        ));
+    }
+
+    None
+}
+
+fn try_cuda_matmul_i8_typed_output_buffer(
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Option<(cuda::CudaBuffer, f32)> {
+    if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
+        return None;
+    }
+    let (Some((DType::I8, a_buffer, Some(a_scale))), Some((DType::I8, b_buffer, Some(b_scale)))) = (
+        a.cloned_cuda_native_lowp_buffer(),
+        b.cloned_cuda_native_lowp_buffer(),
+    ) else {
+        return None;
+    };
+    cuda::matmul_i8_typed_output_buffer_no_host(
+        &a_buffer, a_scale, &b_buffer, b_scale, m_dim, n_dim, k_dim,
     )
+    .ok()
+}
+
+fn try_cuda_matmul_native_low_precision_typed_output_buffer(
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+    output_dtype: DType,
+) -> Option<cuda::CudaBuffer> {
+    if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
+        return None;
+    }
+    let (Some((a_dtype, a_buffer, _)), Some((b_dtype, b_buffer, _))) = (
+        a.cloned_cuda_native_lowp_buffer(),
+        b.cloned_cuda_native_lowp_buffer(),
+    ) else {
+        return None;
+    };
+    if a_dtype != b_dtype || a_dtype != output_dtype {
+        return None;
+    }
+
+    match a_dtype {
+        DType::BF16 => {
+            cuda::matmul_bf16_typed_output_buffer_no_host(&a_buffer, &b_buffer, m_dim, n_dim, k_dim)
+                .ok()
+        }
+        DType::F16 => {
+            cuda::matmul_f16_typed_output_buffer_no_host(&a_buffer, &b_buffer, m_dim, n_dim, k_dim)
+                .ok()
+        }
+        DType::F32 | DType::I8 => None,
+    }
 }
 
 fn try_cuda_batch_matmul_buffer(
@@ -5694,6 +6507,11 @@ fn try_cuda_batch_matmul_buffer(
         return None;
     }
     let batch_count = b.checked_mul(h)?;
+    if let Some(buffer) =
+        try_cuda_batch_matmul_native_low_precision_buffer(lhs, rhs, batch_count, m, k, n)
+    {
+        return Some(buffer);
+    }
     let force_cuda = is_strict_device_execution();
     if !force_cuda && !cuda::should_accelerate_batch_matmul(batch_count, m, n, k) {
         return None;
@@ -5714,18 +6532,178 @@ fn try_cuda_batch_matmul_buffer(
     })
 }
 
-fn try_cuda_batch_matmul(
+fn try_cuda_batch_matmul_native_low_precision_buffer(
     lhs: &Tensor,
     rhs: &Tensor,
-    b: usize,
-    h: usize,
+    batch_count: usize,
     m: usize,
     k: usize,
     n: usize,
+) -> Option<cuda::CudaBuffer> {
+    let rhs_native = rhs.cloned_cuda_native_lowp_buffer();
+    if let (Some((DType::BF16, lhs_buffer, _)), Some((DType::I8, rhs_buffer, Some(rhs_scale)))) =
+        (lhs.cloned_cuda_native_lowp_buffer(), &rhs_native)
+    {
+        return cuda::batch_matmul_bf16_i8_buffer_no_host(
+            &lhs_buffer,
+            rhs_buffer,
+            *rhs_scale,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok();
+    }
+
+    if let (Some((DType::F16, lhs_buffer, _)), Some((DType::I8, rhs_buffer, Some(rhs_scale)))) =
+        (lhs.cloned_cuda_native_lowp_buffer(), &rhs_native)
+    {
+        return cuda::batch_matmul_f16_i8_buffer_no_host(
+            &lhs_buffer,
+            rhs_buffer,
+            *rhs_scale,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok();
+    }
+
+    if lhs.dtype() == DType::F32
+        && let (Some(lhs_buffer), Some((DType::I8, rhs_buffer, Some(rhs_scale)))) =
+            (lhs.cloned_cuda_f32_buffer(), &rhs_native)
+    {
+        return cuda::batch_matmul_f32_i8_buffer_no_host(
+            &lhs_buffer,
+            rhs_buffer,
+            *rhs_scale,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok();
+    }
+
+    let lhs_native = lhs.cloned_cuda_native_lowp_buffer();
+    if let (Some((DType::I8, lhs_buffer, Some(lhs_scale))), Some((DType::BF16, rhs_buffer, _))) =
+        (&lhs_native, &rhs_native)
+    {
+        return cuda::batch_matmul_i8_bf16_buffer_no_host(
+            lhs_buffer,
+            *lhs_scale,
+            rhs_buffer,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok();
+    }
+
+    if let (Some((DType::I8, lhs_buffer, Some(lhs_scale))), Some((DType::F16, rhs_buffer, _))) =
+        (&lhs_native, &rhs_native)
+    {
+        return cuda::batch_matmul_i8_f16_buffer_no_host(
+            lhs_buffer,
+            *lhs_scale,
+            rhs_buffer,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok();
+    }
+
+    if rhs.dtype() == DType::F32
+        && let (Some((DType::I8, lhs_buffer, Some(lhs_scale))), Some(rhs_buffer)) =
+            (&lhs_native, rhs.cloned_cuda_f32_buffer())
+    {
+        return cuda::batch_matmul_i8_f32_buffer_no_host(
+            lhs_buffer,
+            *lhs_scale,
+            &rhs_buffer,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok();
+    }
+
+    let (Some((lhs_dtype, lhs_buffer, lhs_scale)), Some((rhs_dtype, rhs_buffer, rhs_scale))) =
+        (lhs_native, rhs_native)
+    else {
+        return None;
+    };
+    if lhs_dtype != rhs_dtype {
+        return None;
+    }
+
+    match lhs_dtype {
+        DType::BF16 => {
+            cuda::batch_matmul_bf16_buffer_no_host(&lhs_buffer, &rhs_buffer, batch_count, m, n, k)
+                .ok()
+        }
+        DType::F16 => {
+            cuda::batch_matmul_f16_buffer_no_host(&lhs_buffer, &rhs_buffer, batch_count, m, n, k)
+                .ok()
+        }
+        DType::I8 => cuda::batch_matmul_i8_buffer_no_host(
+            &lhs_buffer,
+            lhs_scale?,
+            &rhs_buffer,
+            rhs_scale?,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .ok(),
+        DType::F32 => None,
+    }
+}
+
+fn try_cuda_batch_matmul(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    dims: BatchMatmulDims,
     output_dtype: DType,
 ) -> Option<Tensor> {
-    let buffer = try_cuda_batch_matmul_buffer(lhs, rhs, b, h, m, k, n)?;
-    let out_shape = vec![b, h, m, n];
+    let out_shape = dims.out_shape();
+    if output_dtype == DType::I8
+        && let Some((buffer, scale)) = try_cuda_batch_matmul_i8_typed_output_buffer(lhs, rhs, dims)
+    {
+        return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+            &out_shape,
+            buffer,
+            lhs.device(),
+            output_dtype,
+            Some(scale),
+        ));
+    }
+
+    if matches!(output_dtype, DType::F16 | DType::BF16)
+        && let Some(buffer) = try_cuda_batch_matmul_native_low_precision_typed_output_buffer(
+            lhs,
+            rhs,
+            dims,
+            output_dtype,
+        )
+    {
+        return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+            &out_shape,
+            buffer,
+            lhs.device(),
+            output_dtype,
+            None,
+        ));
+    }
+
+    let buffer = try_cuda_batch_matmul_buffer(lhs, rhs, dims.b, dims.h, dims.m, dims.k, dims.n)?;
     if output_dtype == DType::F32 {
         return Some(Tensor::from_cuda_f32_buffer_no_host(
             &out_shape,
@@ -5743,17 +6721,97 @@ fn try_cuda_batch_matmul(
         ));
     }
 
-    let out = cuda::download_f32(&buffer).ok()?;
-    Some(
-        Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-            Array4::from_shape_vec((b, h, m, n), out)
-                .expect("CUDA batch_matmul output shape build failed")
-                .into_dyn(),
-            output_dtype,
+    if output_dtype == DType::I8 {
+        let (i8_buffer, scale) = cuda::quantize_f32_to_i8_dynamic_no_host(&buffer).ok()?;
+        return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+            &out_shape,
+            i8_buffer,
             lhs.device(),
-            Some(buffer),
-        ),
+            output_dtype,
+            Some(scale),
+        ));
+    }
+
+    None
+}
+
+fn try_cuda_batch_matmul_i8_typed_output_buffer(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    dims: BatchMatmulDims,
+) -> Option<(cuda::CudaBuffer, f32)> {
+    if lhs.device() != crate::autograd::Device::Cuda
+        || rhs.device() != crate::autograd::Device::Cuda
+    {
+        return None;
+    }
+    let (
+        Some((DType::I8, lhs_buffer, Some(lhs_scale))),
+        Some((DType::I8, rhs_buffer, Some(rhs_scale))),
+    ) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
     )
+    else {
+        return None;
+    };
+    let batch_count = dims.batch_count()?;
+    cuda::batch_matmul_i8_typed_output_buffer_no_host(
+        &lhs_buffer,
+        lhs_scale,
+        &rhs_buffer,
+        rhs_scale,
+        batch_count,
+        dims.m,
+        dims.n,
+        dims.k,
+    )
+    .ok()
+}
+
+fn try_cuda_batch_matmul_native_low_precision_typed_output_buffer(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    dims: BatchMatmulDims,
+    output_dtype: DType,
+) -> Option<cuda::CudaBuffer> {
+    if lhs.device() != crate::autograd::Device::Cuda
+        || rhs.device() != crate::autograd::Device::Cuda
+    {
+        return None;
+    }
+    let batch_count = dims.batch_count()?;
+    let (Some((lhs_dtype, lhs_buffer, _)), Some((rhs_dtype, rhs_buffer, _))) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
+    ) else {
+        return None;
+    };
+    if lhs_dtype != rhs_dtype || lhs_dtype != output_dtype {
+        return None;
+    }
+
+    match lhs_dtype {
+        DType::BF16 => cuda::batch_matmul_bf16_typed_output_buffer_no_host(
+            &lhs_buffer,
+            &rhs_buffer,
+            batch_count,
+            dims.m,
+            dims.n,
+            dims.k,
+        )
+        .ok(),
+        DType::F16 => cuda::batch_matmul_f16_typed_output_buffer_no_host(
+            &lhs_buffer,
+            &rhs_buffer,
+            batch_count,
+            dims.m,
+            dims.n,
+            dims.k,
+        )
+        .ok(),
+        DType::F32 | DType::I8 => None,
+    }
 }
 
 fn try_cuda_training_matmul_backward(
@@ -5764,13 +6822,7 @@ fn try_cuda_training_matmul_backward(
     m_dim: usize,
     k_dim: usize,
     n_dim: usize,
-) -> Result<
-    (
-        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
-        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
-    ),
-    String,
-> {
+) -> Result<CudaMatmulBackwardHostDevice, String> {
     let (da_buf, db_buf) =
         try_cuda_training_matmul_backward_buffers(grad, cuda_grad, a, b, m_dim, k_dim, n_dim)?;
     let da_host = cuda::download_f32(&da_buf)?;
@@ -5800,6 +6852,101 @@ fn try_cuda_training_matmul_backward_buffers(
         Some(buffer) if buffer.len() == grad.len() => buffer,
         _ => cuda::upload_f32(&grad.iter().copied().collect::<Vec<_>>())?,
     };
+
+    if let (Some((DType::BF16, a_buffer, _)), Some((DType::I8, b_buffer, b_scale))) = (
+        a.cloned_cuda_native_lowp_buffer(),
+        b.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::matmul_backward_bf16_i8_no_host(
+            &grad_buf,
+            &a_buffer,
+            &b_buffer,
+            b_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+            m_dim,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let (Some((DType::F16, a_buffer, _)), Some((DType::I8, b_buffer, b_scale))) = (
+        a.cloned_cuda_native_lowp_buffer(),
+        b.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::matmul_backward_f16_i8_no_host(
+            &grad_buf,
+            &a_buffer,
+            &b_buffer,
+            b_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+            m_dim,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let Some((DType::I8, b_buffer, b_scale)) = b.cloned_cuda_native_lowp_buffer()
+        && a.dtype() == DType::F32
+    {
+        let a_buffer = a
+            .cloned_cuda_f32_buffer()
+            .ok_or_else(|| "CUDA F32xI8 matmul backward expected lhs buffer".to_string())?;
+        return cuda::matmul_backward_f32_i8_no_host(
+            &grad_buf,
+            &a_buffer,
+            &b_buffer,
+            b_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+            m_dim,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let (Some((DType::I8, a_buffer, a_scale)), Some((DType::BF16, b_buffer, _))) = (
+        a.cloned_cuda_native_lowp_buffer(),
+        b.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::matmul_backward_i8_bf16_no_host(
+            &grad_buf,
+            &a_buffer,
+            a_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+            &b_buffer,
+            m_dim,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let (Some((DType::I8, a_buffer, a_scale)), Some((DType::F16, b_buffer, _))) = (
+        a.cloned_cuda_native_lowp_buffer(),
+        b.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::matmul_backward_i8_f16_no_host(
+            &grad_buf,
+            &a_buffer,
+            a_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+            &b_buffer,
+            m_dim,
+            k_dim,
+            n_dim,
+        );
+    }
+
+    if let Some((DType::I8, a_buffer, a_scale)) = a.cloned_cuda_native_lowp_buffer()
+        && b.dtype() == DType::F32
+    {
+        let b_buffer = b
+            .cloned_cuda_f32_buffer()
+            .ok_or_else(|| "CUDA I8xF32 matmul backward expected rhs buffer".to_string())?;
+        return cuda::matmul_backward_i8_f32_no_host(
+            &grad_buf,
+            &a_buffer,
+            a_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+            &b_buffer,
+            m_dim,
+            k_dim,
+            n_dim,
+        );
+    }
+
     let a_buf = a
         .cloned_cuda_f32_buffer()
         .ok_or_else(|| "CUDA matmul backward expected lhs resident buffer".to_string())?;
@@ -5807,13 +6954,7 @@ fn try_cuda_training_matmul_backward_buffers(
         .cloned_cuda_f32_buffer()
         .ok_or_else(|| "CUDA matmul backward expected rhs resident buffer".to_string())?;
 
-    let grad_t = cuda::permute_f32_buffer(&grad_buf, &[n_dim, m_dim], &[1, 0])?;
-    let b_t = cuda::permute_f32_buffer(&b_buf, &[k_dim, n_dim], &[1, 0])?;
-    let a_t = cuda::permute_f32_buffer(&a_buf, &[k_dim, m_dim], &[1, 0])?;
-
-    let da_buf = cuda::matmul_f32_no_host(&grad_buf, &b_t, m_dim, k_dim, n_dim)?;
-    let db_buf = cuda::matmul_f32_no_host(&grad_t, &a_t, n_dim, k_dim, m_dim)?;
-    Ok((da_buf, db_buf))
+    cuda::matmul_backward_f32_no_host(&grad_buf, &a_buf, &b_buf, m_dim, k_dim, n_dim)
 }
 
 fn try_cuda_training_batch_matmul_backward(
@@ -5821,27 +6962,17 @@ fn try_cuda_training_batch_matmul_backward(
     cuda_grad: Option<cuda::CudaBuffer>,
     lhs: &Tensor,
     rhs: &Tensor,
-    b: usize,
-    h: usize,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Result<
-    (
-        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
-        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
-    ),
-    String,
-> {
+    dims: BatchMatmulDims,
+) -> Result<CudaMatmulBackwardHostDevice, String> {
     let (d_lhs_buf, d_rhs_buf) =
-        try_cuda_training_batch_matmul_backward_buffers(grad, cuda_grad, lhs, rhs, b, h, m, k, n)?;
+        try_cuda_training_batch_matmul_backward_buffers(grad, cuda_grad, lhs, rhs, dims)?;
     let d_lhs_host = cuda::download_f32(&d_lhs_buf)?;
     let d_rhs_host = cuda::download_f32(&d_rhs_buf)?;
 
-    let d_lhs = Array4::from_shape_vec((b, h, m, k), d_lhs_host)
+    let d_lhs = Array4::from_shape_vec((dims.b, dims.h, dims.m, dims.k), d_lhs_host)
         .expect("CUDA batch_matmul backward dLHS shape build failed")
         .into_dyn();
-    let d_rhs = Array4::from_shape_vec((b, h, k, n), d_rhs_host)
+    let d_rhs = Array4::from_shape_vec((dims.b, dims.h, dims.k, dims.n), d_rhs_host)
         .expect("CUDA batch_matmul backward dRHS shape build failed")
         .into_dyn();
     Ok(((d_lhs, d_lhs_buf), (d_rhs, d_rhs_buf)))
@@ -5852,19 +6983,156 @@ fn try_cuda_training_batch_matmul_backward_buffers(
     cuda_grad: Option<cuda::CudaBuffer>,
     lhs: &Tensor,
     rhs: &Tensor,
-    b: usize,
-    h: usize,
-    m: usize,
-    k: usize,
-    n: usize,
+    dims: BatchMatmulDims,
 ) -> Result<(cuda::CudaBuffer, cuda::CudaBuffer), String> {
-    let batch_count = b
-        .checked_mul(h)
+    let batch_count = dims
+        .batch_count()
         .ok_or_else(|| "CUDA batch_matmul backward batch count overflow".to_string())?;
     let grad_buf = match cuda_grad {
         Some(buffer) if buffer.len() == grad.len() => buffer,
         _ => cuda::upload_f32(&grad.iter().copied().collect::<Vec<_>>())?,
     };
+
+    if let (Some((DType::BF16, lhs_buffer, _)), Some((DType::I8, rhs_buffer, rhs_scale))) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::batch_matmul_backward_bf16_i8_no_host(
+            &grad_buf,
+            &lhs_buffer,
+            &rhs_buffer,
+            rhs_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+            batch_count,
+            dims.m,
+            dims.k,
+            dims.n,
+        );
+    }
+
+    if let (Some((DType::F16, lhs_buffer, _)), Some((DType::I8, rhs_buffer, rhs_scale))) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::batch_matmul_backward_f16_i8_no_host(
+            &grad_buf,
+            &lhs_buffer,
+            &rhs_buffer,
+            rhs_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+            dims.batch_count()
+                .ok_or_else(|| "CUDA batch_matmul backward batch size overflow".to_string())?,
+            dims.m,
+            dims.k,
+            dims.n,
+        );
+    }
+
+    if let Some((DType::I8, rhs_buffer, rhs_scale)) = rhs.cloned_cuda_native_lowp_buffer()
+        && lhs.dtype() == DType::F32
+    {
+        let lhs_buffer = lhs
+            .cloned_cuda_f32_buffer()
+            .ok_or_else(|| "CUDA F32xI8 batch_matmul backward expected lhs buffer".to_string())?;
+        return cuda::batch_matmul_backward_f32_i8_no_host(
+            &grad_buf,
+            &lhs_buffer,
+            &rhs_buffer,
+            rhs_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+            batch_count,
+            dims.m,
+            dims.k,
+            dims.n,
+        );
+    }
+
+    if let (Some((DType::I8, lhs_buffer, lhs_scale)), Some((DType::BF16, rhs_buffer, _))) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::batch_matmul_backward_i8_bf16_no_host(
+            &grad_buf,
+            &lhs_buffer,
+            lhs_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+            &rhs_buffer,
+            batch_count,
+            dims.m,
+            dims.k,
+            dims.n,
+        );
+    }
+
+    if let (Some((DType::I8, lhs_buffer, lhs_scale)), Some((DType::F16, rhs_buffer, _))) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
+    ) {
+        return cuda::batch_matmul_backward_i8_f16_no_host(
+            &grad_buf,
+            &lhs_buffer,
+            lhs_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+            &rhs_buffer,
+            batch_count,
+            dims.m,
+            dims.k,
+            dims.n,
+        );
+    }
+
+    if let Some((DType::I8, lhs_buffer, lhs_scale)) = lhs.cloned_cuda_native_lowp_buffer()
+        && rhs.dtype() == DType::F32
+    {
+        let rhs_buffer = rhs
+            .cloned_cuda_f32_buffer()
+            .ok_or_else(|| "CUDA I8xF32 batch_matmul backward expected rhs buffer".to_string())?;
+        return cuda::batch_matmul_backward_i8_f32_no_host(
+            &grad_buf,
+            &lhs_buffer,
+            lhs_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+            &rhs_buffer,
+            batch_count,
+            dims.m,
+            dims.k,
+            dims.n,
+        );
+    }
+
+    if let (Some((lhs_dtype, lhs_buffer, lhs_scale)), Some((rhs_dtype, rhs_buffer, rhs_scale))) = (
+        lhs.cloned_cuda_native_lowp_buffer(),
+        rhs.cloned_cuda_native_lowp_buffer(),
+    ) && lhs_dtype == rhs_dtype
+        && lhs_dtype != DType::F32
+    {
+        return match lhs_dtype {
+            DType::BF16 => cuda::batch_matmul_backward_bf16_no_host(
+                &grad_buf,
+                &lhs_buffer,
+                &rhs_buffer,
+                batch_count,
+                dims.m,
+                dims.k,
+                dims.n,
+            ),
+            DType::F16 => cuda::batch_matmul_backward_f16_no_host(
+                &grad_buf,
+                &lhs_buffer,
+                &rhs_buffer,
+                batch_count,
+                dims.m,
+                dims.k,
+                dims.n,
+            ),
+            DType::I8 => cuda::batch_matmul_backward_i8_no_host(
+                &grad_buf,
+                &lhs_buffer,
+                lhs_scale.ok_or_else(|| "CUDA I8 lhs scale missing".to_string())?,
+                &rhs_buffer,
+                rhs_scale.ok_or_else(|| "CUDA I8 rhs scale missing".to_string())?,
+                batch_count,
+                dims.m,
+                dims.k,
+                dims.n,
+            ),
+            DType::F32 => unreachable!("F32 is excluded by the low-precision guard"),
+        };
+    }
     let lhs_buf = lhs
         .cloned_cuda_f32_buffer()
         .ok_or_else(|| "CUDA batch_matmul backward expected lhs resident buffer".to_string())?;
@@ -5872,12 +7140,920 @@ fn try_cuda_training_batch_matmul_backward_buffers(
         .cloned_cuda_f32_buffer()
         .ok_or_else(|| "CUDA batch_matmul backward expected rhs resident buffer".to_string())?;
 
-    let lhs_t = cuda::permute_f32_buffer(&lhs_buf, &[b, h, k, m], &[0, 1, 3, 2])?;
-    let rhs_t = cuda::permute_f32_buffer(&rhs_buf, &[b, h, n, k], &[0, 1, 3, 2])?;
+    cuda::batch_matmul_backward_f32_no_host(
+        &grad_buf,
+        &lhs_buf,
+        &rhs_buf,
+        batch_count,
+        dims.m,
+        dims.k,
+        dims.n,
+    )
+}
 
-    let d_lhs_buf = cuda::batch_matmul_f32_no_host(&grad_buf, &rhs_t, batch_count, m, k, n)?;
-    let d_rhs_buf = cuda::batch_matmul_f32_no_host(&lhs_t, &grad_buf, batch_count, k, n, m)?;
-    Ok((d_lhs_buf, d_rhs_buf))
+fn matmul_forward_cpu_native(
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Array2<f32> {
+    let input_dtype = a.dtype();
+    if b.dtype() == DType::I8 {
+        return match b.native_storage_owned() {
+            TensorStorageOwned::I8(b_data, scale) => {
+                let b_2d = b_data
+                    .view()
+                    .into_dimensionality::<Ix2>()
+                    .expect("matmul RHS must be 2D [N, K]");
+                let b_owned;
+                let b_slice: &[i8] = if let Some(s) = b_2d.as_slice() {
+                    s
+                } else {
+                    b_owned = b_2d.as_standard_layout().to_owned();
+                    b_owned
+                        .as_slice()
+                        .expect("standard-layout matmul RHS should be contiguous")
+                };
+
+                if input_dtype == DType::I8 {
+                    match a.native_storage_owned() {
+                        TensorStorageOwned::I8(a_data, a_scale) => {
+                            if m_dim == 1 {
+                                let a_owned;
+                                let a_vec: &[i8] = if let Some(s) = a_data.as_slice() {
+                                    s
+                                } else {
+                                    a_owned = a_data.iter().copied().collect::<Vec<i8>>();
+                                    a_owned.as_slice()
+                                };
+
+                                let mut out_vec = vec![0.0f32; n_dim];
+                                matvec_rowmajor_parallel_i8_i8(
+                                    a_vec,
+                                    a_scale,
+                                    b_slice,
+                                    scale,
+                                    n_dim,
+                                    k_dim,
+                                    &mut out_vec,
+                                );
+                                Array2::from_shape_vec((1, n_dim), out_vec)
+                                    .expect("decode matvec shape build failed")
+                            } else {
+                                matmul_rows_i8_slice(
+                                    a_data.view().into_dyn(),
+                                    a_scale,
+                                    SliceRef::I8(b_slice, scale),
+                                    m_dim,
+                                    k_dim,
+                                    n_dim,
+                                )
+                            }
+                        }
+                        TensorStorageOwned::F32(_)
+                        | TensorStorageOwned::F16(_)
+                        | TensorStorageOwned::BF16(_) => {
+                            unreachable!("checked i8 lhs above")
+                        }
+                    }
+                } else {
+                    a.with_storage_view_preferring(StoragePreference::Native, |a_view| {
+                        if m_dim == 1 {
+                            match a_view {
+                                TensorStorageView::F32(a_view) => {
+                                    let a_owned;
+                                    let a_vec: &[f32] = if let Some(s) = a_view.as_slice() {
+                                        s
+                                    } else {
+                                        a_owned = a_view.iter().copied().collect::<Vec<f32>>();
+                                        a_owned.as_slice()
+                                    };
+
+                                    let mut out_vec = vec![0.0f32; n_dim];
+                                    matvec_rowmajor_parallel_f32_i8_matmul(
+                                        a_vec,
+                                        b_slice,
+                                        scale,
+                                        n_dim,
+                                        k_dim,
+                                        &mut out_vec,
+                                    );
+                                    Array2::from_shape_vec((1, n_dim), out_vec)
+                                        .expect("decode matvec shape build failed")
+                                }
+                                TensorStorageView::F16(a_view) => {
+                                    let a_owned;
+                                    let a_vec: &[f16] = if let Some(s) = a_view.as_slice() {
+                                        s
+                                    } else {
+                                        a_owned = a_view.iter().copied().collect::<Vec<f16>>();
+                                        a_owned.as_slice()
+                                    };
+
+                                    let mut out_vec = vec![0.0f32; n_dim];
+                                    with_f16_input_as_f32(a_vec, |a_f32| {
+                                        matvec_rowmajor_parallel_f32_i8_matmul(
+                                            a_f32,
+                                            b_slice,
+                                            scale,
+                                            n_dim,
+                                            k_dim,
+                                            &mut out_vec,
+                                        );
+                                    });
+                                    Array2::from_shape_vec((1, n_dim), out_vec)
+                                        .expect("decode matvec shape build failed")
+                                }
+                                TensorStorageView::BF16(a_view) => {
+                                    let a_owned;
+                                    let a_vec: &[bf16] = if let Some(s) = a_view.as_slice() {
+                                        s
+                                    } else {
+                                        a_owned = a_view.iter().copied().collect::<Vec<bf16>>();
+                                        a_owned.as_slice()
+                                    };
+
+                                    let mut out_vec = vec![0.0f32; n_dim];
+                                    with_bf16_input_as_f32(a_vec, |a_f32| {
+                                        matvec_rowmajor_parallel_f32_i8_matmul(
+                                            a_f32,
+                                            b_slice,
+                                            scale,
+                                            n_dim,
+                                            k_dim,
+                                            &mut out_vec,
+                                        );
+                                    });
+                                    Array2::from_shape_vec((1, n_dim), out_vec)
+                                        .expect("decode matvec shape build failed")
+                                }
+                            }
+                        } else {
+                            let b_view = b_data.view().into_dyn();
+                            match a_view {
+                                TensorStorageView::F32(a_view) => {
+                                    matmul_rows_f32_i8(a_view, b_view, scale, m_dim, k_dim, n_dim)
+                                }
+                                TensorStorageView::F16(a_view) => matmul_rows_f16_slice(
+                                    a_view,
+                                    SliceRef::I8(b_slice, scale),
+                                    m_dim,
+                                    k_dim,
+                                    n_dim,
+                                ),
+                                TensorStorageView::BF16(a_view) => {
+                                    matmul_rows_bf16_i8(a_view, b_view, scale, m_dim, k_dim, n_dim)
+                                }
+                            }
+                        }
+                    })
+                }
+            }
+            TensorStorageOwned::F32(_)
+            | TensorStorageOwned::F16(_)
+            | TensorStorageOwned::BF16(_) => unreachable!("checked i8 RHS above"),
+        };
+    }
+
+    a.with_storage_view_preferring(StoragePreference::Native, |a_view| {
+        b.with_storage_view_preferring(StoragePreference::Native, |b_view| match (a_view, b_view) {
+            (TensorStorageView::F32(a_view), TensorStorageView::F32(b_view)) => {
+                if m_dim == 1 {
+                    let a_owned;
+                    let a_vec: &[f32] = if let Some(s) = a_view.as_slice() {
+                        s
+                    } else {
+                        a_owned = a_view.iter().copied().collect::<Vec<f32>>();
+                        a_owned.as_slice()
+                    };
+
+                    let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
+                    let b_owned;
+                    let b_slice: &[f32] = if let Some(s) = b_2d.as_slice() {
+                        s
+                    } else {
+                        b_owned = b_2d.as_standard_layout().to_owned();
+                        b_owned
+                            .as_slice()
+                            .expect("standard-layout matmul RHS should be contiguous")
+                    };
+
+                    let mut out_vec = vec![0.0f32; n_dim];
+                    matvec_rowmajor_parallel(a_vec, b_slice, n_dim, k_dim, &mut out_vec);
+                    Array2::from_shape_vec((1, n_dim), out_vec)
+                        .expect("decode matvec shape build failed")
+                } else {
+                    let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
+                    let mut res = Array2::<f32>::zeros((m_dim, n_dim));
+                    if let Ok(a_2d_view) = a_view.clone().into_shape((m_dim, k_dim)) {
+                        general_mat_mul(1.0, &a_2d_view, &b_2d.t(), 0.0, &mut res);
+                    } else {
+                        let a_2d_owned = a_view
+                            .to_owned()
+                            .into_shape((m_dim, k_dim))
+                            .expect("Reshape A failed");
+                        general_mat_mul(1.0, &a_2d_owned, &b_2d.t(), 0.0, &mut res);
+                    }
+                    res
+                }
+            }
+            (TensorStorageView::F32(a_view), TensorStorageView::F16(b_view)) => {
+                matmul_rows_f32_f16(a_view, b_view, m_dim, k_dim, n_dim)
+            }
+            (TensorStorageView::F32(a_view), TensorStorageView::BF16(b_view)) => {
+                matmul_rows_f32_bf16(a_view, b_view, m_dim, k_dim, n_dim)
+            }
+            (TensorStorageView::F16(a_view), TensorStorageView::F32(b_view)) => {
+                matmul_rows_f16_f32(a_view, b_view, m_dim, k_dim, n_dim)
+            }
+            (TensorStorageView::F16(a_view), TensorStorageView::F16(b_view)) => {
+                matmul_rows_f16_f16(a_view, b_view, m_dim, k_dim, n_dim)
+            }
+            (TensorStorageView::F16(a_view), TensorStorageView::BF16(b_view)) => {
+                let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
+                matmul_rows_f16_slice(
+                    a_view,
+                    SliceRef::BF16(
+                        b_2d.as_slice()
+                            .expect("standard-layout matmul RHS should be contiguous"),
+                    ),
+                    m_dim,
+                    k_dim,
+                    n_dim,
+                )
+            }
+            (TensorStorageView::BF16(a_view), TensorStorageView::F32(b_view)) => {
+                matmul_rows_bf16_f32(a_view, b_view, m_dim, k_dim, n_dim)
+            }
+            (TensorStorageView::BF16(a_view), TensorStorageView::F16(b_view)) => {
+                let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
+                matmul_rows_bf16_slice(
+                    a_view,
+                    SliceRef::F16(
+                        b_2d.as_slice()
+                            .expect("standard-layout matmul RHS should be contiguous"),
+                    ),
+                    m_dim,
+                    k_dim,
+                    n_dim,
+                )
+            }
+            (TensorStorageView::BF16(a_view), TensorStorageView::BF16(b_view)) => {
+                matmul_rows_bf16_bf16(a_view, b_view, m_dim, k_dim, n_dim)
+            }
+        })
+    })
+}
+
+fn f16_view_to_f32_owned(view: ndarray::ArrayViewD<'_, f16>) -> ArrayD<f32> {
+    let shape = view.shape().to_vec();
+    let mut raw = vec![0.0f32; view.len()];
+    if let Some(slice) = view.as_slice_memory_order() {
+        slice.convert_to_f32_slice(&mut raw);
+    } else {
+        for (dst, src) in raw.iter_mut().zip(view.iter()) {
+            *dst = src.to_f32();
+        }
+    }
+    ArrayD::from_shape_vec(IxDyn(&shape), raw).expect("Failed to build f16 f32 compute view")
+}
+
+fn bf16_view_to_f32_owned(view: ndarray::ArrayViewD<'_, bf16>) -> ArrayD<f32> {
+    let shape = view.shape().to_vec();
+    let mut raw = vec![0.0f32; view.len()];
+    if let Some(slice) = view.as_slice_memory_order() {
+        slice.convert_to_f32_slice(&mut raw);
+    } else {
+        for (dst, src) in raw.iter_mut().zip(view.iter()) {
+            *dst = src.to_f32();
+        }
+    }
+    ArrayD::from_shape_vec(IxDyn(&shape), raw).expect("Failed to build bf16 f32 compute view")
+}
+
+fn with_native_f32_compute_view<R>(
+    tensor: &Tensor,
+    f: impl FnOnce(ndarray::ArrayViewD<'_, f32>) -> R,
+) -> R {
+    tensor.with_storage_view_preferring(StoragePreference::Native, |view| match view {
+        TensorStorageView::F32(view) => f(view),
+        TensorStorageView::F16(view) => {
+            let owned = f16_view_to_f32_owned(view);
+            f(owned.view())
+        }
+        TensorStorageView::BF16(view) => {
+            let owned = bf16_view_to_f32_owned(view);
+            f(owned.view())
+        }
+    })
+}
+
+fn matmul_backward_f16_slices(
+    a: &[f16],
+    b: &[f16],
+    grad: &[f32],
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut da = vec![0.0f32; m_dim * k_dim];
+    da.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(m, da_row)| {
+            let grad_row = &grad[m * n_dim..(m + 1) * n_dim];
+            for n in 0..n_dim {
+                let g = grad_row[n];
+                let b_row = &b[n * k_dim..(n + 1) * k_dim];
+                for (dst, &bv) in da_row.iter_mut().zip(b_row.iter()) {
+                    *dst += g * bv.to_f32();
+                }
+            }
+        });
+
+    let mut db = vec![0.0f32; n_dim * k_dim];
+    db.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(n, db_row)| {
+            for m in 0..m_dim {
+                let g = grad[m * n_dim + n];
+                let a_row = &a[m * k_dim..(m + 1) * k_dim];
+                for (dst, &av) in db_row.iter_mut().zip(a_row.iter()) {
+                    *dst += g * av.to_f32();
+                }
+            }
+        });
+
+    (da, db)
+}
+
+fn matmul_backward_bf16_slices(
+    a: &[bf16],
+    b: &[bf16],
+    grad: &[f32],
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut da = vec![0.0f32; m_dim * k_dim];
+    da.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(m, da_row)| {
+            let grad_row = &grad[m * n_dim..(m + 1) * n_dim];
+            for n in 0..n_dim {
+                let g = grad_row[n];
+                let b_row = &b[n * k_dim..(n + 1) * k_dim];
+                for (dst, &bv) in da_row.iter_mut().zip(b_row.iter()) {
+                    *dst += g * bv.to_f32();
+                }
+            }
+        });
+
+    let mut db = vec![0.0f32; n_dim * k_dim];
+    db.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(n, db_row)| {
+            for m in 0..m_dim {
+                let g = grad[m * n_dim + n];
+                let a_row = &a[m * k_dim..(m + 1) * k_dim];
+                for (dst, &av) in db_row.iter_mut().zip(a_row.iter()) {
+                    *dst += g * av.to_f32();
+                }
+            }
+        });
+
+    (da, db)
+}
+
+fn matmul_backward_i8_slices(
+    a: &[i8],
+    a_scale: f32,
+    b: &[i8],
+    b_scale: f32,
+    grad: &[f32],
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut da = vec![0.0f32; m_dim * k_dim];
+    da.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(m, da_row)| {
+            let grad_row = &grad[m * n_dim..(m + 1) * n_dim];
+            for n in 0..n_dim {
+                let g = grad_row[n] * b_scale;
+                let b_row = &b[n * k_dim..(n + 1) * k_dim];
+                for (dst, &bv) in da_row.iter_mut().zip(b_row.iter()) {
+                    *dst += g * (bv as f32);
+                }
+            }
+        });
+
+    let mut db = vec![0.0f32; n_dim * k_dim];
+    db.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(n, db_row)| {
+            for m in 0..m_dim {
+                let g = grad[m * n_dim + n] * a_scale;
+                let a_row = &a[m * k_dim..(m + 1) * k_dim];
+                for (dst, &av) in db_row.iter_mut().zip(a_row.iter()) {
+                    *dst += g * (av as f32);
+                }
+            }
+        });
+
+    (da, db)
+}
+
+fn matmul_backward_rhs_i8_slices<T: DotElem>(
+    a: &[T],
+    b: &[i8],
+    b_scale: f32,
+    grad: &[f32],
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut da = vec![0.0f32; m_dim * k_dim];
+    da.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(m, da_row)| {
+            let grad_row = &grad[m * n_dim..(m + 1) * n_dim];
+            for n in 0..n_dim {
+                let g = grad_row[n] * b_scale;
+                let b_row = &b[n * k_dim..(n + 1) * k_dim];
+                for (dst, &bv) in da_row.iter_mut().zip(b_row.iter()) {
+                    *dst += g * (bv as f32);
+                }
+            }
+        });
+
+    let mut db = vec![0.0f32; n_dim * k_dim];
+    db.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(n, db_row)| {
+            for m in 0..m_dim {
+                let g = grad[m * n_dim + n];
+                let a_row = &a[m * k_dim..(m + 1) * k_dim];
+                for (dst, &av) in db_row.iter_mut().zip(a_row.iter()) {
+                    *dst += g * av.to_f32();
+                }
+            }
+        });
+
+    (da, db)
+}
+
+fn matmul_backward_lhs_i8_slices<T: DotElem>(
+    a: &[i8],
+    a_scale: f32,
+    b: &[T],
+    grad: &[f32],
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut da = vec![0.0f32; m_dim * k_dim];
+    da.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(m, da_row)| {
+            let grad_row = &grad[m * n_dim..(m + 1) * n_dim];
+            for n in 0..n_dim {
+                let g = grad_row[n];
+                let b_row = &b[n * k_dim..(n + 1) * k_dim];
+                for (dst, &bv) in da_row.iter_mut().zip(b_row.iter()) {
+                    *dst += g * bv.to_f32();
+                }
+            }
+        });
+
+    let mut db = vec![0.0f32; n_dim * k_dim];
+    db.par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(n, db_row)| {
+            for m in 0..m_dim {
+                let g = grad[m * n_dim + n] * a_scale;
+                let a_row = &a[m * k_dim..(m + 1) * k_dim];
+                for (dst, &av) in db_row.iter_mut().zip(a_row.iter()) {
+                    *dst += g * (av as f32);
+                }
+            }
+        });
+
+    (da, db)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_matmul_backward_typed_slices<T: DotElem>(
+    lhs: &[T],
+    rhs: &[T],
+    grad: &[f32],
+    batch_count: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut d_lhs = vec![0.0f32; batch_count * m_dim * k_dim];
+    d_lhs
+        .par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(batch_row, d_lhs_row)| {
+            let batch = batch_row / m_dim;
+            let row = batch_row - batch * m_dim;
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            let rhs_batch = &rhs[batch * k_dim * n_dim..(batch + 1) * k_dim * n_dim];
+            let grad_row = &grad_batch[row * n_dim..(row + 1) * n_dim];
+            for kk in 0..k_dim {
+                let mut acc = 0.0f32;
+                for col in 0..n_dim {
+                    acc += grad_row[col] * rhs_batch[kk * n_dim + col].to_f32();
+                }
+                d_lhs_row[kk] = acc;
+            }
+        });
+
+    let mut d_rhs = vec![0.0f32; batch_count * k_dim * n_dim];
+    d_rhs
+        .par_chunks_mut(n_dim)
+        .enumerate()
+        .for_each(|(batch_kk, d_rhs_row)| {
+            let batch = batch_kk / k_dim;
+            let kk = batch_kk - batch * k_dim;
+            let lhs_batch = &lhs[batch * m_dim * k_dim..(batch + 1) * m_dim * k_dim];
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            for col in 0..n_dim {
+                let mut acc = 0.0f32;
+                for row in 0..m_dim {
+                    acc += lhs_batch[row * k_dim + kk].to_f32() * grad_batch[row * n_dim + col];
+                }
+                d_rhs_row[col] = acc;
+            }
+        });
+
+    (d_lhs, d_rhs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_matmul_backward_i8_slices(
+    lhs: &[i8],
+    lhs_scale: f32,
+    rhs: &[i8],
+    rhs_scale: f32,
+    grad: &[f32],
+    batch_count: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut d_lhs = vec![0.0f32; batch_count * m_dim * k_dim];
+    d_lhs
+        .par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(batch_row, d_lhs_row)| {
+            let batch = batch_row / m_dim;
+            let row = batch_row - batch * m_dim;
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            let rhs_batch = &rhs[batch * k_dim * n_dim..(batch + 1) * k_dim * n_dim];
+            let grad_row = &grad_batch[row * n_dim..(row + 1) * n_dim];
+            for kk in 0..k_dim {
+                let mut acc = 0.0f32;
+                for col in 0..n_dim {
+                    acc += grad_row[col] * (rhs_batch[kk * n_dim + col] as f32) * rhs_scale;
+                }
+                d_lhs_row[kk] = acc;
+            }
+        });
+
+    let mut d_rhs = vec![0.0f32; batch_count * k_dim * n_dim];
+    d_rhs
+        .par_chunks_mut(n_dim)
+        .enumerate()
+        .for_each(|(batch_kk, d_rhs_row)| {
+            let batch = batch_kk / k_dim;
+            let kk = batch_kk - batch * k_dim;
+            let lhs_batch = &lhs[batch * m_dim * k_dim..(batch + 1) * m_dim * k_dim];
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            for col in 0..n_dim {
+                let mut acc = 0.0f32;
+                for row in 0..m_dim {
+                    acc += (lhs_batch[row * k_dim + kk] as f32)
+                        * lhs_scale
+                        * grad_batch[row * n_dim + col];
+                }
+                d_rhs_row[col] = acc;
+            }
+        });
+
+    (d_lhs, d_rhs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_matmul_backward_rhs_i8_slices<T: DotElem>(
+    lhs: &[T],
+    rhs: &[i8],
+    rhs_scale: f32,
+    grad: &[f32],
+    batch_count: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut d_lhs = vec![0.0f32; batch_count * m_dim * k_dim];
+    d_lhs
+        .par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(batch_row, d_lhs_row)| {
+            let batch = batch_row / m_dim;
+            let row = batch_row - batch * m_dim;
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            let rhs_batch = &rhs[batch * k_dim * n_dim..(batch + 1) * k_dim * n_dim];
+            let grad_row = &grad_batch[row * n_dim..(row + 1) * n_dim];
+            for kk in 0..k_dim {
+                let mut acc = 0.0f32;
+                for col in 0..n_dim {
+                    acc += grad_row[col] * (rhs_batch[kk * n_dim + col] as f32) * rhs_scale;
+                }
+                d_lhs_row[kk] = acc;
+            }
+        });
+
+    let mut d_rhs = vec![0.0f32; batch_count * k_dim * n_dim];
+    d_rhs
+        .par_chunks_mut(n_dim)
+        .enumerate()
+        .for_each(|(batch_kk, d_rhs_row)| {
+            let batch = batch_kk / k_dim;
+            let kk = batch_kk - batch * k_dim;
+            let lhs_batch = &lhs[batch * m_dim * k_dim..(batch + 1) * m_dim * k_dim];
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            for col in 0..n_dim {
+                let mut acc = 0.0f32;
+                for row in 0..m_dim {
+                    acc += lhs_batch[row * k_dim + kk].to_f32() * grad_batch[row * n_dim + col];
+                }
+                d_rhs_row[col] = acc;
+            }
+        });
+
+    (d_lhs, d_rhs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_matmul_backward_lhs_i8_slices<T: DotElem>(
+    lhs: &[i8],
+    lhs_scale: f32,
+    rhs: &[T],
+    grad: &[f32],
+    batch_count: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut d_lhs = vec![0.0f32; batch_count * m_dim * k_dim];
+    d_lhs
+        .par_chunks_mut(k_dim)
+        .enumerate()
+        .for_each(|(batch_row, d_lhs_row)| {
+            let batch = batch_row / m_dim;
+            let row = batch_row - batch * m_dim;
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            let rhs_batch = &rhs[batch * k_dim * n_dim..(batch + 1) * k_dim * n_dim];
+            let grad_row = &grad_batch[row * n_dim..(row + 1) * n_dim];
+            for kk in 0..k_dim {
+                let mut acc = 0.0f32;
+                for col in 0..n_dim {
+                    acc += grad_row[col] * rhs_batch[kk * n_dim + col].to_f32();
+                }
+                d_lhs_row[kk] = acc;
+            }
+        });
+
+    let mut d_rhs = vec![0.0f32; batch_count * k_dim * n_dim];
+    d_rhs
+        .par_chunks_mut(n_dim)
+        .enumerate()
+        .for_each(|(batch_kk, d_rhs_row)| {
+            let batch = batch_kk / k_dim;
+            let kk = batch_kk - batch * k_dim;
+            let lhs_batch = &lhs[batch * m_dim * k_dim..(batch + 1) * m_dim * k_dim];
+            let grad_batch = &grad[batch * m_dim * n_dim..(batch + 1) * m_dim * n_dim];
+            for col in 0..n_dim {
+                let mut acc = 0.0f32;
+                for row in 0..m_dim {
+                    acc += (lhs_batch[row * k_dim + kk] as f32)
+                        * lhs_scale
+                        * grad_batch[row * n_dim + col];
+                }
+                d_rhs_row[col] = acc;
+            }
+        });
+
+    (d_lhs, d_rhs)
+}
+
+fn try_matmul_backward_cpu_native_lowp(
+    a: &Tensor,
+    b: &Tensor,
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Option<(ndarray::ArrayD<f32>, ndarray::ArrayD<f32>)> {
+    if grad.len() != m_dim * n_dim {
+        return None;
+    }
+
+    macro_rules! slice_or_owned {
+        ($array:expr, $owned:ident) => {
+            if let Some(slice) = $array.as_slice_memory_order() {
+                slice
+            } else {
+                $owned = $array.iter().copied().collect::<Vec<_>>();
+                $owned.as_slice()
+            }
+        };
+    }
+
+    let grad_owned;
+    let grad_slice = if let Some(slice) = grad.as_slice_memory_order() {
+        slice
+    } else {
+        grad_owned = grad.iter().copied().collect::<Vec<_>>();
+        grad_owned.as_slice()
+    };
+    let a_shape = a.shape_vec();
+
+    let (da, db) = match (a.native_storage_owned(), b.native_storage_owned()) {
+        (TensorStorageOwned::F16(a_data), TensorStorageOwned::F16(b_data)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_f16_slices(
+                slice_or_owned!(a_data, a_owned),
+                slice_or_owned!(b_data, b_owned),
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::BF16(a_data), TensorStorageOwned::BF16(b_data)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_bf16_slices(
+                slice_or_owned!(a_data, a_owned),
+                slice_or_owned!(b_data, b_owned),
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::I8(a_data, a_scale), TensorStorageOwned::I8(b_data, b_scale)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                a_scale,
+                slice_or_owned!(b_data, b_owned),
+                b_scale,
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::F32(a_data), TensorStorageOwned::I8(b_data, b_scale)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_rhs_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                slice_or_owned!(b_data, b_owned),
+                b_scale,
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::F16(a_data), TensorStorageOwned::I8(b_data, b_scale)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_rhs_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                slice_or_owned!(b_data, b_owned),
+                b_scale,
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::BF16(a_data), TensorStorageOwned::I8(b_data, b_scale)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_rhs_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                slice_or_owned!(b_data, b_owned),
+                b_scale,
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::I8(a_data, a_scale), TensorStorageOwned::F32(b_data)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_lhs_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                a_scale,
+                slice_or_owned!(b_data, b_owned),
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::I8(a_data, a_scale), TensorStorageOwned::F16(b_data)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_lhs_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                a_scale,
+                slice_or_owned!(b_data, b_owned),
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        (TensorStorageOwned::I8(a_data, a_scale), TensorStorageOwned::BF16(b_data)) => {
+            let a_owned;
+            let b_owned;
+            matmul_backward_lhs_i8_slices(
+                slice_or_owned!(a_data, a_owned),
+                a_scale,
+                slice_or_owned!(b_data, b_owned),
+                grad_slice,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+        }
+        _ => return None,
+    };
+
+    Some((
+        Array2::from_shape_vec((m_dim, k_dim), da)
+            .ok()?
+            .into_shape(a_shape)
+            .ok()?
+            .into_dyn(),
+        Array2::from_shape_vec((n_dim, k_dim), db).ok()?.into_dyn(),
+    ))
+}
+
+fn matmul_backward_cpu_f32(
+    a: &Tensor,
+    b: &Tensor,
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> (ndarray::ArrayD<f32>, ndarray::ArrayD<f32>) {
+    if let Some(grads) = try_matmul_backward_cpu_native_lowp(a, b, grad, m_dim, k_dim, n_dim) {
+        return grads;
+    }
+
+    let g_len = grad.len();
+    let g_m = g_len / n_dim;
+    let grad_2d = grad
+        .view()
+        .into_shape((g_m, n_dim))
+        .expect("Grad reshape failed: non-contiguous gradient?");
+    let a_shape = a.shape_vec();
+
+    with_native_f32_compute_view(a, |a_view| {
+        with_native_f32_compute_view(b, |b_view| {
+            let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
+
+            let mut da_2d = Array2::<f32>::zeros((m_dim, k_dim));
+            general_mat_mul(1.0, &grad_2d, &b_2d, 0.0, &mut da_2d);
+
+            let mut db_2d = Array2::<f32>::zeros((n_dim, k_dim));
+            if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
+                general_mat_mul(1.0, &grad_2d.t(), &a_2d, 0.0, &mut db_2d);
+            } else {
+                let a_2d_owned = a_view.to_owned().into_shape((m_dim, k_dim)).unwrap();
+                general_mat_mul(1.0, &grad_2d.t(), &a_2d_owned, 0.0, &mut db_2d);
+            }
+
+            (
+                da_2d.into_shape(a_shape).unwrap().into_dyn(),
+                db_2d.into_dyn(),
+            )
+        })
+    })
 }
 
 // A[..., K] @ B^T, where B is [N(out), K(in)]
@@ -5927,6 +8103,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: Some(buffer),
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: false,
             storage_dtype: crate::precision::DType::F32,
@@ -5978,34 +8157,11 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
                                 "CUDA matmul backward failed in strict device execution mode: {err}"
                             );
                         }
-                        let g_len = grad.len();
-                        let g_m = g_len / n_dim;
-                        let grad_2d = grad
-                            .view()
-                            .into_shape((g_m, n_dim))
-                            .expect("Grad reshape failed: non-contiguous gradient?");
-                        let (a_data, b_data) = {
-                            let ad = a_clone.0.borrow();
-                            let bd = b_clone.0.borrow();
-                            (ad.data.clone(), bd.data.clone())
-                        };
-                        let a_2d_view = a_data.view().into_shape((m_dim, k_dim_a));
-                        let a_2d_owned;
-                        let a_2d = match a_2d_view {
-                            Ok(v) => v,
-                            Err(_) => {
-                                a_2d_owned =
-                                    a_data.to_owned().into_shape((m_dim, k_dim_a)).unwrap();
-                                a_2d_owned.view()
-                            }
-                        };
-                        let b_2d = b_data.view().into_dimensionality::<Ix2>().unwrap();
-                        let mut da_2d = Array2::<f32>::zeros((m_dim, k_dim_a));
-                        general_mat_mul(1.0, &grad_2d, &b_2d, 0.0, &mut da_2d);
-                        a_clone.add_grad(da_2d.into_shape(a_data.shape()).unwrap().into_dyn());
-                        let mut db_2d = Array2::<f32>::zeros((n_dim, k_dim_a));
-                        general_mat_mul(1.0, &grad_2d.t(), &a_2d, 0.0, &mut db_2d);
-                        b_clone.add_grad(db_2d.into_dyn());
+                        let (da, db) = matmul_backward_cpu_f32(
+                            &a_clone, &b_clone, grad, m_dim, k_dim_a, n_dim,
+                        );
+                        a_clone.add_grad(da);
+                        b_clone.add_grad(db);
                     }
                 }
             })),
@@ -6016,7 +8172,6 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     }
 
     if !build_graph {
-        let input_dtype = a.dtype();
         let output_dtype = if a.dtype() == b.dtype() {
             a.dtype()
         } else {
@@ -6025,263 +8180,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         if let Some(cuda_out) = try_cuda_matmul(a, b, m_dim, n_dim, k_dim_a, output_dtype) {
             return cuda_out;
         }
-        if b.dtype() == DType::I8 {
-            let res_2d = match b.native_storage_owned() {
-                TensorStorageOwned::I8(b_data, scale) => {
-                    let b_2d = b_data
-                        .view()
-                        .into_dimensionality::<Ix2>()
-                        .expect("matmul RHS must be 2D [N, K]");
-                    let b_owned;
-                    let b_slice: &[i8] = if let Some(s) = b_2d.as_slice() {
-                        s
-                    } else {
-                        b_owned = b_2d.as_standard_layout().to_owned();
-                        b_owned
-                            .as_slice()
-                            .expect("standard-layout matmul RHS should be contiguous")
-                    };
-
-                    if input_dtype == DType::I8 {
-                        match a.native_storage_owned() {
-                            TensorStorageOwned::I8(a_data, a_scale) => {
-                                if m_dim == 1 {
-                                    let a_owned;
-                                    let a_vec: &[i8] = if let Some(s) = a_data.as_slice() {
-                                        s
-                                    } else {
-                                        a_owned = a_data.iter().copied().collect::<Vec<i8>>();
-                                        a_owned.as_slice()
-                                    };
-
-                                    let mut out_vec = vec![0.0f32; n_dim];
-                                    matvec_rowmajor_parallel_i8_i8(
-                                        a_vec,
-                                        a_scale,
-                                        b_slice,
-                                        scale,
-                                        n_dim,
-                                        k_dim_a,
-                                        &mut out_vec,
-                                    );
-                                    Array2::from_shape_vec((1, n_dim), out_vec)
-                                        .expect("decode matvec shape build failed")
-                                } else {
-                                    matmul_rows_i8_slice(
-                                        a_data.view().into_dyn(),
-                                        a_scale,
-                                        SliceRef::I8(b_slice, scale),
-                                        m_dim,
-                                        k_dim_a,
-                                        n_dim,
-                                    )
-                                }
-                            }
-                            TensorStorageOwned::F32(_)
-                            | TensorStorageOwned::F16(_)
-                            | TensorStorageOwned::BF16(_) => {
-                                unreachable!("checked i8 lhs above")
-                            }
-                        }
-                    } else {
-                        a.with_storage_view_preferring(StoragePreference::Native, |a_view| {
-                            if m_dim == 1 {
-                                match a_view {
-                                    TensorStorageView::F32(a_view) => {
-                                        let a_owned;
-                                        let a_vec: &[f32] = if let Some(s) = a_view.as_slice() {
-                                            s
-                                        } else {
-                                            a_owned = a_view.iter().copied().collect::<Vec<f32>>();
-                                            a_owned.as_slice()
-                                        };
-
-                                        let mut out_vec = vec![0.0f32; n_dim];
-                                        matvec_rowmajor_parallel_f32_i8_matmul(
-                                            a_vec,
-                                            b_slice,
-                                            scale,
-                                            n_dim,
-                                            k_dim_a,
-                                            &mut out_vec,
-                                        );
-                                        Array2::from_shape_vec((1, n_dim), out_vec)
-                                            .expect("decode matvec shape build failed")
-                                    }
-                                    TensorStorageView::F16(a_view) => {
-                                        let a_owned;
-                                        let a_vec: &[f16] = if let Some(s) = a_view.as_slice() {
-                                            s
-                                        } else {
-                                            a_owned = a_view.iter().copied().collect::<Vec<f16>>();
-                                            a_owned.as_slice()
-                                        };
-
-                                        let mut out_vec = vec![0.0f32; n_dim];
-                                        with_f16_input_as_f32(a_vec, |a_f32| {
-                                            matvec_rowmajor_parallel_f32_i8_matmul(
-                                                a_f32,
-                                                b_slice,
-                                                scale,
-                                                n_dim,
-                                                k_dim_a,
-                                                &mut out_vec,
-                                            );
-                                        });
-                                        Array2::from_shape_vec((1, n_dim), out_vec)
-                                            .expect("decode matvec shape build failed")
-                                    }
-                                    TensorStorageView::BF16(a_view) => {
-                                        let a_owned;
-                                        let a_vec: &[bf16] = if let Some(s) = a_view.as_slice() {
-                                            s
-                                        } else {
-                                            a_owned = a_view.iter().copied().collect::<Vec<bf16>>();
-                                            a_owned.as_slice()
-                                        };
-
-                                        let mut out_vec = vec![0.0f32; n_dim];
-                                        with_bf16_input_as_f32(a_vec, |a_f32| {
-                                            matvec_rowmajor_parallel_f32_i8_matmul(
-                                                a_f32,
-                                                b_slice,
-                                                scale,
-                                                n_dim,
-                                                k_dim_a,
-                                                &mut out_vec,
-                                            );
-                                        });
-                                        Array2::from_shape_vec((1, n_dim), out_vec)
-                                            .expect("decode matvec shape build failed")
-                                    }
-                                }
-                            } else {
-                                let b_view = b_data.view().into_dyn();
-                                match a_view {
-                                    TensorStorageView::F32(a_view) => matmul_rows_f32_i8(
-                                        a_view, b_view, scale, m_dim, k_dim_a, n_dim,
-                                    ),
-                                    TensorStorageView::F16(a_view) => matmul_rows_f16_slice(
-                                        a_view,
-                                        SliceRef::I8(b_slice, scale),
-                                        m_dim,
-                                        k_dim_a,
-                                        n_dim,
-                                    ),
-                                    TensorStorageView::BF16(a_view) => matmul_rows_bf16_i8(
-                                        a_view, b_view, scale, m_dim, k_dim_a, n_dim,
-                                    ),
-                                }
-                            }
-                        })
-                    }
-                }
-                TensorStorageOwned::F32(_)
-                | TensorStorageOwned::F16(_)
-                | TensorStorageOwned::BF16(_) => unreachable!("checked i8 RHS above"),
-            };
-
-            let mut out_shape = a_shape.clone();
-            let last_idx = out_shape.len() - 1;
-            out_shape[last_idx] = n_dim;
-            return Tensor::from_f32_data_no_grad_with_device_dtype(
-                res_2d.into_shape(out_shape).unwrap().into_dyn(),
-                output_dtype,
-                output_device,
-            );
-        }
-        let res_2d = a.with_storage_view_preferring(StoragePreference::Native, |a_view| {
-            b.with_storage_view_for_input_dtype_and_route(
-                input_dtype,
-                KernelRouteClass::GenericMatmul,
-                |b_view| match (a_view, b_view) {
-                    (TensorStorageView::F32(a_view), TensorStorageView::F32(b_view)) => {
-                        if m_dim == 1 {
-                            let a_owned;
-                            let a_vec: &[f32] = if let Some(s) = a_view.as_slice() {
-                                s
-                            } else {
-                                a_owned = a_view.iter().copied().collect::<Vec<f32>>();
-                                a_owned.as_slice()
-                            };
-
-                            let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
-                            let b_owned;
-                            let b_slice: &[f32] = if let Some(s) = b_2d.as_slice() {
-                                s
-                            } else {
-                                b_owned = b_2d.as_standard_layout().to_owned();
-                                b_owned
-                                    .as_slice()
-                                    .expect("standard-layout matmul RHS should be contiguous")
-                            };
-
-                            let mut out_vec = vec![0.0f32; n_dim];
-                            matvec_rowmajor_parallel(a_vec, b_slice, n_dim, k_dim_a, &mut out_vec);
-                            Array2::from_shape_vec((1, n_dim), out_vec)
-                                .expect("decode matvec shape build failed")
-                        } else {
-                            let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
-                            let mut res = Array2::<f32>::zeros((m_dim, n_dim));
-                            if let Ok(a_2d_view) = a_view.clone().into_shape((m_dim, k_dim_a)) {
-                                general_mat_mul(1.0, &a_2d_view, &b_2d.t(), 0.0, &mut res);
-                            } else {
-                                let a_2d_owned = a_view
-                                    .to_owned()
-                                    .into_shape((m_dim, k_dim_a))
-                                    .expect("Reshape A failed");
-                                general_mat_mul(1.0, &a_2d_owned, &b_2d.t(), 0.0, &mut res);
-                            }
-                            res
-                        }
-                    }
-                    (TensorStorageView::F32(a_view), TensorStorageView::F16(b_view)) => {
-                        matmul_rows_f32_f16(a_view, b_view, m_dim, k_dim_a, n_dim)
-                    }
-                    (TensorStorageView::F32(a_view), TensorStorageView::BF16(b_view)) => {
-                        matmul_rows_f32_bf16(a_view, b_view, m_dim, k_dim_a, n_dim)
-                    }
-                    (TensorStorageView::F16(a_view), TensorStorageView::F32(b_view)) => {
-                        matmul_rows_f16_f32(a_view, b_view, m_dim, k_dim_a, n_dim)
-                    }
-                    (TensorStorageView::F16(a_view), TensorStorageView::F16(b_view)) => {
-                        matmul_rows_f16_f16(a_view, b_view, m_dim, k_dim_a, n_dim)
-                    }
-                    (TensorStorageView::F16(a_view), TensorStorageView::BF16(b_view)) => {
-                        let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
-                        matmul_rows_f16_slice(
-                            a_view,
-                            SliceRef::BF16(
-                                b_2d.as_slice()
-                                    .expect("standard-layout matmul RHS should be contiguous"),
-                            ),
-                            m_dim,
-                            k_dim_a,
-                            n_dim,
-                        )
-                    }
-                    (TensorStorageView::BF16(a_view), TensorStorageView::F32(b_view)) => {
-                        matmul_rows_bf16_f32(a_view, b_view, m_dim, k_dim_a, n_dim)
-                    }
-                    (TensorStorageView::BF16(a_view), TensorStorageView::F16(b_view)) => {
-                        let b_2d = b_view.into_dimensionality::<Ix2>().unwrap();
-                        matmul_rows_bf16_slice(
-                            a_view,
-                            SliceRef::F16(
-                                b_2d.as_slice()
-                                    .expect("standard-layout matmul RHS should be contiguous"),
-                            ),
-                            m_dim,
-                            k_dim_a,
-                            n_dim,
-                        )
-                    }
-                    (TensorStorageView::BF16(a_view), TensorStorageView::BF16(b_view)) => {
-                        matmul_rows_bf16_bf16(a_view, b_view, m_dim, k_dim_a, n_dim)
-                    }
-                },
-            )
-        });
+        let res_2d = matmul_forward_cpu_native(a, b, m_dim, k_dim_a, n_dim);
 
         let mut out_shape = a_shape.clone();
         let last_idx = out_shape.len() - 1;
@@ -6293,52 +8192,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         );
     }
 
-    let res_2d = if m_dim == 1 {
-        let ad = a.data_ref();
-        let bd = b.data_ref();
-
-        let a_owned;
-        let a_vec: &[f32] = if let Some(s) = ad.as_slice() {
-            s
-        } else {
-            a_owned = ad.iter().copied().collect::<Vec<f32>>();
-            a_owned.as_slice()
-        };
-
-        let b_2d = bd.view().into_dimensionality::<Ix2>().unwrap();
-        let mut out_vec = vec![0.0f32; n_dim];
-
-        let b_owned;
-        let b_slice: &[f32] = if let Some(s) = b_2d.as_slice() {
-            s
-        } else {
-            b_owned = b_2d.as_standard_layout().to_owned();
-            b_owned
-                .as_slice()
-                .expect("standard-layout matmul RHS should be contiguous")
-        };
-        matvec_rowmajor_parallel(a_vec, b_slice, n_dim, k_dim_a, &mut out_vec);
-
-        Array2::from_shape_vec((1, n_dim), out_vec).expect("decode matvec shape build failed")
-    } else {
-        let ad = a.data_ref();
-        let bd = b.data_ref();
-
-        let b_2d = bd.view().into_dimensionality::<Ix2>().unwrap();
-        let mut res = Array2::<f32>::zeros((m_dim, n_dim));
-
-        if let Ok(a_2d_view) = ad.view().into_shape((m_dim, k_dim_a)) {
-            general_mat_mul(1.0, &a_2d_view, &b_2d.t(), 0.0, &mut res);
-        } else {
-            let a_2d_owned = ad
-                .to_owned()
-                .into_shape((m_dim, k_dim_a))
-                .expect("Reshape A failed");
-            general_mat_mul(1.0, &a_2d_owned, &b_2d.t(), 0.0, &mut res);
-        }
-
-        res
-    };
+    let res_2d = matmul_forward_cpu_native(a, b, m_dim, k_dim_a, n_dim);
 
     let mut out_shape = a_shape.clone();
     let last_idx = out_shape.len() - 1;
@@ -6355,6 +8209,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -6365,42 +8222,268 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         parents: vec![a_clone.clone(), b_clone.clone()],
         requires_grad: true,
         backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
-            let g_len = grad.len();
-            let g_m = g_len / n_dim;
-
-            let grad_2d = grad
-                .view()
-                .into_shape((g_m, n_dim))
-                .expect("Grad reshape failed: non-contiguous gradient?");
-
-            let (a_data, b_data) = {
-                let ad = a_clone.0.borrow();
-                let bd = b_clone.0.borrow();
-                (ad.data.clone(), bd.data.clone())
-            };
-
-            let a_2d_view = a_data.view().into_shape((m_dim, k_dim_a));
-            let a_2d_owned;
-            let a_2d = match a_2d_view {
-                Ok(v) => v,
-                Err(_) => {
-                    a_2d_owned = a_data.to_owned().into_shape((m_dim, k_dim_a)).unwrap();
-                    a_2d_owned.view()
-                }
-            };
-
-            let b_2d = b_data.view().into_dimensionality::<Ix2>().unwrap();
-
-            let mut da_2d = Array2::<f32>::zeros((m_dim, k_dim_a));
-            general_mat_mul(1.0, &grad_2d, &b_2d, 0.0, &mut da_2d);
-            a_clone.add_grad(da_2d.into_shape(a_data.shape()).unwrap().into_dyn());
-
-            let mut db_2d = Array2::<f32>::zeros((n_dim, k_dim_a));
-            general_mat_mul(1.0, &grad_2d.t(), &a_2d, 0.0, &mut db_2d);
-            b_clone.add_grad(db_2d.into_dyn());
+            let (da, db) = matmul_backward_cpu_f32(&a_clone, &b_clone, grad, m_dim, k_dim_a, n_dim);
+            a_clone.add_grad(da);
+            b_clone.add_grad(db);
         })),
         device: output_device,
     })))
+}
+
+fn batch_matmul_forward_cpu_f32(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    b: usize,
+    h: usize,
+    m: usize,
+    n: usize,
+) -> ndarray::ArrayD<f32> {
+    with_native_f32_compute_view(lhs, |lhs_view| {
+        with_native_f32_compute_view(rhs, |rhs_view| {
+            let lhs_view = lhs_view.into_dimensionality::<Ix4>().unwrap();
+            let rhs_view = rhs_view.into_dimensionality::<Ix4>().unwrap();
+            let mut output = Array4::<f32>::zeros((b, h, m, n));
+
+            Zip::from(output.outer_iter_mut())
+                .and(lhs_view.outer_iter())
+                .and(rhs_view.outer_iter())
+                .for_each(|mut out_batch, lhs_batch, rhs_batch| {
+                    Zip::from(out_batch.outer_iter_mut())
+                        .and(lhs_batch.outer_iter())
+                        .and(rhs_batch.outer_iter())
+                        .for_each(|mut out_mat, lhs_mat, rhs_mat| {
+                            general_mat_mul(1.0, &lhs_mat, &rhs_mat, 0.0, &mut out_mat);
+                        });
+                });
+
+            output.into_dyn()
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_batch_matmul_backward_cpu_native_lowp(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<(ndarray::ArrayD<f32>, ndarray::ArrayD<f32>)> {
+    if grad.len() != b * h * m * n {
+        return None;
+    }
+
+    macro_rules! slice_or_owned {
+        ($array:expr, $owned:ident) => {
+            if let Some(slice) = $array.as_slice_memory_order() {
+                slice
+            } else {
+                $owned = $array.iter().copied().collect::<Vec<_>>();
+                $owned.as_slice()
+            }
+        };
+    }
+
+    let grad_owned;
+    let grad_slice = if let Some(slice) = grad.as_slice_memory_order() {
+        slice
+    } else {
+        grad_owned = grad.iter().copied().collect::<Vec<_>>();
+        grad_owned.as_slice()
+    };
+    let batch_count = b.checked_mul(h)?;
+
+    let (d_lhs, d_rhs) = match (lhs.native_storage_owned(), rhs.native_storage_owned()) {
+        (TensorStorageOwned::F16(lhs_data), TensorStorageOwned::F16(rhs_data)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_typed_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                slice_or_owned!(rhs_data, rhs_owned),
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::BF16(lhs_data), TensorStorageOwned::BF16(rhs_data)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_typed_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                slice_or_owned!(rhs_data, rhs_owned),
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (
+            TensorStorageOwned::I8(lhs_data, lhs_scale),
+            TensorStorageOwned::I8(rhs_data, rhs_scale),
+        ) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                lhs_scale,
+                slice_or_owned!(rhs_data, rhs_owned),
+                rhs_scale,
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::F32(lhs_data), TensorStorageOwned::I8(rhs_data, rhs_scale)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_rhs_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                slice_or_owned!(rhs_data, rhs_owned),
+                rhs_scale,
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::F16(lhs_data), TensorStorageOwned::I8(rhs_data, rhs_scale)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_rhs_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                slice_or_owned!(rhs_data, rhs_owned),
+                rhs_scale,
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::BF16(lhs_data), TensorStorageOwned::I8(rhs_data, rhs_scale)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_rhs_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                slice_or_owned!(rhs_data, rhs_owned),
+                rhs_scale,
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::I8(lhs_data, lhs_scale), TensorStorageOwned::F32(rhs_data)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_lhs_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                lhs_scale,
+                slice_or_owned!(rhs_data, rhs_owned),
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::I8(lhs_data, lhs_scale), TensorStorageOwned::F16(rhs_data)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_lhs_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                lhs_scale,
+                slice_or_owned!(rhs_data, rhs_owned),
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        (TensorStorageOwned::I8(lhs_data, lhs_scale), TensorStorageOwned::BF16(rhs_data)) => {
+            let lhs_owned;
+            let rhs_owned;
+            batch_matmul_backward_lhs_i8_slices(
+                slice_or_owned!(lhs_data, lhs_owned),
+                lhs_scale,
+                slice_or_owned!(rhs_data, rhs_owned),
+                grad_slice,
+                batch_count,
+                m,
+                k,
+                n,
+            )
+        }
+        _ => return None,
+    };
+
+    Some((
+        Array4::from_shape_vec((b, h, m, k), d_lhs).ok()?.into_dyn(),
+        Array4::from_shape_vec((b, h, k, n), d_rhs).ok()?.into_dyn(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_matmul_backward_cpu_f32(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (ndarray::ArrayD<f32>, ndarray::ArrayD<f32>) {
+    if let Some(grads) = try_batch_matmul_backward_cpu_native_lowp(lhs, rhs, grad, b, h, m, k, n) {
+        return grads;
+    }
+
+    let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
+    with_native_f32_compute_view(lhs, |lhs_view| {
+        with_native_f32_compute_view(rhs, |rhs_view| {
+            let lhs_view = lhs_view.into_dimensionality::<Ix4>().unwrap();
+            let rhs_view = rhs_view.into_dimensionality::<Ix4>().unwrap();
+
+            let mut d_lhs = Array4::<f32>::zeros((b, h, m, k));
+            Zip::from(d_lhs.outer_iter_mut())
+                .and(grad_view.outer_iter())
+                .and(rhs_view.outer_iter())
+                .for_each(|mut d_l_b, g_b, r_b| {
+                    Zip::from(d_l_b.outer_iter_mut())
+                        .and(g_b.outer_iter())
+                        .and(r_b.outer_iter())
+                        .for_each(|mut d_l_mat, g_mat, r_mat| {
+                            general_mat_mul(1.0, &g_mat, &r_mat.t(), 0.0, &mut d_l_mat);
+                        });
+                });
+
+            let mut d_rhs = Array4::<f32>::zeros((b, h, k, n));
+            Zip::from(d_rhs.outer_iter_mut())
+                .and(lhs_view.outer_iter())
+                .and(grad_view.outer_iter())
+                .for_each(|mut d_r_b, l_b, g_b| {
+                    Zip::from(d_r_b.outer_iter_mut())
+                        .and(l_b.outer_iter())
+                        .and(g_b.outer_iter())
+                        .for_each(|mut d_r_mat, l_mat, g_mat| {
+                            general_mat_mul(1.0, &l_mat.t(), &g_mat, 0.0, &mut d_r_mat);
+                        });
+                });
+
+            (d_lhs.into_dyn(), d_rhs.into_dyn())
+        })
+    })
 }
 
 // lhs: [B, H, M, K]
@@ -6423,6 +8506,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     assert_eq!(b, b2, "batch dim mismatch");
     assert_eq!(h, h2, "head dim mismatch");
     assert_eq!(k, k2, "k dim mismatch");
+    let dims = BatchMatmulDims { b, h, m, k, n };
 
     if build_graph
         && output_device == crate::autograd::Device::Cuda
@@ -6439,6 +8523,9 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: Some(buffer),
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: false,
             storage_dtype: crate::precision::DType::F32,
@@ -6459,11 +8546,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
                         cuda_grad.clone(),
                         &lhs_clone,
                         &rhs_clone,
-                        b,
-                        h,
-                        m,
-                        k,
-                        n,
+                        dims,
                     ) {
                         Ok((d_lhs_buf, d_rhs_buf)) => {
                             lhs_clone.add_cuda_grad_buffer_only(d_lhs_buf);
@@ -6478,7 +8561,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
                     }
                 }
                 let cuda_result = try_cuda_training_batch_matmul_backward(
-                    grad, cuda_grad, &lhs_clone, &rhs_clone, b, h, m, k, n,
+                    grad, cuda_grad, &lhs_clone, &rhs_clone, dims,
                 );
                 match cuda_result {
                     Ok(((d_lhs, d_lhs_buf), (d_rhs, d_rhs_buf))) => {
@@ -6491,37 +8574,11 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
                                 "CUDA batch_matmul backward failed in strict device execution mode: {err}"
                             );
                         }
-                        let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
-                        let l_data = lhs_clone.0.borrow().data.clone();
-                        let r_data = rhs_clone.0.borrow().data.clone();
-                        let l_view_4d = l_data.view().into_dimensionality::<Ix4>().unwrap();
-                        let r_view_4d = r_data.view().into_dimensionality::<Ix4>().unwrap();
-                        let mut d_lhs = Array4::<f32>::zeros((b, h, m, k));
-                        Zip::from(d_lhs.outer_iter_mut())
-                            .and(grad_view.outer_iter())
-                            .and(r_view_4d.outer_iter())
-                            .for_each(|mut d_l_b, g_b, r_b| {
-                                Zip::from(d_l_b.outer_iter_mut())
-                                    .and(g_b.outer_iter())
-                                    .and(r_b.outer_iter())
-                                    .for_each(|mut d_l_mat, g_mat, r_mat| {
-                                        general_mat_mul(1.0, &g_mat, &r_mat.t(), 0.0, &mut d_l_mat);
-                                    });
-                            });
-                        lhs_clone.add_grad(d_lhs.into_dyn());
-                        let mut d_rhs = Array4::<f32>::zeros((b, h, k, n));
-                        Zip::from(d_rhs.outer_iter_mut())
-                            .and(l_view_4d.outer_iter())
-                            .and(grad_view.outer_iter())
-                            .for_each(|mut d_r_b, l_b, g_b| {
-                                Zip::from(d_r_b.outer_iter_mut())
-                                    .and(l_b.outer_iter())
-                                    .and(g_b.outer_iter())
-                                    .for_each(|mut d_r_mat, l_mat, g_mat| {
-                                        general_mat_mul(1.0, &l_mat.t(), &g_mat, 0.0, &mut d_r_mat);
-                                    });
-                            });
-                        rhs_clone.add_grad(d_rhs.into_dyn());
+                        let (d_lhs, d_rhs) = batch_matmul_backward_cpu_f32(
+                            &lhs_clone, &rhs_clone, grad, b, h, m, k, n,
+                        );
+                        lhs_clone.add_grad(d_lhs);
+                        rhs_clone.add_grad(d_rhs);
                     }
                 }
             })),
@@ -6538,50 +8595,10 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         } else {
             DType::F32
         };
-        if let Some(cuda_out) = try_cuda_batch_matmul(lhs, rhs, b, h, m, k, n, output_dtype) {
+        if let Some(cuda_out) = try_cuda_batch_matmul(lhs, rhs, dims, output_dtype) {
             return cuda_out;
         }
-        let output_dyn =
-            lhs.with_storage_view_preferring(StoragePreference::F32Compute, |lhs_view| {
-                rhs.with_storage_view_preferring(StoragePreference::F32Compute, |rhs_view| {
-                    let lhs_view = match lhs_view {
-                        TensorStorageView::F32(view) => view,
-                        TensorStorageView::F16(_) => {
-                            unreachable!("f32 compute preference should expose f32 view")
-                        }
-                        TensorStorageView::BF16(_) => {
-                            unreachable!("f32 compute preference should expose f32 view")
-                        }
-                    };
-                    let rhs_view = match rhs_view {
-                        TensorStorageView::F32(view) => view,
-                        TensorStorageView::F16(_) => {
-                            unreachable!("f32 compute preference should expose f32 view")
-                        }
-                        TensorStorageView::BF16(_) => {
-                            unreachable!("f32 compute preference should expose f32 view")
-                        }
-                    };
-
-                    let lhs_view = lhs_view.into_dimensionality::<Ix4>().unwrap();
-                    let rhs_view = rhs_view.into_dimensionality::<Ix4>().unwrap();
-                    let mut output = Array4::<f32>::zeros((b, h, m, n));
-
-                    Zip::from(output.outer_iter_mut())
-                        .and(lhs_view.outer_iter())
-                        .and(rhs_view.outer_iter())
-                        .for_each(|mut out_batch, lhs_batch, rhs_batch| {
-                            Zip::from(out_batch.outer_iter_mut())
-                                .and(lhs_batch.outer_iter())
-                                .and(rhs_batch.outer_iter())
-                                .for_each(|mut out_mat, lhs_mat, rhs_mat| {
-                                    general_mat_mul(1.0, &lhs_mat, &rhs_mat, 0.0, &mut out_mat);
-                                });
-                        });
-
-                    output.into_dyn()
-                })
-            });
+        let output_dyn = batch_matmul_forward_cpu_f32(lhs, rhs, b, h, m, n);
 
         return Tensor::from_f32_data_no_grad_with_device_dtype(
             output_dyn,
@@ -6590,27 +8607,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         );
     }
 
-    let lhs_ref = lhs.data_ref();
-    let rhs_ref = rhs.data_ref();
-
-    let lhs_view = lhs_ref.view().into_dimensionality::<Ix4>().unwrap();
-    let rhs_view = rhs_ref.view().into_dimensionality::<Ix4>().unwrap();
-
-    let mut output = Array4::<f32>::zeros((b, h, m, n));
-
-    Zip::from(output.outer_iter_mut())
-        .and(lhs_view.outer_iter())
-        .and(rhs_view.outer_iter())
-        .for_each(|mut out_batch, lhs_batch, rhs_batch| {
-            Zip::from(out_batch.outer_iter_mut())
-                .and(lhs_batch.outer_iter())
-                .and(rhs_batch.outer_iter())
-                .for_each(|mut out_mat, lhs_mat, rhs_mat| {
-                    general_mat_mul(1.0, &lhs_mat, &rhs_mat, 0.0, &mut out_mat);
-                });
-        });
-
-    let output_dyn = output.into_dyn();
+    let output_dyn = batch_matmul_forward_cpu_f32(lhs, rhs, b, h, m, n);
 
     let lhs_clone = lhs.clone();
     let rhs_clone = rhs.clone();
@@ -6621,6 +8618,9 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -6630,40 +8630,10 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         cuda_f32_grad: None,
         parents: vec![lhs_clone.clone(), rhs_clone.clone()],
         backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
-            let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
-            let l_data = lhs_clone.0.borrow().data.clone();
-            let r_data = rhs_clone.0.borrow().data.clone();
-
-            let l_view_4d = l_data.view().into_dimensionality::<Ix4>().unwrap();
-            let r_view_4d = r_data.view().into_dimensionality::<Ix4>().unwrap();
-
-            let mut d_lhs = Array4::<f32>::zeros((b, h, m, k));
-            Zip::from(d_lhs.outer_iter_mut())
-                .and(grad_view.outer_iter())
-                .and(r_view_4d.outer_iter())
-                .for_each(|mut d_l_b, g_b, r_b| {
-                    Zip::from(d_l_b.outer_iter_mut())
-                        .and(g_b.outer_iter())
-                        .and(r_b.outer_iter())
-                        .for_each(|mut d_l_mat, g_mat, r_mat| {
-                            general_mat_mul(1.0, &g_mat, &r_mat.t(), 0.0, &mut d_l_mat);
-                        });
-                });
-            lhs_clone.add_grad(d_lhs.into_dyn());
-
-            let mut d_rhs = Array4::<f32>::zeros((b, h, k, n));
-            Zip::from(d_rhs.outer_iter_mut())
-                .and(l_view_4d.outer_iter())
-                .and(grad_view.outer_iter())
-                .for_each(|mut d_r_b, l_b, g_b| {
-                    Zip::from(d_r_b.outer_iter_mut())
-                        .and(l_b.outer_iter())
-                        .and(g_b.outer_iter())
-                        .for_each(|mut d_r_mat, l_mat, g_mat| {
-                            general_mat_mul(1.0, &l_mat.t(), &g_mat, 0.0, &mut d_r_mat);
-                        });
-                });
-            rhs_clone.add_grad(d_rhs.into_dyn());
+            let (d_lhs, d_rhs) =
+                batch_matmul_backward_cpu_f32(&lhs_clone, &rhs_clone, grad, b, h, m, k, n);
+            lhs_clone.add_grad(d_lhs);
+            rhs_clone.add_grad(d_rhs);
         })),
         requires_grad: true,
         device: output_device,
@@ -6676,7 +8646,6 @@ mod tests {
     use crate::autograd::no_grad;
     #[cfg(feature = "cuda")]
     use crate::autograd::set_strict_device_execution;
-    #[cfg(feature = "cuda")]
     use crate::ops::arithmetic::sum;
     use crate::precision::{PrecisionConfig, with_precision_config};
     #[cfg(feature = "cuda")]
@@ -7179,6 +9148,358 @@ mod tests {
         t
     }
 
+    fn make_training_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
+        Tensor::new_with_dtype(
+            ndarray::Array::from_shape_vec(ndarray::IxDyn(shape), data)
+                .expect("test tensor shape mismatch")
+                .into_dyn(),
+            dtype,
+        )
+    }
+
+    fn make_training_parameter(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
+        Tensor::parameter_with_dtype(
+            ndarray::Array::from_shape_vec(ndarray::IxDyn(shape), data)
+                .expect("test tensor shape mismatch")
+                .into_dyn(),
+            dtype,
+        )
+    }
+
+    #[test]
+    fn matmul_training_forward_keeps_low_precision_storage_until_backward() {
+        for allow_parameter_dtype_copies in [false, true] {
+            with_precision_config(
+                PrecisionConfig {
+                    parameter_dtype: DType::F32,
+                    runtime_dtype: DType::F32,
+                    allow_parameter_dtype_copies,
+                },
+                || {
+                    for dtype in [DType::F16, DType::BF16, DType::I8] {
+                        let a = make_training_tensor(
+                            &[2, 4],
+                            vec![1.0, -2.0, 0.5, 3.0, -1.0, 0.25, 1.5, -0.5],
+                            dtype,
+                        );
+                        let b = make_training_parameter(
+                            &[3, 4],
+                            vec![
+                                1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+                            ],
+                            dtype,
+                        );
+
+                        assert_eq!(a.dtype(), dtype);
+                        assert_eq!(b.dtype(), dtype);
+                        assert!(!a.has_host_f32_data());
+                        assert!(!b.has_host_f32_data());
+
+                        let out = matmul(&a, &b);
+                        assert_eq!(out.dtype(), DType::F32);
+                        assert_eq!(out.shape_vec(), vec![2, 3]);
+                        assert!(
+                            !a.has_host_f32_data(),
+                            "lhs {dtype:?} materialized during forward"
+                        );
+                        assert!(
+                            !b.has_host_f32_data(),
+                            "rhs parameter {dtype:?} materialized during forward"
+                        );
+
+                        sum(&out).backward();
+                        let a_grad = a.grad().expect("lhs grad");
+                        let b_grad = b.grad().expect("rhs grad");
+                        assert_eq!(a_grad.shape(), &[2, 4]);
+                        assert_eq!(b_grad.shape(), &[3, 4]);
+                        assert!(a_grad.iter().all(|v| v.is_finite()));
+                        assert!(b_grad.iter().all(|v| v.is_finite()));
+                        assert_eq!(a.dtype(), dtype);
+                        assert_eq!(b.dtype(), dtype);
+                        assert!(
+                            !a.has_host_f32_data(),
+                            "lhs {dtype:?} materialized during backward"
+                        );
+                        assert!(
+                            !b.has_host_f32_data(),
+                            "rhs parameter {dtype:?} materialized during backward"
+                        );
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_backward_reads_native_low_precision_without_f32_materialization() {
+        fn decoded(tensor: &Tensor) -> Vec<f32> {
+            match tensor.native_storage_owned() {
+                TensorStorageOwned::F32(data) => data.iter().copied().collect(),
+                TensorStorageOwned::F16(data) => data.iter().map(|v| v.to_f32()).collect(),
+                TensorStorageOwned::BF16(data) => data.iter().map(|v| v.to_f32()).collect(),
+                TensorStorageOwned::I8(data, scale) => {
+                    data.iter().map(|&v| (v as f32) * scale).collect()
+                }
+            }
+        }
+
+        let grad = ndarray::Array::from_shape_vec(
+            ndarray::IxDyn(&[2, 3]),
+            vec![1.0f32, -0.5, 0.25, 2.0, -1.0, 0.5],
+        )
+        .expect("grad shape mismatch")
+        .into_dyn();
+
+        for (lhs_dtype, rhs_dtype) in [
+            (DType::F16, DType::F16),
+            (DType::BF16, DType::BF16),
+            (DType::I8, DType::I8),
+            (DType::F32, DType::I8),
+            (DType::F16, DType::I8),
+            (DType::BF16, DType::I8),
+            (DType::I8, DType::F32),
+            (DType::I8, DType::F16),
+            (DType::I8, DType::BF16),
+        ] {
+            let a = make_tensor(
+                &[2, 4],
+                vec![1.0, -2.0, 0.5, 3.0, -1.0, 0.25, 1.5, -0.5],
+                lhs_dtype,
+            );
+            let b = make_tensor(
+                &[3, 4],
+                vec![
+                    1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+                ],
+                rhs_dtype,
+            );
+            let lhs_was_lowp = lhs_dtype != DType::F32;
+            let rhs_was_lowp = rhs_dtype != DType::F32;
+            if lhs_was_lowp {
+                assert!(!a.has_host_f32_data());
+            }
+            if rhs_was_lowp {
+                assert!(!b.has_host_f32_data());
+            }
+
+            let (da, db) = matmul_backward_cpu_f32(&a, &b, &grad.view(), 2, 4, 3);
+            if lhs_was_lowp {
+                assert!(
+                    !a.has_host_f32_data(),
+                    "lhs {lhs_dtype:?} materialized during matmul backward"
+                );
+            }
+            if rhs_was_lowp {
+                assert!(
+                    !b.has_host_f32_data(),
+                    "rhs {rhs_dtype:?} materialized during matmul backward"
+                );
+            }
+
+            let a_vals = decoded(&a);
+            let b_vals = decoded(&b);
+            let grad_vals = grad.as_slice_memory_order().unwrap();
+            for m in 0..2 {
+                for k in 0..4 {
+                    let expected = (0..3)
+                        .map(|n| grad_vals[m * 3 + n] * b_vals[n * 4 + k])
+                        .sum::<f32>();
+                    let got = da.as_slice_memory_order().unwrap()[m * 4 + k];
+                    assert!(
+                        (got - expected).abs() <= 0.08,
+                        "lhs={lhs_dtype:?} rhs={rhs_dtype:?} da[{m},{k}] got {got}, expected {expected}"
+                    );
+                }
+            }
+            for n in 0..3 {
+                for k in 0..4 {
+                    let expected = (0..2)
+                        .map(|m| grad_vals[m * 3 + n] * a_vals[m * 4 + k])
+                        .sum::<f32>();
+                    let got = db.as_slice_memory_order().unwrap()[n * 4 + k];
+                    assert!(
+                        (got - expected).abs() <= 0.08,
+                        "lhs={lhs_dtype:?} rhs={rhs_dtype:?} db[{n},{k}] got {got}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_matmul_backward_reads_native_low_precision_without_f32_materialization() {
+        fn decoded(tensor: &Tensor) -> Vec<f32> {
+            match tensor.native_storage_owned() {
+                TensorStorageOwned::F32(data) => data.iter().copied().collect(),
+                TensorStorageOwned::F16(data) => data.iter().map(|v| v.to_f32()).collect(),
+                TensorStorageOwned::BF16(data) => data.iter().map(|v| v.to_f32()).collect(),
+                TensorStorageOwned::I8(data, scale) => {
+                    data.iter().map(|&v| (v as f32) * scale).collect()
+                }
+            }
+        }
+
+        let grad = ndarray::Array::from_shape_vec(
+            ndarray::IxDyn(&[1, 2, 2, 3]),
+            vec![
+                1.0f32, -0.5, 0.25, 2.0, -1.0, 0.5, -0.75, 1.25, -1.5, 0.5, 0.75, -0.25,
+            ],
+        )
+        .expect("grad shape mismatch")
+        .into_dyn();
+
+        for (lhs_dtype, rhs_dtype) in [
+            (DType::F16, DType::F16),
+            (DType::BF16, DType::BF16),
+            (DType::I8, DType::I8),
+            (DType::F32, DType::I8),
+            (DType::F16, DType::I8),
+            (DType::BF16, DType::I8),
+            (DType::I8, DType::F32),
+            (DType::I8, DType::F16),
+            (DType::I8, DType::BF16),
+        ] {
+            let lhs = make_tensor(
+                &[1, 2, 2, 4],
+                vec![
+                    1.0, -2.0, 0.5, 3.0, -1.0, 0.25, 1.5, -0.5, 0.75, -1.25, 2.0, -2.5, 1.25, 0.5,
+                    -0.75, 2.25,
+                ],
+                lhs_dtype,
+            );
+            let rhs = make_tensor(
+                &[1, 2, 4, 3],
+                vec![
+                    1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5, -0.25, 0.75,
+                    1.25, -1.5, 0.5, -0.75, 1.75, -1.25, 0.25, 0.5, -2.0, 1.0,
+                ],
+                rhs_dtype,
+            );
+            let lhs_was_lowp = lhs_dtype != DType::F32;
+            let rhs_was_lowp = rhs_dtype != DType::F32;
+            if lhs_was_lowp {
+                assert!(!lhs.has_host_f32_data());
+            }
+            if rhs_was_lowp {
+                assert!(!rhs.has_host_f32_data());
+            }
+
+            let (d_lhs, d_rhs) =
+                batch_matmul_backward_cpu_f32(&lhs, &rhs, &grad.view(), 1, 2, 2, 4, 3);
+
+            if lhs_was_lowp {
+                assert!(
+                    !lhs.has_host_f32_data(),
+                    "lhs {lhs_dtype:?} materialized during batch backward"
+                );
+            }
+            if rhs_was_lowp {
+                assert!(
+                    !rhs.has_host_f32_data(),
+                    "rhs {rhs_dtype:?} materialized during batch backward"
+                );
+            }
+
+            let lhs_vals = decoded(&lhs);
+            let rhs_vals = decoded(&rhs);
+            let grad_vals = grad.as_slice_memory_order().unwrap();
+            let d_lhs_vals = d_lhs.as_slice_memory_order().unwrap();
+            let d_rhs_vals = d_rhs.as_slice_memory_order().unwrap();
+            for batch in 0..2 {
+                for row in 0..2 {
+                    for kk in 0..4 {
+                        let expected = (0..3)
+                            .map(|col| {
+                                grad_vals[batch * 2 * 3 + row * 3 + col]
+                                    * rhs_vals[batch * 4 * 3 + kk * 3 + col]
+                            })
+                            .sum::<f32>();
+                        let got = d_lhs_vals[batch * 2 * 4 + row * 4 + kk];
+                        assert!(
+                            (got - expected).abs() <= 0.08,
+                            "lhs={lhs_dtype:?} rhs={rhs_dtype:?} d_lhs[{batch},{row},{kk}] got {got}, expected {expected}"
+                        );
+                    }
+                }
+                for kk in 0..4 {
+                    for col in 0..3 {
+                        let expected = (0..2)
+                            .map(|row| {
+                                lhs_vals[batch * 2 * 4 + row * 4 + kk]
+                                    * grad_vals[batch * 2 * 3 + row * 3 + col]
+                            })
+                            .sum::<f32>();
+                        let got = d_rhs_vals[batch * 4 * 3 + kk * 3 + col];
+                        assert!(
+                            (got - expected).abs() <= 0.08,
+                            "lhs={lhs_dtype:?} rhs={rhs_dtype:?} d_rhs[{batch},{kk},{col}] got {got}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_matmul_training_forward_keeps_low_precision_storage_until_backward() {
+        for allow_parameter_dtype_copies in [false, true] {
+            with_precision_config(
+                PrecisionConfig {
+                    parameter_dtype: DType::F32,
+                    runtime_dtype: DType::F32,
+                    allow_parameter_dtype_copies,
+                },
+                || {
+                    for dtype in [DType::F16, DType::BF16, DType::I8] {
+                        let lhs = make_training_tensor(
+                            &[1, 1, 2, 3],
+                            vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0],
+                            dtype,
+                        );
+                        let rhs = make_training_parameter(
+                            &[1, 1, 3, 2],
+                            vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75],
+                            dtype,
+                        );
+
+                        assert!(!lhs.has_host_f32_data());
+                        assert!(!rhs.has_host_f32_data());
+
+                        let out = batch_matmul(&lhs, &rhs);
+                        assert_eq!(out.dtype(), DType::F32);
+                        assert_eq!(out.shape_vec(), vec![1, 1, 2, 2]);
+                        assert!(
+                            !lhs.has_host_f32_data(),
+                            "lhs {dtype:?} materialized during forward"
+                        );
+                        assert!(
+                            !rhs.has_host_f32_data(),
+                            "rhs parameter {dtype:?} materialized during forward"
+                        );
+
+                        sum(&out).backward();
+                        let lhs_grad = lhs.grad().expect("lhs grad");
+                        let rhs_grad = rhs.grad().expect("rhs grad");
+                        assert_eq!(lhs_grad.shape(), &[1, 1, 2, 3]);
+                        assert_eq!(rhs_grad.shape(), &[1, 1, 3, 2]);
+                        assert!(lhs_grad.iter().all(|v| v.is_finite()));
+                        assert!(rhs_grad.iter().all(|v| v.is_finite()));
+                        assert_eq!(lhs.dtype(), dtype);
+                        assert_eq!(rhs.dtype(), dtype);
+                        assert!(
+                            !lhs.has_host_f32_data(),
+                            "lhs {dtype:?} materialized during backward"
+                        );
+                        assert!(
+                            !rhs.has_host_f32_data(),
+                            "rhs parameter {dtype:?} materialized during backward"
+                        );
+                    }
+                },
+            );
+        }
+    }
+
     #[test]
     fn matmul_no_grad_preserves_bf16_output_dtype() {
         let a = make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::BF16);
@@ -7224,7 +9545,7 @@ mod tests {
     }
 
     #[test]
-    fn matmul_same_dtype_bf16_parameter_may_materialize_cached_f32_for_generic_gemm() {
+    fn matmul_same_dtype_bf16_parameter_uses_native_storage_for_generic_gemm() {
         with_precision_config(
             PrecisionConfig {
                 parameter_dtype: DType::BF16,
@@ -7258,15 +9579,15 @@ mod tests {
 
                 let inner = b.0.borrow();
                 assert!(
-                    inner.has_f32_data,
-                    "generic bf16 matmul is currently expected to materialize cached f32 parameter storage"
+                    !inner.has_f32_data,
+                    "generic bf16 matmul should read native parameter storage without caching f32"
                 );
             },
         );
     }
 
     #[test]
-    fn matmul_mixed_f32_input_is_allowed_to_materialize_parameter_cache() {
+    fn matmul_mixed_f32_input_uses_native_low_precision_parameter_storage() {
         with_precision_config(
             PrecisionConfig {
                 parameter_dtype: DType::BF16,
@@ -7300,8 +9621,8 @@ mod tests {
 
                 let inner = b.0.borrow();
                 assert!(
-                    inner.has_f32_data,
-                    "mixed f32 input should still be allowed to materialize cached f32 parameter storage"
+                    !inner.has_f32_data,
+                    "mixed f32 input should read native low-precision parameter storage without caching f32"
                 );
             },
         );
@@ -7512,6 +9833,10 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!a.has_host_f32_data());
+        assert!(!b.has_host_f32_data());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
@@ -7526,6 +9851,67 @@ mod tests {
             !out.has_host_f32_data(),
             "bf16 CUDA matmul should keep output resident until host data is requested"
         );
+        {
+            let inner = out.0.borrow();
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "bf16 CUDA matmul should write native bf16 output, not a resident f32 buffer"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "bf16 CUDA matmul should keep resident bf16 storage"
+            );
+        }
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_preserves_f16_dtype_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::F16).to_cuda();
+        let b = make_tensor(
+            &[3, 4],
+            vec![
+                1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+            ],
+            DType::F16,
+        )
+        .to_cuda();
+        assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!a.has_host_f32_data());
+        assert!(!b.has_host_f32_data());
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::F16);
+        assert!(
+            !out.has_host_f32_data(),
+            "f16 CUDA matmul should keep output resident until host data is requested"
+        );
+        {
+            let inner = out.0.borrow();
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "f16 CUDA matmul should write native f16 output, not a resident f32 buffer"
+            );
+            assert!(
+                inner.cuda_f16_data.is_some(),
+                "f16 CUDA matmul should keep resident f16 storage"
+            );
+        }
         for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
         }
@@ -7547,6 +9933,10 @@ mod tests {
             DType::BF16,
         )
         .to_cuda();
+        assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!a.has_host_f32_data());
+        assert!(!b.has_host_f32_data());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
@@ -7558,19 +9948,24 @@ mod tests {
         assert_eq!(out.dtype(), DType::BF16);
         assert!(!out.has_host_f32_data());
 
-        out.with_storage_view(|view| match view {
-            TensorStorageView::F32(view) => {
-                let vals = view.iter().copied().collect::<Vec<_>>();
-                assert!(
-                    vals.iter().any(|v| v.abs() > 1e-6),
-                    "materialized CUDA values should not be an all-zero placeholder"
-                );
-            }
-            TensorStorageView::F16(_) => panic!("bf16 matmul output should not expose f16 data"),
-            TensorStorageView::BF16(_) => {
-                panic!("bf16 CUDA-only output should materialize from its resident data")
-            }
-        });
+        let bf16_buffer = {
+            let inner = out.0.borrow();
+            assert!(inner.cuda_f32_data.is_none());
+            inner
+                .cuda_bf16_data
+                .clone()
+                .expect("bf16 matmul should keep resident bf16 output")
+        };
+        let bits = crate::ops::cuda::download_u16_storage(&bf16_buffer)
+            .expect("download bf16 matmul bits");
+        let vals = bits
+            .iter()
+            .map(|&bits| bf16::from_bits(bits).to_f32())
+            .collect::<Vec<_>>();
+        assert!(
+            vals.iter().any(|v| v.abs() > 1e-6),
+            "resident CUDA bf16 values should not be an all-zero placeholder"
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -7589,6 +9984,10 @@ mod tests {
             DType::I8,
         )
         .to_cuda();
+        assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!a.has_host_f32_data());
+        assert!(!b.has_host_f32_data());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
@@ -7599,8 +9998,684 @@ mod tests {
         let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
         assert!(out.is_cuda());
         assert_eq!(out.dtype(), DType::I8);
+        {
+            let inner = out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "i8 CUDA matmul output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "i8 CUDA matmul output should quantize away the temporary f32 buffer"
+            );
+            assert!(
+                inner.cuda_i8_data.is_some(),
+                "i8 CUDA matmul output should keep resident i8 storage"
+            );
+            assert!(
+                inner.i8_scale.is_some(),
+                "i8 CUDA matmul output should record dynamic quantization scale"
+            );
+        }
         for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
             assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_i8_matmul_matches_quantized_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let m = 9;
+        let n = 19;
+        let k = 35;
+        let scale = 0.03125f32;
+        let a = (0..m * k)
+            .map(|i| ((((i * 17 + 3) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let b = (0..n * k)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let a_buf = crate::ops::cuda::upload_i8_storage(&a).expect("upload i8 matmul a");
+        let b_buf = crate::ops::cuda::upload_i8_storage(&b).expect("upload i8 matmul b");
+
+        let out = crate::ops::cuda::matmul_i8_buffer_no_host(&a_buf, scale, &b_buf, scale, m, n, k)
+            .expect("CUDA resident i8 matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download resident i8 matmul");
+
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0i32;
+                for kk in 0..k {
+                    acc += (a[row * k + kk] as i32) * (b[col * k + kk] as i32);
+                }
+                expected[row * n + col] = (acc as f32) * scale * scale;
+            }
+        }
+
+        for (actual, expected) in got.iter().zip(expected.iter()) {
+            assert_eq!(actual, expected, "resident tiled i8 matmul kernel drifted");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_bf16_i8_matmul_matches_cpu_reference_without_host_f32() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(
+            &[4, 7],
+            vec![
+                1.0, -2.0, 0.5, 3.0, -1.25, 0.75, 2.5, -0.5, 1.5, -3.0, 0.25, 2.0, -1.0, 0.125,
+                3.5, -0.75, 1.25, -2.25, 0.5, 1.0, -1.5, 0.0, 2.75, -0.25, 1.75, -3.5, 0.625, 2.25,
+            ],
+            DType::BF16,
+        )
+        .to_cuda();
+        let b = make_tensor(
+            &[5, 7],
+            vec![
+                0.5, -1.0, 2.0, -0.25, 1.5, -2.5, 0.75, -1.5, 0.25, 1.25, -2.0, 0.5, 3.0, -0.75,
+                2.5, -0.5, -1.25, 1.0, -3.0, 0.125, 1.75, -2.25, 1.5, 0.5, -0.625, 2.25, -1.0, 3.5,
+                1.0, 2.0, -3.0, 0.75, -1.5, 0.25, -2.5,
+            ],
+            DType::I8,
+        )
+        .to_cuda();
+        assert_eq!(a.dtype(), DType::BF16);
+        assert_eq!(b.dtype(), DType::I8);
+        assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!a.has_host_f32_data());
+        assert!(!b.has_host_f32_data());
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::F32);
+        assert!(!a.has_host_f32_data());
+        assert!(
+            !b.has_host_f32_data(),
+            "mixed BF16xI8 CUDA matmul should not materialize I8 weights as host f32"
+        );
+        assert!(
+            !out.has_host_f32_data(),
+            "mixed BF16xI8 CUDA matmul should keep f32 output resident until requested"
+        );
+        {
+            let inner = out.0.borrow();
+            assert!(inner.cuda_f32_data.is_some());
+            assert!(inner.cuda_bf16_data.is_none());
+            assert!(inner.cuda_i8_data.is_none());
+        }
+
+        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "mixed BF16xI8 CUDA matmul drifted: got={got}, expect={expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_f16_i8_matmul_matches_cpu_reference_without_host_f32() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(&[4, 7], sample_f32(28), DType::F16).to_cuda();
+        let b = make_tensor(&[5, 7], sample_f32(35), DType::I8).to_cuda();
+        assert_eq!(a.dtype(), DType::F16);
+        assert_eq!(b.dtype(), DType::I8);
+        assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!a.has_host_f32_data());
+        assert!(!b.has_host_f32_data());
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::F32);
+        assert!(!a.has_host_f32_data());
+        assert!(
+            !b.has_host_f32_data(),
+            "mixed F16xI8 CUDA matmul should not materialize I8 weights as host f32"
+        );
+        assert!(
+            !out.has_host_f32_data(),
+            "mixed F16xI8 CUDA matmul should keep f32 output resident until requested"
+        );
+
+        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "mixed F16xI8 CUDA matmul drifted: got={got}, expect={expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_f32_i8_matmul_matches_cpu_reference_without_host_f32_weight() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(&[3, 6], sample_f32(18), DType::F32).to_cuda();
+        let b = make_tensor(
+            &[4, 6],
+            vec![
+                0.5, -1.0, 2.0, -0.25, 1.5, -2.5, -1.5, 0.25, 1.25, -2.0, 0.5, 3.0, 2.5, -0.5,
+                -1.25, 1.0, -3.0, 0.125, -2.25, 1.5, 0.5, -0.625, 2.25, -1.0,
+            ],
+            DType::I8,
+        )
+        .to_cuda();
+        assert_eq!(a.dtype(), DType::F32);
+        assert_eq!(b.dtype(), DType::I8);
+        assert!(a.cloned_cuda_f32_buffer().is_some());
+        assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!b.has_host_f32_data());
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::F32);
+        assert!(
+            !b.has_host_f32_data(),
+            "F32xI8 CUDA matmul should not materialize I8 weights as host f32"
+        );
+        assert!(
+            !out.has_host_f32_data(),
+            "F32xI8 CUDA matmul should keep f32 output resident until requested"
+        );
+        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!(
+                (got - expect).abs() < 3e-2,
+                "mixed F32xI8 CUDA matmul drifted: got={got}, expect={expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_i8_floatlike_matmul_matches_cpu_reference_without_host_f32_input() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let k = 31;
+        let n = 9;
+        for (m, rhs_dtype) in [1usize, 5]
+            .into_iter()
+            .flat_map(|m| [DType::F16, DType::BF16, DType::F32].map(|rhs_dtype| (m, rhs_dtype)))
+        {
+            let a = make_tensor(&[m, k], sample_f32(m * k), DType::I8).to_cuda();
+            let b = make_tensor(&[n, k], sample_f32(n * k), rhs_dtype).to_cuda();
+            assert_eq!(a.dtype(), DType::I8);
+            assert_eq!(b.dtype(), rhs_dtype);
+            assert!(a.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!a.has_host_f32_data());
+            if rhs_dtype != DType::F32 {
+                assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+                assert!(!b.has_host_f32_data());
+            } else {
+                assert!(b.cloned_cuda_f32_buffer().is_some());
+            }
+
+            crate::ops::cuda::set_enabled(true);
+            crate::autograd::set_strict_device_execution(true);
+            let out = no_grad(|| matmul(&a, &b));
+            crate::autograd::set_strict_device_execution(false);
+            crate::ops::cuda::set_enabled(false);
+
+            assert!(out.is_cuda());
+            assert_eq!(out.dtype(), DType::F32);
+            assert!(
+                !a.has_host_f32_data(),
+                "I8x{rhs_dtype:?} CUDA matmul should not materialize I8 input as host f32"
+            );
+            assert!(
+                !out.has_host_f32_data(),
+                "I8x{rhs_dtype:?} CUDA matmul should keep f32 output resident until requested"
+            );
+
+            let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+            for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() < 5e-2,
+                    "mixed I8x{rhs_dtype:?} CUDA matmul drifted for m={m}: got={got}, expect={expect}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_single_row_float_i8_matvec_matches_cpu_reference_without_host_f32_weight() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let k = 257;
+        let n = 7;
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let a = make_tensor(&[1, k], sample_f32(k), dtype).to_cuda();
+            let b = make_tensor(&[n, k], sample_f32(n * k), DType::I8).to_cuda();
+            assert_eq!(a.dtype(), dtype);
+            assert_eq!(b.dtype(), DType::I8);
+            assert!(b.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!b.has_host_f32_data());
+
+            crate::ops::cuda::set_enabled(true);
+            crate::autograd::set_strict_device_execution(true);
+            let out = no_grad(|| matmul(&a, &b));
+            crate::autograd::set_strict_device_execution(false);
+            crate::ops::cuda::set_enabled(false);
+
+            assert!(out.is_cuda());
+            assert_eq!(out.dtype(), DType::F32);
+            assert!(
+                !b.has_host_f32_data(),
+                "{dtype:?}xI8 CUDA matvec should not materialize I8 weights as host f32"
+            );
+            let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+            for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() < 5e-2,
+                    "single-row {dtype:?}xI8 CUDA matvec drifted: got={got}, expect={expect}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_mixed_i8_argmax_matches_cpu_logits_argmax_without_host_f32_weight() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let k = 19;
+        let vocab = 13;
+        for (batch, dtype) in [DType::F16, DType::BF16, DType::F32, DType::I8]
+            .into_iter()
+            .flat_map(|dtype| [(1usize, dtype), (2usize, dtype)])
+        {
+            let a = make_tensor(&[batch, k], sample_f32(batch * k), dtype).to_cuda();
+            let b = make_tensor(&[vocab, k], sample_f32(vocab * k), DType::I8).to_cuda();
+            let (weight_dtype, weight_buf, weight_scale) = b
+                .cloned_cuda_native_lowp_buffer()
+                .expect("resident i8 weight");
+            assert_eq!(weight_dtype, DType::I8);
+            assert!(!b.has_host_f32_data());
+
+            let got = if dtype == DType::BF16 {
+                let (input_dtype, input_buf, _) = a
+                    .cloned_cuda_native_lowp_buffer()
+                    .expect("resident bf16 input");
+                assert_eq!(input_dtype, DType::BF16);
+                crate::ops::cuda::matvec_argmax_bf16_i8(
+                    &input_buf,
+                    &weight_buf,
+                    weight_scale.expect("i8 weight scale"),
+                    batch,
+                    vocab,
+                    k,
+                )
+            } else if dtype == DType::F16 {
+                let (input_dtype, input_buf, _) = a
+                    .cloned_cuda_native_lowp_buffer()
+                    .expect("resident f16 input");
+                assert_eq!(input_dtype, DType::F16);
+                crate::ops::cuda::matvec_argmax_f16_i8(
+                    &input_buf,
+                    &weight_buf,
+                    weight_scale.expect("i8 weight scale"),
+                    batch,
+                    vocab,
+                    k,
+                )
+            } else if dtype == DType::I8 {
+                let (input_dtype, input_buf, input_scale) = a
+                    .cloned_cuda_native_lowp_buffer()
+                    .expect("resident i8 input");
+                assert_eq!(input_dtype, DType::I8);
+                crate::ops::cuda::matvec_argmax_i8_i8(
+                    &input_buf,
+                    input_scale.expect("i8 input scale"),
+                    &weight_buf,
+                    weight_scale.expect("i8 weight scale"),
+                    batch,
+                    vocab,
+                    k,
+                )
+            } else {
+                let input_buf = a.cloned_cuda_f32_buffer().expect("resident f32 input");
+                crate::ops::cuda::matvec_argmax_f32_i8(
+                    &input_buf,
+                    &weight_buf,
+                    weight_scale.expect("i8 weight scale"),
+                    batch,
+                    vocab,
+                    k,
+                )
+            }
+            .expect("CUDA mixed argmax");
+
+            let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+            let logits = reference.data_ref();
+            let expected = (0..batch)
+                .map(|row| {
+                    let row_logits = logits.slice(ndarray::s![row, ..]);
+                    row_logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+                        .map(|(idx, _)| idx)
+                        .expect("non-empty vocab")
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(got, expected, "{dtype:?}xI8 CUDA argmax drifted");
+            assert!(
+                !b.has_host_f32_data(),
+                "{dtype:?}xI8 CUDA argmax should not materialize I8 weights as host f32"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_i8_weight_argmax_rejects_invalid_scales() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let batch = 2;
+        let vocab = 3;
+        let hidden = 5;
+        let input_u16 = crate::ops::cuda::upload_u16_storage(&vec![0; batch * hidden])
+            .expect("upload u16 input");
+        let input_f32 =
+            crate::ops::cuda::upload_f32(&vec![0.0; batch * hidden]).expect("upload f32 input");
+        let input_i8 =
+            crate::ops::cuda::upload_i8_storage(&vec![0; batch * hidden]).expect("upload i8 input");
+        let weight_i8 = crate::ops::cuda::upload_i8_storage(&vec![0; vocab * hidden])
+            .expect("upload i8 weight");
+
+        assert!(
+            crate::ops::cuda::matvec_argmax_bf16_i8(
+                &input_u16,
+                &weight_i8,
+                f32::NAN,
+                batch,
+                vocab,
+                hidden,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::ops::cuda::matvec_argmax_f16_i8(
+                &input_u16, &weight_i8, 0.0, batch, vocab, hidden,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::ops::cuda::matvec_argmax_f32_i8(
+                &input_f32, &weight_i8, -1.0, batch, vocab, hidden,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::ops::cuda::matvec_argmax_i8_i8(
+                &input_i8,
+                f32::INFINITY,
+                &weight_i8,
+                0.05,
+                batch,
+                vocab,
+                hidden,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_i8_matmul_typed_output_matches_dynamic_quantized_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let m = 9;
+        let n = 19;
+        let k = 35;
+        let a_scale = 0.03125f32;
+        let b_scale = 0.046875f32;
+        let a = (0..m * k)
+            .map(|i| ((((i * 17 + 3) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let b = (0..n * k)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let a_buf = crate::ops::cuda::upload_i8_storage(&a).expect("upload typed i8 matmul a");
+        let b_buf = crate::ops::cuda::upload_i8_storage(&b).expect("upload typed i8 matmul b");
+
+        let (out, got_scale) = crate::ops::cuda::matmul_i8_typed_output_buffer_no_host(
+            &a_buf, a_scale, &b_buf, b_scale, m, n, k,
+        )
+        .expect("CUDA resident typed-output i8 matmul");
+        let got = crate::ops::cuda::download_i8_storage(&out).expect("download typed i8 matmul");
+
+        let mut values = vec![0.0f32; m * n];
+        let mut max_abs = 0.0f32;
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0i32;
+                for kk in 0..k {
+                    acc += (a[row * k + kk] as i32) * (b[col * k + kk] as i32);
+                }
+                let value = (acc as f32) * a_scale * b_scale;
+                values[row * n + col] = value;
+                max_abs = max_abs.max(value.abs());
+            }
+        }
+        let expected_scale = if max_abs > 0.0 {
+            (max_abs / 127.0).max(f32::MIN_POSITIVE)
+        } else {
+            1.0
+        };
+        assert!(
+            (got_scale - expected_scale).abs() <= 1e-6,
+            "typed i8 matmul scale drifted: got={got_scale}, expected={expected_scale}"
+        );
+
+        let expected = values
+            .iter()
+            .map(|value| {
+                let q = (value / expected_scale).round().clamp(-127.0, 127.0);
+                q as i8
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(got, expected, "typed i8 matmul quantized output drifted");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_i8_matmul_typed_output_zero_absmax_uses_unit_scale() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let m = 5;
+        let n = 7;
+        let k = 11;
+        let a_buf =
+            crate::ops::cuda::upload_i8_storage(&vec![0; m * k]).expect("upload zero i8 matmul a");
+        let b_buf =
+            crate::ops::cuda::upload_i8_storage(&vec![0; n * k]).expect("upload zero i8 matmul b");
+
+        let (out, scale) = crate::ops::cuda::matmul_i8_typed_output_buffer_no_host(
+            &a_buf, 0.03125, &b_buf, 0.046875, m, n, k,
+        )
+        .expect("CUDA zero typed-output i8 matmul");
+        let got =
+            crate::ops::cuda::download_i8_storage(&out).expect("download zero typed i8 matmul");
+
+        assert_eq!(scale, 1.0);
+        assert_eq!(got, vec![0; m * n]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_i8_batch_matmul_typed_output_matches_dynamic_quantized_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let batch_count = 2;
+        let m = 3;
+        let n = 4;
+        let k = 5;
+        let lhs_scale = 0.03125f32;
+        let rhs_scale = 0.046875f32;
+        let lhs = (0..batch_count * m * k)
+            .map(|i| ((((i * 17 + 3) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let rhs = (0..batch_count * k * n)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let lhs_buf = crate::ops::cuda::upload_i8_storage(&lhs).expect("upload typed i8 batch lhs");
+        let rhs_buf = crate::ops::cuda::upload_i8_storage(&rhs).expect("upload typed i8 batch rhs");
+
+        let (out, got_scale) = crate::ops::cuda::batch_matmul_i8_typed_output_buffer_no_host(
+            &lhs_buf,
+            lhs_scale,
+            &rhs_buf,
+            rhs_scale,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .expect("CUDA resident typed-output i8 batch matmul");
+        let got =
+            crate::ops::cuda::download_i8_storage(&out).expect("download typed i8 batch matmul");
+
+        let mut values = vec![0.0f32; batch_count * m * n];
+        let mut max_abs = 0.0f32;
+        for batch in 0..batch_count {
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0i32;
+                    for kk in 0..k {
+                        acc += (lhs[batch * m * k + row * k + kk] as i32)
+                            * (rhs[batch * k * n + kk * n + col] as i32);
+                    }
+                    let idx = batch * m * n + row * n + col;
+                    let value = (acc as f32) * lhs_scale * rhs_scale;
+                    values[idx] = value;
+                    max_abs = max_abs.max(value.abs());
+                }
+            }
+        }
+        let expected_scale = if max_abs > 0.0 {
+            (max_abs / 127.0).max(f32::MIN_POSITIVE)
+        } else {
+            1.0
+        };
+        assert!(
+            (got_scale - expected_scale).abs() <= 1e-6,
+            "typed i8 batch matmul scale drifted: got={got_scale}, expected={expected_scale}"
+        );
+
+        let expected = values
+            .iter()
+            .map(|value| {
+                let q = (value / expected_scale).round().clamp(-127.0, 127.0);
+                q as i8
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got, expected,
+            "typed i8 batch matmul quantized output drifted"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resident_i8_batch_matmul_f32_output_handles_tiled_tail_dimensions() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let batch_count = 2;
+        let m = 5;
+        let n = 7;
+        let k = 35;
+        let lhs_scale = 0.03125f32;
+        let rhs_scale = 0.046875f32;
+        let lhs = (0..batch_count * m * k)
+            .map(|i| ((((i * 17 + 3) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let rhs = (0..batch_count * k * n)
+            .map(|i| ((((i * 29 + 11) % 255) as i32) - 127) as i8)
+            .collect::<Vec<_>>();
+        let lhs_buf = crate::ops::cuda::upload_i8_storage(&lhs).expect("upload tiled i8 batch lhs");
+        let rhs_buf = crate::ops::cuda::upload_i8_storage(&rhs).expect("upload tiled i8 batch rhs");
+
+        let out = crate::ops::cuda::batch_matmul_i8_buffer_no_host(
+            &lhs_buf,
+            lhs_scale,
+            &rhs_buf,
+            rhs_scale,
+            batch_count,
+            m,
+            n,
+            k,
+        )
+        .expect("CUDA resident f32-output i8 batch matmul");
+        let got = crate::ops::cuda::download_f32(&out).expect("download tiled i8 batch matmul");
+
+        for batch in 0..batch_count {
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0i32;
+                    for kk in 0..k {
+                        acc += (lhs[batch * m * k + row * k + kk] as i32)
+                            * (rhs[batch * k * n + kk * n + col] as i32);
+                    }
+                    let idx = batch * m * n + row * n + col;
+                    let expected = (acc as f32) * lhs_scale * rhs_scale;
+                    assert_eq!(
+                        got[idx], expected,
+                        "tiled i8 batch_matmul drifted at batch={batch}, row={row}, col={col}"
+                    );
+                }
+            }
         }
     }
 
@@ -7637,9 +10712,531 @@ mod tests {
             !out.has_host_f32_data(),
             "bf16 CUDA batch_matmul should keep output resident until host data is requested"
         );
+        {
+            let inner = out.0.borrow();
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "bf16 CUDA batch_matmul should write native bf16 output, not a resident f32 buffer"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "bf16 CUDA batch_matmul should keep resident bf16 storage"
+            );
+        }
         for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_mixed_i8_matches_cpu_reference_without_host_f32_rhs() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let shape_lhs = [2, 3, 5, 131];
+        let shape_rhs = [2, 3, 131, 7];
+        let lhs_len = shape_lhs.iter().product::<usize>();
+        let rhs_len = shape_rhs.iter().product::<usize>();
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let lhs = make_tensor(&shape_lhs, sample_f32(lhs_len), dtype).to_cuda();
+            let rhs = make_tensor(&shape_rhs, sample_f32(rhs_len), DType::I8).to_cuda();
+            assert_eq!(lhs.dtype(), dtype);
+            assert_eq!(rhs.dtype(), DType::I8);
+            assert!(rhs.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!rhs.has_host_f32_data());
+
+            crate::ops::cuda::set_enabled(true);
+            crate::autograd::set_strict_device_execution(true);
+            let out = no_grad(|| batch_matmul(&lhs, &rhs));
+            crate::autograd::set_strict_device_execution(false);
+            crate::ops::cuda::set_enabled(false);
+
+            assert!(out.is_cuda());
+            assert_eq!(out.dtype(), DType::F32);
+            assert!(
+                !rhs.has_host_f32_data(),
+                "{dtype:?}xI8 CUDA batch_matmul should not materialize I8 rhs as host f32"
+            );
+            assert!(
+                !out.has_host_f32_data(),
+                "{dtype:?}xI8 CUDA batch_matmul should keep f32 output resident until requested"
+            );
+
+            let reference = no_grad(|| batch_matmul(&lhs.to_cpu(), &rhs.to_cpu()));
+            for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() < 5e-2,
+                    "mixed {dtype:?}xI8 CUDA batch_matmul drifted: got={got}, expect={expect}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_i8_floatlike_matches_cpu_reference_without_host_f32_lhs() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let shape_lhs = [2, 3, 5, 131];
+        let shape_rhs = [2, 3, 131, 7];
+        let lhs_len = shape_lhs.iter().product::<usize>();
+        let rhs_len = shape_rhs.iter().product::<usize>();
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let lhs = make_tensor(&shape_lhs, sample_f32(lhs_len), DType::I8).to_cuda();
+            let rhs = make_tensor(&shape_rhs, sample_f32(rhs_len), dtype).to_cuda();
+            assert_eq!(lhs.dtype(), DType::I8);
+            assert_eq!(rhs.dtype(), dtype);
+            assert!(lhs.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!lhs.has_host_f32_data());
+            if dtype != DType::F32 {
+                assert!(rhs.cloned_cuda_native_lowp_buffer().is_some());
+                assert!(!rhs.has_host_f32_data());
+            } else {
+                assert!(rhs.cloned_cuda_f32_buffer().is_some());
+            }
+
+            crate::ops::cuda::set_enabled(true);
+            crate::autograd::set_strict_device_execution(true);
+            let out = no_grad(|| batch_matmul(&lhs, &rhs));
+            crate::autograd::set_strict_device_execution(false);
+            crate::ops::cuda::set_enabled(false);
+
+            assert!(out.is_cuda());
+            assert_eq!(out.dtype(), DType::F32);
+            assert!(
+                !lhs.has_host_f32_data(),
+                "I8x{dtype:?} CUDA batch_matmul should not materialize I8 lhs as host f32"
+            );
+            assert!(
+                !out.has_host_f32_data(),
+                "I8x{dtype:?} CUDA batch_matmul should keep f32 output resident until requested"
+            );
+
+            let reference = no_grad(|| batch_matmul(&lhs.to_cpu(), &rhs.to_cpu()));
+            for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() < 5e-2,
+                    "mixed I8x{dtype:?} CUDA batch_matmul drifted: got={got}, expect={expect}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_lowp_uses_resident_forward_buffer_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let lhs =
+                make_tensor(&[1, 1, 2, 3], vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0], dtype).to_cuda();
+            let rhs =
+                make_tensor(&[1, 1, 3, 2], vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75], dtype).to_cuda();
+            assert!(lhs.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(rhs.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!lhs.has_host_f32_data());
+            assert!(!rhs.has_host_f32_data());
+
+            let out = no_grad(|| batch_matmul(&lhs, &rhs));
+
+            assert!(out.is_cuda());
+            assert_eq!(out.dtype(), dtype);
+            {
+                let inner = out.0.borrow();
+                match dtype {
+                    DType::F16 => {
+                        assert!(inner.cuda_f32_data.is_none());
+                        assert!(inner.cuda_f16_data.is_some());
+                    }
+                    DType::BF16 => {
+                        assert!(inner.cuda_f32_data.is_none());
+                        assert!(inner.cuda_bf16_data.is_some());
+                    }
+                    DType::I8 => {
+                        assert!(inner.cuda_f32_data.is_none());
+                        assert!(inner.cuda_i8_data.is_some());
+                    }
+                    DType::F32 => unreachable!("test only covers low precision dtypes"),
+                }
+            }
+            assert!(!lhs.has_host_f32_data());
+            assert!(!rhs.has_host_f32_data());
+            let reference = no_grad(|| batch_matmul(&lhs.to_cpu(), &rhs.to_cpu()));
+            for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{dtype:?} batch_matmul got {got}, expect {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_lowp_backward_outputs_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let lhs = make_grad_tensor(&[1, 1, 2, 3], vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0]);
+            lhs.cast_inplace(dtype);
+            let lhs = lhs.to_cuda();
+            let rhs = make_grad_tensor(&[1, 1, 3, 2], vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75]);
+            rhs.cast_inplace(dtype);
+            let rhs = rhs.to_cuda();
+
+            let loss = sum(&batch_matmul(&lhs, &rhs));
+            loss.backward();
+
+            assert!(lhs.cloned_cuda_f32_grad().is_some());
+            assert!(rhs.cloned_cuda_f32_grad().is_some());
+            assert!(!lhs.has_host_f32_data());
+            assert!(!rhs.has_host_f32_data());
+            let lhs_grad = lhs.grad().expect("CUDA batch_matmul lhs grad");
+            let rhs_grad = rhs.grad().expect("CUDA batch_matmul rhs grad");
+            for (got, expected) in lhs_grad.iter().zip([1.5f32, 0.5, -0.5, 1.5, 0.5, -0.5]) {
+                assert!(
+                    (got - expected).abs() <= 0.08,
+                    "{dtype:?} lhs grad got {got}, expected {expected}"
+                );
+            }
+            for (got, expected) in rhs_grad.iter().zip([4.0f32, 4.0, -3.0, -3.0, 2.5, 2.5]) {
+                assert!(
+                    (got - expected).abs() <= 0.08,
+                    "{dtype:?} rhs grad got {got}, expected {expected}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let lhs_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75];
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for lhs_dtype in [DType::F16, DType::F32, DType::BF16] {
+            let lhs_cpu = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
+            lhs_cpu.cast_inplace(lhs_dtype);
+            let rhs_cpu = make_grad_tensor(&[1, 1, 3, 2], rhs_data.clone());
+            rhs_cpu.cast_inplace(DType::I8);
+
+            let lhs_cuda = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
+            lhs_cuda.cast_inplace(lhs_dtype);
+            let lhs_cuda = lhs_cuda.to_cuda();
+            let rhs_cuda = make_grad_tensor(&[1, 1, 3, 2], rhs_data.clone());
+            rhs_cuda.cast_inplace(DType::I8);
+            let rhs_cuda = rhs_cuda.to_cuda();
+
+            let loss_cuda = sum(&batch_matmul(&lhs_cuda, &rhs_cuda));
+            loss_cuda.backward();
+
+            let loss_cpu = sum(&batch_matmul(&lhs_cpu, &rhs_cpu));
+            loss_cpu.backward();
+
+            assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(rhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(!rhs_cuda.has_host_f32_data());
+            assert!(!lhs_cuda.has_host_grad());
+            assert!(!rhs_cuda.has_host_grad());
+
+            let lhs_grad = lhs_cuda.grad().expect("CUDA mixed batch_matmul lhs grad");
+            let rhs_grad = rhs_cuda.grad().expect("CUDA mixed batch_matmul rhs grad");
+            let lhs_ref = lhs_cpu.grad().expect("CPU mixed batch_matmul lhs grad");
+            let rhs_ref = rhs_cpu.grad().expect("CPU mixed batch_matmul rhs grad");
+            for (got, expect) in lhs_grad.iter().zip(lhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{lhs_dtype:?}xI8 lhs grad got {got}, expect {expect}"
+                );
+            }
+            for (got, expect) in rhs_grad.iter().zip(rhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{lhs_dtype:?}xI8 rhs grad got {got}, expect {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let lhs_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75];
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for rhs_dtype in [DType::F16, DType::F32, DType::BF16] {
+            let lhs_cpu = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
+            lhs_cpu.cast_inplace(DType::I8);
+            let rhs_cpu = make_grad_tensor(&[1, 1, 3, 2], rhs_data.clone());
+            rhs_cpu.cast_inplace(rhs_dtype);
+
+            let lhs_cuda = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
+            lhs_cuda.cast_inplace(DType::I8);
+            let lhs_cuda = lhs_cuda.to_cuda();
+            let rhs_cuda = make_grad_tensor(&[1, 1, 3, 2], rhs_data.clone());
+            rhs_cuda.cast_inplace(rhs_dtype);
+            let rhs_cuda = rhs_cuda.to_cuda();
+
+            let loss_cuda = sum(&batch_matmul(&lhs_cuda, &rhs_cuda));
+            loss_cuda.backward();
+
+            let loss_cpu = sum(&batch_matmul(&lhs_cpu, &rhs_cpu));
+            loss_cpu.backward();
+
+            assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(rhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(!lhs_cuda.has_host_f32_data());
+            assert!(!lhs_cuda.has_host_grad());
+            assert!(!rhs_cuda.has_host_grad());
+
+            let lhs_grad = lhs_cuda
+                .grad()
+                .expect("CUDA I8xfloatlike batch_matmul lhs grad");
+            let rhs_grad = rhs_cuda
+                .grad()
+                .expect("CUDA I8xfloatlike batch_matmul rhs grad");
+            let lhs_ref = lhs_cpu
+                .grad()
+                .expect("CPU I8xfloatlike batch_matmul lhs grad");
+            let rhs_ref = rhs_cpu
+                .grad()
+                .expect("CPU I8xfloatlike batch_matmul rhs grad");
+            for (got, expect) in lhs_grad.iter().zip(lhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "I8x{rhs_dtype:?} batch_matmul lhs grad got {got}, expect {expect}"
+                );
+            }
+            for (got, expect) in rhs_grad.iter().zip(rhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "I8x{rhs_dtype:?} batch_matmul rhs grad got {got}, expect {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_lowp_backward_handles_asymmetric_gradient_sizes() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for (m, n, lhs_dtype, rhs_dtype) in [
+            (2, 5, DType::BF16, DType::BF16),
+            (5, 2, DType::F16, DType::I8),
+            (2, 5, DType::I8, DType::F16),
+            (5, 2, DType::I8, DType::I8),
+        ] {
+            let k = 3;
+            let lhs_data = sample_f32(m * k);
+            let rhs_data = sample_f32(k * n);
+
+            let lhs_cpu = make_grad_tensor(&[1, 1, m, k], lhs_data.clone());
+            lhs_cpu.cast_inplace(lhs_dtype);
+            let rhs_cpu = make_grad_tensor(&[1, 1, k, n], rhs_data.clone());
+            rhs_cpu.cast_inplace(rhs_dtype);
+
+            let lhs_cuda = make_grad_tensor(&[1, 1, m, k], lhs_data);
+            lhs_cuda.cast_inplace(lhs_dtype);
+            let lhs_cuda = lhs_cuda.to_cuda();
+            let rhs_cuda = make_grad_tensor(&[1, 1, k, n], rhs_data);
+            rhs_cuda.cast_inplace(rhs_dtype);
+            let rhs_cuda = rhs_cuda.to_cuda();
+
+            sum(&batch_matmul(&lhs_cuda, &rhs_cuda)).backward();
+            sum(&batch_matmul(&lhs_cpu, &rhs_cpu)).backward();
+
+            assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(rhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(!lhs_cuda.has_host_grad());
+            assert!(!rhs_cuda.has_host_grad());
+            let lhs_grad = lhs_cuda.grad().expect("CUDA asymmetric batch lhs grad");
+            let rhs_grad = rhs_cuda.grad().expect("CUDA asymmetric batch rhs grad");
+            let lhs_ref = lhs_cpu.grad().expect("CPU asymmetric batch lhs grad");
+            let rhs_ref = rhs_cpu.grad().expect("CPU asymmetric batch rhs grad");
+            assert_eq!(lhs_grad.len(), m * k);
+            assert_eq!(rhs_grad.len(), k * n);
+            for (got, expect) in lhs_grad.iter().zip(lhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{lhs_dtype:?}x{rhs_dtype:?} asymmetric lhs grad got {got}, expect {expect}"
+                );
+            }
+            for (got, expect) in rhs_grad.iter().zip(rhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{lhs_dtype:?}x{rhs_dtype:?} asymmetric rhs grad got {got}, expect {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let lhs_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75, 1.25, -0.5, 0.75];
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for lhs_dtype in [DType::F16, DType::F32, DType::BF16] {
+            let lhs_cpu = make_grad_tensor(&[2, 3], lhs_data.clone());
+            lhs_cpu.cast_inplace(lhs_dtype);
+            let rhs_cpu = make_grad_tensor(&[3, 3], rhs_data.clone());
+            rhs_cpu.cast_inplace(DType::I8);
+
+            let lhs_cuda = make_grad_tensor(&[2, 3], lhs_data.clone());
+            lhs_cuda.cast_inplace(lhs_dtype);
+            let lhs_cuda = lhs_cuda.to_cuda();
+            let rhs_cuda = make_grad_tensor(&[3, 3], rhs_data.clone());
+            rhs_cuda.cast_inplace(DType::I8);
+            let rhs_cuda = rhs_cuda.to_cuda();
+
+            let loss_cuda = sum(&matmul(&lhs_cuda, &rhs_cuda));
+            loss_cuda.backward();
+
+            let loss_cpu = sum(&matmul(&lhs_cpu, &rhs_cpu));
+            loss_cpu.backward();
+
+            assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(rhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(!rhs_cuda.has_host_f32_data());
+            assert!(!lhs_cuda.has_host_grad());
+            assert!(!rhs_cuda.has_host_grad());
+
+            let lhs_grad = lhs_cuda.grad().expect("CUDA mixed matmul lhs grad");
+            let rhs_grad = rhs_cuda.grad().expect("CUDA mixed matmul rhs grad");
+            let lhs_ref = lhs_cpu.grad().expect("CPU mixed matmul lhs grad");
+            let rhs_ref = rhs_cpu.grad().expect("CPU mixed matmul rhs grad");
+            for (got, expect) in lhs_grad.iter().zip(lhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{lhs_dtype:?}xI8 matmul lhs grad got {got}, expect {expect}"
+                );
+            }
+            for (got, expect) in rhs_grad.iter().zip(rhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "{lhs_dtype:?}xI8 matmul rhs grad got {got}, expect {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let lhs_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75, 1.25, -0.5, 0.75];
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for rhs_dtype in [DType::F16, DType::F32, DType::BF16] {
+            let lhs_cpu = make_grad_tensor(&[2, 3], lhs_data.clone());
+            lhs_cpu.cast_inplace(DType::I8);
+            let rhs_cpu = make_grad_tensor(&[3, 3], rhs_data.clone());
+            rhs_cpu.cast_inplace(rhs_dtype);
+
+            let lhs_cuda = make_grad_tensor(&[2, 3], lhs_data.clone());
+            lhs_cuda.cast_inplace(DType::I8);
+            let lhs_cuda = lhs_cuda.to_cuda();
+            let rhs_cuda = make_grad_tensor(&[3, 3], rhs_data.clone());
+            rhs_cuda.cast_inplace(rhs_dtype);
+            let rhs_cuda = rhs_cuda.to_cuda();
+
+            let loss_cuda = sum(&matmul(&lhs_cuda, &rhs_cuda));
+            loss_cuda.backward();
+
+            let loss_cpu = sum(&matmul(&lhs_cpu, &rhs_cpu));
+            loss_cpu.backward();
+
+            assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(rhs_cuda.cloned_cuda_f32_grad().is_some());
+            assert!(!lhs_cuda.has_host_f32_data());
+            assert!(!lhs_cuda.has_host_grad());
+            assert!(!rhs_cuda.has_host_grad());
+
+            let lhs_grad = lhs_cuda.grad().expect("CUDA I8xfloatlike matmul lhs grad");
+            let rhs_grad = rhs_cuda.grad().expect("CUDA I8xfloatlike matmul rhs grad");
+            let lhs_ref = lhs_cpu.grad().expect("CPU I8xfloatlike matmul lhs grad");
+            let rhs_ref = rhs_cpu.grad().expect("CPU I8xfloatlike matmul rhs grad");
+            for (got, expect) in lhs_grad.iter().zip(lhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "I8x{rhs_dtype:?} matmul lhs grad got {got}, expect {expect}"
+                );
+            }
+            for (got, expect) in rhs_grad.iter().zip(rhs_ref.iter()) {
+                assert!(
+                    (got - expect).abs() <= 0.08,
+                    "I8x{rhs_dtype:?} matmul rhs grad got {got}, expect {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
     }
 
     #[cfg(feature = "cuda")]
@@ -7732,5 +11329,771 @@ mod tests {
                 "rhs grad got {got}, expect {expect}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "performance sanity test; run with --ignored --nocapture"]
+    fn cpu_batch_matmul_backward_lowp_perf_smoke() {
+        let b = 4;
+        let h = 4;
+        let m = 16;
+        let k = 64;
+        let n = 32;
+        let lhs_data = (0..b * h * m * k)
+            .map(|i| (i as f32 % 251.0) / 41.0 - 2.75)
+            .collect::<Vec<_>>();
+        let rhs_data = (0..b * h * k * n)
+            .map(|i| ((i * 23) as f32 % 239.0) / 53.0 - 2.25)
+            .collect::<Vec<_>>();
+        let grad = ndarray::Array::from_shape_vec(
+            ndarray::IxDyn(&[b, h, m, n]),
+            (0..b * h * m * n)
+                .map(|i| ((i * 11) as f32 % 89.0) / 29.0 - 1.25)
+                .collect::<Vec<_>>(),
+        )
+        .expect("grad shape mismatch")
+        .into_dyn();
+
+        let measure = |lhs_dtype: DType, rhs_dtype: DType| {
+            let lhs = make_tensor(&[b, h, m, k], lhs_data.clone(), lhs_dtype);
+            let rhs = make_tensor(&[b, h, k, n], rhs_data.clone(), rhs_dtype);
+            let start = std::time::Instant::now();
+            let (d_lhs, d_rhs) =
+                batch_matmul_backward_cpu_f32(&lhs, &rhs, &grad.view(), b, h, m, k, n);
+            let elapsed_us = start.elapsed().as_secs_f64() * 1.0e6;
+            assert_eq!(d_lhs.shape(), &[b, h, m, k]);
+            assert_eq!(d_rhs.shape(), &[b, h, k, n]);
+            assert!(d_lhs.iter().all(|v| v.is_finite()));
+            assert!(d_rhs.iter().all(|v| v.is_finite()));
+            elapsed_us
+        };
+
+        let bf16_bf16_us = measure(DType::BF16, DType::BF16);
+        let i8_i8_us = measure(DType::I8, DType::I8);
+        let bf16_i8_us = measure(DType::BF16, DType::I8);
+        let f32_i8_us = measure(DType::F32, DType::I8);
+
+        println!(
+            "cpu batch_matmul backward b={b} h={h} m={m} n={n} k={k}: bf16xbf16={bf16_bf16_us:.1}us, i8xi8={i8_i8_us:.1}us, bf16xi8={bf16_i8_us:.1}us, f32xi8={f32_i8_us:.1}us"
+        );
+
+        let mm_m = 64;
+        let mm_n = 64;
+        let mm_k = 128;
+        let mm_lhs = (0..mm_m * mm_k)
+            .map(|i| (i as f32 % 251.0) / 43.0 - 2.5)
+            .collect::<Vec<_>>();
+        let mm_rhs = (0..mm_n * mm_k)
+            .map(|i| ((i * 19) as f32 % 239.0) / 47.0 - 2.0)
+            .collect::<Vec<_>>();
+        let mm_grad = ndarray::Array::from_shape_vec(
+            ndarray::IxDyn(&[mm_m, mm_n]),
+            (0..mm_m * mm_n)
+                .map(|i| ((i * 13) as f32 % 97.0) / 31.0 - 1.5)
+                .collect::<Vec<_>>(),
+        )
+        .expect("matmul grad shape mismatch")
+        .into_dyn();
+
+        let measure_mm = |lhs_dtype: DType, rhs_dtype: DType| {
+            let lhs = make_tensor(&[mm_m, mm_k], mm_lhs.clone(), lhs_dtype);
+            let rhs = make_tensor(&[mm_n, mm_k], mm_rhs.clone(), rhs_dtype);
+            let start = std::time::Instant::now();
+            let (d_lhs, d_rhs) =
+                matmul_backward_cpu_f32(&lhs, &rhs, &mm_grad.view(), mm_m, mm_k, mm_n);
+            let elapsed_us = start.elapsed().as_secs_f64() * 1.0e6;
+            assert_eq!(d_lhs.shape(), &[mm_m, mm_k]);
+            assert_eq!(d_rhs.shape(), &[mm_n, mm_k]);
+            assert!(d_lhs.iter().all(|v| v.is_finite()));
+            assert!(d_rhs.iter().all(|v| v.is_finite()));
+            elapsed_us
+        };
+
+        let mm_bf16_bf16_us = measure_mm(DType::BF16, DType::BF16);
+        let mm_i8_i8_us = measure_mm(DType::I8, DType::I8);
+        let mm_bf16_i8_us = measure_mm(DType::BF16, DType::I8);
+        let mm_f32_i8_us = measure_mm(DType::F32, DType::I8);
+
+        println!(
+            "cpu matmul backward m={mm_m} n={mm_n} k={mm_k}: bf16xbf16={mm_bf16_bf16_us:.1}us, i8xi8={mm_i8_i8_us:.1}us, bf16xi8={mm_bf16_i8_us:.1}us, f32xi8={mm_f32_i8_us:.1}us"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "performance sanity test; run with --ignored --nocapture"]
+    fn cuda_resident_lowp_matmul_perf_smoke() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        fn median_cuda_us(mut run: impl FnMut()) -> f64 {
+            run();
+            crate::ops::cuda::synchronize().expect("sync CUDA performance warmup");
+            let mut samples = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                run();
+                crate::ops::cuda::synchronize().expect("sync CUDA performance sample");
+                samples.push(start.elapsed().as_secs_f64() * 1.0e6);
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        let m = 128;
+        let n = 128;
+        let k = 256;
+        let a = (0..m * k)
+            .map(|i| (i as f32 % 251.0) / 43.0 - 2.5)
+            .collect::<Vec<_>>();
+        let b = (0..n * k)
+            .map(|i| ((i * 19) as f32 % 239.0) / 47.0 - 2.0)
+            .collect::<Vec<_>>();
+
+        let a_f32 = crate::ops::cuda::upload_f32(&a).expect("upload matmul a f32");
+        let b_f32 = crate::ops::cuda::upload_f32(&b).expect("upload matmul b f32");
+        let f32_out = crate::ops::cuda::matmul_f32_no_host(&a_f32, &b_f32, m, n, k)
+            .expect("CUDA f32 matmul perf path");
+        let f32_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_f32_no_host(&a_f32, &b_f32, m, n, k)
+                .expect("CUDA f32 matmul performance sample");
+        });
+        let f32_vals = crate::ops::cuda::download_f32(&f32_out).expect("download f32 matmul");
+
+        let a_f16 = a
+            .iter()
+            .map(|&v| f16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let b_f16 = b
+            .iter()
+            .map(|&v| f16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let a_f16_buf = crate::ops::cuda::upload_u16_storage(&a_f16).expect("upload matmul a f16");
+        let b_f16_buf = crate::ops::cuda::upload_u16_storage(&b_f16).expect("upload matmul b f16");
+        let f16_out = crate::ops::cuda::matmul_f16_buffer_no_host(&a_f16_buf, &b_f16_buf, m, n, k)
+            .expect("CUDA resident f16 matmul perf path");
+        let f16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_f16_buffer_no_host(&a_f16_buf, &b_f16_buf, m, n, k)
+                .expect("CUDA resident f16 matmul performance sample");
+        });
+        let f16_vals = crate::ops::cuda::download_f32(&f16_out).expect("download f16 matmul");
+
+        let a_bf16 = a
+            .iter()
+            .map(|&v| bf16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let b_bf16 = b
+            .iter()
+            .map(|&v| bf16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let a_bf16_buf =
+            crate::ops::cuda::upload_u16_storage(&a_bf16).expect("upload matmul a bf16");
+        let b_bf16_buf =
+            crate::ops::cuda::upload_u16_storage(&b_bf16).expect("upload matmul b bf16");
+        let bf16_out =
+            crate::ops::cuda::matmul_bf16_buffer_no_host(&a_bf16_buf, &b_bf16_buf, m, n, k)
+                .expect("CUDA resident bf16 matmul perf path");
+        let bf16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_bf16_buffer_no_host(&a_bf16_buf, &b_bf16_buf, m, n, k)
+                .expect("CUDA resident bf16 matmul performance sample");
+        });
+        let bf16_vals = crate::ops::cuda::download_f32(&bf16_out).expect("download bf16 matmul");
+
+        let a_i8 = a
+            .iter()
+            .map(|&v| (v / 0.05).round().clamp(-127.0, 127.0) as i8)
+            .collect::<Vec<_>>();
+        let b_i8 = b
+            .iter()
+            .map(|&v| (v / 0.05).round().clamp(-127.0, 127.0) as i8)
+            .collect::<Vec<_>>();
+        let a_i8_buf = crate::ops::cuda::upload_i8_storage(&a_i8).expect("upload matmul a i8");
+        let b_i8_buf = crate::ops::cuda::upload_i8_storage(&b_i8).expect("upload matmul b i8");
+        let i8_out =
+            crate::ops::cuda::matmul_i8_buffer_no_host(&a_i8_buf, 0.05, &b_i8_buf, 0.05, m, n, k)
+                .expect("CUDA resident i8 matmul perf path");
+        let i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_i8_buffer_no_host(
+                &a_i8_buf, 0.05, &b_i8_buf, 0.05, m, n, k,
+            )
+            .expect("CUDA resident i8 matmul performance sample");
+        });
+        let i8_vals = crate::ops::cuda::download_f32(&i8_out).expect("download i8 matmul");
+        let i8_typed_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_i8_typed_output_buffer_no_host(
+                &a_i8_buf, 0.05, &b_i8_buf, 0.05, m, n, k,
+            )
+            .expect("CUDA resident typed-output i8 matmul performance sample");
+        });
+        let mut i8_quant_ref = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0i32;
+                for kk in 0..k {
+                    acc += (a_i8[row * k + kk] as i32) * (b_i8[col * k + kk] as i32);
+                }
+                i8_quant_ref[row * n + col] = (acc as f32) * 0.05 * 0.05;
+            }
+        }
+
+        let max_err = |vals: &[f32]| {
+            vals.iter()
+                .zip(f32_vals.iter())
+                .map(|(&got, &expect)| (got - expect).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let max_err_against = |vals: &[f32], reference: &[f32]| {
+            vals.iter()
+                .zip(reference.iter())
+                .map(|(&got, &expect)| (got - expect).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        println!(
+            "cuda resident lowp matmul m={m} n={n} k={k}: f32={f32_us:.1}us, f16={f16_us:.1}us max_err={:.5}, bf16={bf16_us:.1}us max_err={:.5}, i8_f32_out={i8_us:.1}us i8_typed_out={i8_typed_us:.1}us kernel_err={:.5} quant_err={:.5}",
+            max_err(&f16_vals),
+            max_err(&bf16_vals),
+            max_err_against(&i8_vals, &i8_quant_ref),
+            max_err(&i8_vals)
+        );
+
+        let f16_i8_out =
+            crate::ops::cuda::matmul_f16_i8_buffer_no_host(&a_f16_buf, &b_i8_buf, 0.05, m, n, k)
+                .expect("CUDA F16xI8 matmul perf path");
+        let f16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_f16_i8_buffer_no_host(
+                &a_f16_buf, &b_i8_buf, 0.05, m, n, k,
+            )
+            .expect("CUDA F16xI8 matmul performance sample");
+        });
+        let f16_i8_vals =
+            crate::ops::cuda::download_f32(&f16_i8_out).expect("download F16xI8 matmul");
+        let bf16_i8_out =
+            crate::ops::cuda::matmul_bf16_i8_buffer_no_host(&a_bf16_buf, &b_i8_buf, 0.05, m, n, k)
+                .expect("CUDA BF16xI8 matmul perf path");
+        let bf16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_bf16_i8_buffer_no_host(
+                &a_bf16_buf,
+                &b_i8_buf,
+                0.05,
+                m,
+                n,
+                k,
+            )
+            .expect("CUDA BF16xI8 matmul performance sample");
+        });
+        let bf16_i8_vals =
+            crate::ops::cuda::download_f32(&bf16_i8_out).expect("download BF16xI8 matmul");
+        let f32_i8_out =
+            crate::ops::cuda::matmul_f32_i8_buffer_no_host(&a_f32, &b_i8_buf, 0.05, m, n, k)
+                .expect("CUDA F32xI8 matmul perf path");
+        let f32_i8_us = median_cuda_us(|| {
+            let _ =
+                crate::ops::cuda::matmul_f32_i8_buffer_no_host(&a_f32, &b_i8_buf, 0.05, m, n, k)
+                    .expect("CUDA F32xI8 matmul performance sample");
+        });
+        let f32_i8_vals =
+            crate::ops::cuda::download_f32(&f32_i8_out).expect("download F32xI8 matmul");
+        println!(
+            "cuda resident mixed matmul m={m} n={n} k={k}: f16xi8={f16_i8_us:.1}us quant_err={:.5} f32_err={:.5}, bf16xi8={bf16_i8_us:.1}us quant_err={:.5} f32_err={:.5}, f32xi8={f32_i8_us:.1}us quant_err={:.5} f32_err={:.5}",
+            max_err_against(&f16_i8_vals, &i8_quant_ref),
+            max_err(&f16_i8_vals),
+            max_err_against(&bf16_i8_vals, &i8_quant_ref),
+            max_err(&bf16_i8_vals),
+            max_err_against(&f32_i8_vals, &i8_quant_ref),
+            max_err(&f32_i8_vals)
+        );
+
+        let i8_f16_out =
+            crate::ops::cuda::matmul_i8_f16_buffer_no_host(&a_i8_buf, 0.05, &b_f16_buf, m, n, k)
+                .expect("CUDA I8xF16 matmul perf path");
+        let i8_f16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_i8_f16_buffer_no_host(
+                &a_i8_buf, 0.05, &b_f16_buf, m, n, k,
+            )
+            .expect("CUDA I8xF16 matmul performance sample");
+        });
+        let i8_f16_vals =
+            crate::ops::cuda::download_f32(&i8_f16_out).expect("download I8xF16 matmul");
+        let i8_bf16_out =
+            crate::ops::cuda::matmul_i8_bf16_buffer_no_host(&a_i8_buf, 0.05, &b_bf16_buf, m, n, k)
+                .expect("CUDA I8xBF16 matmul perf path");
+        let i8_bf16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_i8_bf16_buffer_no_host(
+                &a_i8_buf,
+                0.05,
+                &b_bf16_buf,
+                m,
+                n,
+                k,
+            )
+            .expect("CUDA I8xBF16 matmul performance sample");
+        });
+        let i8_bf16_vals =
+            crate::ops::cuda::download_f32(&i8_bf16_out).expect("download I8xBF16 matmul");
+        let i8_f32_out =
+            crate::ops::cuda::matmul_i8_f32_buffer_no_host(&a_i8_buf, 0.05, &b_f32, m, n, k)
+                .expect("CUDA I8xF32 matmul perf path");
+        let i8_f32_us = median_cuda_us(|| {
+            let _ =
+                crate::ops::cuda::matmul_i8_f32_buffer_no_host(&a_i8_buf, 0.05, &b_f32, m, n, k)
+                    .expect("CUDA I8xF32 matmul performance sample");
+        });
+        let i8_f32_vals =
+            crate::ops::cuda::download_f32(&i8_f32_out).expect("download I8xF32 matmul");
+
+        let mut i8_lhs_ref = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += (a_i8[row * k + kk] as f32) * 0.05 * b[col * k + kk];
+                }
+                i8_lhs_ref[row * n + col] = acc;
+            }
+        }
+        println!(
+            "cuda resident mixed matmul mirrored m={m} n={n} k={k}: i8xf16={i8_f16_us:.1}us quant_err={:.5} f32_err={:.5}, i8xbf16={i8_bf16_us:.1}us quant_err={:.5} f32_err={:.5}, i8xf32={i8_f32_us:.1}us quant_err={:.5} f32_err={:.5}",
+            max_err_against(&i8_f16_vals, &i8_lhs_ref),
+            max_err(&i8_f16_vals),
+            max_err_against(&i8_bf16_vals, &i8_lhs_ref),
+            max_err(&i8_bf16_vals),
+            max_err_against(&i8_f32_vals, &i8_lhs_ref),
+            max_err(&i8_f32_vals)
+        );
+
+        let batch_count = 8;
+        let bm = 16;
+        let bn = 32;
+        let bk = 64;
+        let lhs = (0..batch_count * bm * bk)
+            .map(|i| (i as f32 % 251.0) / 41.0 - 2.75)
+            .collect::<Vec<_>>();
+        let rhs = (0..batch_count * bk * bn)
+            .map(|i| ((i * 23) as f32 % 239.0) / 53.0 - 2.25)
+            .collect::<Vec<_>>();
+        let lhs_f32 = crate::ops::cuda::upload_f32(&lhs).expect("upload batch lhs f32");
+        let rhs_f32 = crate::ops::cuda::upload_f32(&rhs).expect("upload batch rhs f32");
+        let batch_f32_out =
+            crate::ops::cuda::batch_matmul_f32_no_host(&lhs_f32, &rhs_f32, batch_count, bm, bn, bk)
+                .expect("CUDA f32 batch_matmul perf path");
+        let batch_f32_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_f32_no_host(
+                &lhs_f32,
+                &rhs_f32,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA f32 batch_matmul performance sample");
+        });
+        let batch_f32_vals =
+            crate::ops::cuda::download_f32(&batch_f32_out).expect("download f32 batch_matmul");
+
+        let lhs_bf16 = lhs
+            .iter()
+            .map(|&v| bf16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let lhs_f16 = lhs
+            .iter()
+            .map(|&v| f16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let rhs_i8 = rhs
+            .iter()
+            .map(|&v| (v / 0.05).round().clamp(-127.0, 127.0) as i8)
+            .collect::<Vec<_>>();
+        let lhs_i8 = lhs
+            .iter()
+            .map(|&v| (v / 0.05).round().clamp(-127.0, 127.0) as i8)
+            .collect::<Vec<_>>();
+        let rhs_bf16 = rhs
+            .iter()
+            .map(|&v| bf16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let rhs_f16 = rhs
+            .iter()
+            .map(|&v| f16::from_f32(v).to_bits())
+            .collect::<Vec<_>>();
+        let lhs_bf16_buf =
+            crate::ops::cuda::upload_u16_storage(&lhs_bf16).expect("upload batch lhs bf16");
+        let lhs_f16_buf =
+            crate::ops::cuda::upload_u16_storage(&lhs_f16).expect("upload batch lhs f16");
+        let lhs_i8_buf = crate::ops::cuda::upload_i8_storage(&lhs_i8).expect("upload batch lhs i8");
+        let rhs_i8_buf = crate::ops::cuda::upload_i8_storage(&rhs_i8).expect("upload batch rhs i8");
+        let rhs_bf16_buf =
+            crate::ops::cuda::upload_u16_storage(&rhs_bf16).expect("upload batch rhs bf16");
+        let rhs_f16_buf =
+            crate::ops::cuda::upload_u16_storage(&rhs_f16).expect("upload batch rhs f16");
+        let batch_f16_i8_out = crate::ops::cuda::batch_matmul_f16_i8_buffer_no_host(
+            &lhs_f16_buf,
+            &rhs_i8_buf,
+            0.05,
+            batch_count,
+            bm,
+            bn,
+            bk,
+        )
+        .expect("CUDA F16xI8 batch_matmul perf path");
+        let batch_f16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_f16_i8_buffer_no_host(
+                &lhs_f16_buf,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA F16xI8 batch_matmul performance sample");
+        });
+        let batch_f16_i8_vals = crate::ops::cuda::download_f32(&batch_f16_i8_out)
+            .expect("download F16xI8 batch_matmul");
+
+        let batch_bf16_i8_out = crate::ops::cuda::batch_matmul_bf16_i8_buffer_no_host(
+            &lhs_bf16_buf,
+            &rhs_i8_buf,
+            0.05,
+            batch_count,
+            bm,
+            bn,
+            bk,
+        )
+        .expect("CUDA BF16xI8 batch_matmul perf path");
+        let batch_bf16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_bf16_i8_buffer_no_host(
+                &lhs_bf16_buf,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA BF16xI8 batch_matmul performance sample");
+        });
+        let batch_bf16_i8_vals = crate::ops::cuda::download_f32(&batch_bf16_i8_out)
+            .expect("download BF16xI8 batch_matmul");
+
+        let batch_f32_i8_out = crate::ops::cuda::batch_matmul_f32_i8_buffer_no_host(
+            &lhs_f32,
+            &rhs_i8_buf,
+            0.05,
+            batch_count,
+            bm,
+            bn,
+            bk,
+        )
+        .expect("CUDA F32xI8 batch_matmul perf path");
+        let batch_f32_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_f32_i8_buffer_no_host(
+                &lhs_f32,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA F32xI8 batch_matmul performance sample");
+        });
+        let batch_f32_i8_vals = crate::ops::cuda::download_f32(&batch_f32_i8_out)
+            .expect("download F32xI8 batch_matmul");
+
+        let mut batch_quant_ref = vec![0.0f32; batch_count * bm * bn];
+        for batch in 0..batch_count {
+            for row in 0..bm {
+                for col in 0..bn {
+                    let mut acc = 0.0f32;
+                    for kk in 0..bk {
+                        acc += lhs[batch * bm * bk + row * bk + kk]
+                            * (rhs_i8[batch * bk * bn + kk * bn + col] as f32)
+                            * 0.05;
+                    }
+                    batch_quant_ref[batch * bm * bn + row * bn + col] = acc;
+                }
+            }
+        }
+        println!(
+            "cuda resident mixed batch_matmul batch={batch_count} m={bm} n={bn} k={bk}: f32={batch_f32_us:.1}us, f16xi8={batch_f16_i8_us:.1}us quant_err={:.5} f32_err={:.5}, bf16xi8={batch_bf16_i8_us:.1}us quant_err={:.5} f32_err={:.5}, f32xi8={batch_f32_i8_us:.1}us quant_err={:.5} f32_err={:.5}",
+            max_err_against(&batch_f16_i8_vals, &batch_quant_ref),
+            max_err_against(&batch_f16_i8_vals, &batch_f32_vals),
+            max_err_against(&batch_bf16_i8_vals, &batch_quant_ref),
+            max_err_against(&batch_bf16_i8_vals, &batch_f32_vals),
+            max_err_against(&batch_f32_i8_vals, &batch_quant_ref),
+            max_err_against(&batch_f32_i8_vals, &batch_f32_vals)
+        );
+
+        let batch_i8_f16_out = crate::ops::cuda::batch_matmul_i8_f16_buffer_no_host(
+            &lhs_i8_buf,
+            0.05,
+            &rhs_f16_buf,
+            batch_count,
+            bm,
+            bn,
+            bk,
+        )
+        .expect("CUDA I8xF16 batch_matmul perf path");
+        let batch_i8_f16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_i8_f16_buffer_no_host(
+                &lhs_i8_buf,
+                0.05,
+                &rhs_f16_buf,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA I8xF16 batch_matmul performance sample");
+        });
+        let batch_i8_f16_vals = crate::ops::cuda::download_f32(&batch_i8_f16_out)
+            .expect("download I8xF16 batch_matmul");
+
+        let batch_i8_bf16_out = crate::ops::cuda::batch_matmul_i8_bf16_buffer_no_host(
+            &lhs_i8_buf,
+            0.05,
+            &rhs_bf16_buf,
+            batch_count,
+            bm,
+            bn,
+            bk,
+        )
+        .expect("CUDA I8xBF16 batch_matmul perf path");
+        let batch_i8_bf16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_i8_bf16_buffer_no_host(
+                &lhs_i8_buf,
+                0.05,
+                &rhs_bf16_buf,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA I8xBF16 batch_matmul performance sample");
+        });
+        let batch_i8_bf16_vals = crate::ops::cuda::download_f32(&batch_i8_bf16_out)
+            .expect("download I8xBF16 batch_matmul");
+
+        let batch_i8_f32_out = crate::ops::cuda::batch_matmul_i8_f32_buffer_no_host(
+            &lhs_i8_buf,
+            0.05,
+            &rhs_f32,
+            batch_count,
+            bm,
+            bn,
+            bk,
+        )
+        .expect("CUDA I8xF32 batch_matmul perf path");
+        let batch_i8_f32_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_i8_f32_buffer_no_host(
+                &lhs_i8_buf,
+                0.05,
+                &rhs_f32,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA I8xF32 batch_matmul performance sample");
+        });
+        let batch_i8_f32_vals = crate::ops::cuda::download_f32(&batch_i8_f32_out)
+            .expect("download I8xF32 batch_matmul");
+
+        let mut batch_i8_lhs_ref = vec![0.0f32; batch_count * bm * bn];
+        for batch in 0..batch_count {
+            for row in 0..bm {
+                for col in 0..bn {
+                    let mut acc = 0.0f32;
+                    for kk in 0..bk {
+                        acc += (lhs_i8[batch * bm * bk + row * bk + kk] as f32)
+                            * 0.05
+                            * rhs[batch * bk * bn + kk * bn + col];
+                    }
+                    batch_i8_lhs_ref[batch * bm * bn + row * bn + col] = acc;
+                }
+            }
+        }
+        println!(
+            "cuda resident mixed batch_matmul mirrored batch={batch_count} m={bm} n={bn} k={bk}: i8xf16={batch_i8_f16_us:.1}us quant_err={:.5} f32_err={:.5}, i8xbf16={batch_i8_bf16_us:.1}us quant_err={:.5} f32_err={:.5}, i8xf32={batch_i8_f32_us:.1}us quant_err={:.5} f32_err={:.5}",
+            max_err_against(&batch_i8_f16_vals, &batch_i8_lhs_ref),
+            max_err_against(&batch_i8_f16_vals, &batch_f32_vals),
+            max_err_against(&batch_i8_bf16_vals, &batch_i8_lhs_ref),
+            max_err_against(&batch_i8_bf16_vals, &batch_f32_vals),
+            max_err_against(&batch_i8_f32_vals, &batch_i8_lhs_ref),
+            max_err_against(&batch_i8_f32_vals, &batch_f32_vals)
+        );
+
+        let batch_i8_i8_f32_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_i8_buffer_no_host(
+                &lhs_i8_buf,
+                0.05,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA I8xI8 f32-output batch_matmul performance sample");
+        });
+
+        let batch_i8_i8_typed_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_i8_typed_output_buffer_no_host(
+                &lhs_i8_buf,
+                0.05,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bn,
+                bk,
+            )
+            .expect("CUDA I8xI8 typed-output batch_matmul performance sample");
+        });
+        println!(
+            "cuda resident I8xI8 batch_matmul batch={batch_count} m={bm} n={bn} k={bk}: f32_out={batch_i8_i8_f32_us:.1}us, typed_i8_out={batch_i8_i8_typed_us:.1}us"
+        );
+
+        let grad = (0..m * n)
+            .map(|i| ((i * 13) as f32 % 97.0) / 31.0 - 1.5)
+            .collect::<Vec<_>>();
+        let grad_buf = crate::ops::cuda::upload_f32(&grad).expect("upload matmul grad");
+        let backward_f16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_backward_f16_i8_no_host(
+                &grad_buf, &a_f16_buf, &b_i8_buf, 0.05, m, k, n,
+            )
+            .expect("CUDA F16xI8 matmul backward performance sample");
+        });
+        let backward_bf16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_backward_bf16_i8_no_host(
+                &grad_buf,
+                &a_bf16_buf,
+                &b_i8_buf,
+                0.05,
+                m,
+                k,
+                n,
+            )
+            .expect("CUDA BF16xI8 matmul backward performance sample");
+        });
+        let backward_f32_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_backward_f32_i8_no_host(
+                &grad_buf, &a_f32, &b_i8_buf, 0.05, m, k, n,
+            )
+            .expect("CUDA F32xI8 matmul backward performance sample");
+        });
+        let backward_i8_f16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_backward_i8_f16_no_host(
+                &grad_buf, &a_i8_buf, 0.05, &b_f16_buf, m, k, n,
+            )
+            .expect("CUDA I8xF16 matmul backward performance sample");
+        });
+        let backward_i8_bf16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_backward_i8_bf16_no_host(
+                &grad_buf,
+                &a_i8_buf,
+                0.05,
+                &b_bf16_buf,
+                m,
+                k,
+                n,
+            )
+            .expect("CUDA I8xBF16 matmul backward performance sample");
+        });
+        let backward_i8_f32_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::matmul_backward_i8_f32_no_host(
+                &grad_buf, &a_i8_buf, 0.05, &b_f32, m, k, n,
+            )
+            .expect("CUDA I8xF32 matmul backward performance sample");
+        });
+
+        let batch_grad = (0..batch_count * bm * bn)
+            .map(|i| ((i * 11) as f32 % 89.0) / 29.0 - 1.25)
+            .collect::<Vec<_>>();
+        let batch_grad_buf =
+            crate::ops::cuda::upload_f32(&batch_grad).expect("upload batch_matmul grad");
+        let batch_backward_f16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_backward_f16_i8_no_host(
+                &batch_grad_buf,
+                &lhs_f16_buf,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bk,
+                bn,
+            )
+            .expect("CUDA F16xI8 batch_matmul backward performance sample");
+        });
+        let batch_backward_bf16_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_backward_bf16_i8_no_host(
+                &batch_grad_buf,
+                &lhs_bf16_buf,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bk,
+                bn,
+            )
+            .expect("CUDA BF16xI8 batch_matmul backward performance sample");
+        });
+        let batch_backward_f32_i8_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_backward_f32_i8_no_host(
+                &batch_grad_buf,
+                &lhs_f32,
+                &rhs_i8_buf,
+                0.05,
+                batch_count,
+                bm,
+                bk,
+                bn,
+            )
+            .expect("CUDA F32xI8 batch_matmul backward performance sample");
+        });
+        let batch_backward_i8_f16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_backward_i8_f16_no_host(
+                &batch_grad_buf,
+                &lhs_i8_buf,
+                0.05,
+                &rhs_f16_buf,
+                batch_count,
+                bm,
+                bk,
+                bn,
+            )
+            .expect("CUDA I8xF16 batch_matmul backward performance sample");
+        });
+        let batch_backward_i8_bf16_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_backward_i8_bf16_no_host(
+                &batch_grad_buf,
+                &lhs_i8_buf,
+                0.05,
+                &rhs_bf16_buf,
+                batch_count,
+                bm,
+                bk,
+                bn,
+            )
+            .expect("CUDA I8xBF16 batch_matmul backward performance sample");
+        });
+        let batch_backward_i8_f32_us = median_cuda_us(|| {
+            let _ = crate::ops::cuda::batch_matmul_backward_i8_f32_no_host(
+                &batch_grad_buf,
+                &lhs_i8_buf,
+                0.05,
+                &rhs_f32,
+                batch_count,
+                bm,
+                bk,
+                bn,
+            )
+            .expect("CUDA I8xF32 batch_matmul backward performance sample");
+        });
+
+        println!(
+            "cuda resident mixed backward: matmul f16xi8={backward_f16_i8_us:.1}us bf16xi8={backward_bf16_i8_us:.1}us f32xi8={backward_f32_i8_us:.1}us i8xf16={backward_i8_f16_us:.1}us i8xbf16={backward_i8_bf16_us:.1}us i8xf32={backward_i8_f32_us:.1}us; batch_matmul f16xi8={batch_backward_f16_i8_us:.1}us bf16xi8={batch_backward_bf16_i8_us:.1}us f32xi8={batch_backward_f32_i8_us:.1}us i8xf16={batch_backward_i8_f16_us:.1}us i8xbf16={batch_backward_i8_bf16_us:.1}us i8xf32={batch_backward_i8_f32_us:.1}us"
+        );
     }
 }

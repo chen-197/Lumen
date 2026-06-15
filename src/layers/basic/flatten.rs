@@ -7,6 +7,13 @@ impl Flatten {
         Flatten
     }
 }
+
+impl Default for Flatten {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Module for Flatten {
     fn forward(&self, input: Tensor) -> Tensor {
         let shape = input.shape_vec();

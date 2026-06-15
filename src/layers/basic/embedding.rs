@@ -90,10 +90,118 @@ impl Embedding {
 
         let num_elements = indices.len();
         if output_device == crate::autograd::Device::Cuda && num_elements > 0 {
+            if !build_graph {
+                let native_weight = self.weight.cloned_cuda_native_lowp_buffer();
+                if let Some((dtype, weight_buf, scale)) = native_weight {
+                    let native_out = indices.with_cuda_f32_buffer(|indices_buf| {
+                        cuda::embedding_typed_same_dtype_buffer(
+                            indices_buf,
+                            &weight_buf,
+                            dtype,
+                            num_elements,
+                            v_size,
+                            e_dim,
+                        )
+                    });
+                    match native_out {
+                        Ok(buffer) => {
+                            return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                &out_shape,
+                                buffer,
+                                output_device,
+                                dtype,
+                                if dtype == DType::I8 { scale } else { None },
+                            );
+                        }
+                        Err(err) => {
+                            assert!(
+                                !is_strict_device_execution(),
+                                "embedding CUDA native low precision forward failed while strict device execution is enabled: {err}"
+                            );
+                        }
+                    }
+                }
+
+                let cuda_out = indices.with_cuda_f32_buffer(|indices_buf| {
+                    if let Some((dtype, weight_buf, scale)) =
+                        self.weight.cloned_cuda_native_lowp_buffer()
+                    {
+                        cuda::embedding_typed_buffer(
+                            indices_buf,
+                            &weight_buf,
+                            dtype,
+                            scale,
+                            num_elements,
+                            v_size,
+                            e_dim,
+                        )
+                    } else {
+                        self.weight.with_cuda_f32_buffer(|weight_buf| {
+                            cuda::embedding_f32_buffer(
+                                indices_buf,
+                                weight_buf,
+                                num_elements,
+                                v_size,
+                                e_dim,
+                            )
+                        })
+                    }
+                });
+                match cuda_out {
+                    Ok(buffer) => {
+                        if matches!(self.weight.dtype(), DType::F16 | DType::BF16) {
+                            match cuda::f32_to_lowp_storage_no_host(&buffer, self.weight.dtype()) {
+                                Ok(lowp_buffer) => {
+                                    return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                        &out_shape,
+                                        lowp_buffer,
+                                        output_device,
+                                        self.weight.dtype(),
+                                        None,
+                                    );
+                                }
+                                Err(err) => {
+                                    assert!(
+                                        !is_strict_device_execution(),
+                                        "embedding CUDA low precision output conversion failed while strict device execution is enabled: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                            &out_shape,
+                            buffer,
+                            output_device,
+                            self.weight.dtype(),
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "embedding CUDA forward failed while strict device execution is enabled: {err}"
+                        );
+                    }
+                }
+            }
+
             let cuda_out = indices.with_cuda_f32_buffer(|indices_buf| {
-                self.weight.with_cuda_f32_buffer(|weight_buf| {
-                    cuda::embedding_f32(indices_buf, weight_buf, num_elements, v_size, e_dim)
-                })
+                if let Some((dtype, weight_buf, scale)) =
+                    self.weight.cloned_cuda_native_lowp_buffer()
+                {
+                    cuda::embedding_typed(
+                        indices_buf,
+                        &weight_buf,
+                        dtype,
+                        scale,
+                        num_elements,
+                        v_size,
+                        e_dim,
+                    )
+                } else {
+                    self.weight.with_cuda_f32_buffer(|weight_buf| {
+                        cuda::embedding_f32(indices_buf, weight_buf, num_elements, v_size, e_dim)
+                    })
+                }
             });
             match cuda_out {
                 Ok((buffer, out)) => {
@@ -119,6 +227,9 @@ impl Embedding {
                         bf16_data: None,
                         i8_data: None,
                         cuda_f32_data: Some(buffer),
+                        cuda_f16_data: None,
+                        cuda_bf16_data: None,
+                        cuda_i8_data: None,
                         i8_scale: None,
                         has_f32_data: true,
                         storage_dtype: crate::precision::DType::F32,
@@ -428,6 +539,9 @@ impl Embedding {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: crate::precision::DType::F32,
@@ -621,16 +735,33 @@ mod tests {
         );
 
         let indices = make_tensor(&[2, 2], vec![0.0, 2.0, 5.0, 1.0], DType::F32).to_cuda();
+        assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| emb.forward(&indices));
         crate::autograd::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
+        assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
         let cpu_out = no_grad(|| emb_ref.forward(&indices.to_cpu()));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::BF16);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "CUDA embedding no-grad output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "CUDA embedding no-grad output should not keep a resident f32 compute buffer for bf16 output"
+            );
+            assert!(
+                inner.cuda_bf16_data.is_some(),
+                "CUDA embedding no-grad output should keep resident bf16 storage"
+            );
+        }
 
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
@@ -753,16 +884,33 @@ mod tests {
         );
 
         let indices = make_tensor(&[2, 2], vec![0.0, 2.0, 3.0, 1.0], DType::F32).to_cuda();
+        assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
         crate::ops::cuda::set_enabled(true);
         crate::autograd::set_strict_device_execution(true);
         let cuda_out = no_grad(|| emb.forward(&indices));
         crate::autograd::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
+        assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
         let cpu_out = no_grad(|| emb_ref.forward(&indices.to_cpu()));
         assert!(cuda_out.is_cuda());
         assert_eq!(cuda_out.dtype(), DType::I8);
+        {
+            let inner = cuda_out.0.borrow();
+            assert!(
+                !inner.has_f32_data,
+                "I8 CUDA embedding output should not eagerly materialize host f32 data"
+            );
+            assert!(
+                inner.cuda_f32_data.is_none(),
+                "I8 CUDA embedding output should not keep a resident f32 compute buffer"
+            );
+            assert!(
+                inner.cuda_i8_data.is_some(),
+                "I8 CUDA embedding output should keep resident i8 storage"
+            );
+        }
         for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
             assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
         }

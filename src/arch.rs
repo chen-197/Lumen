@@ -110,6 +110,25 @@ pub fn x86_avx512_bf16_kernel_runtime_available() -> bool {
 }
 
 #[inline]
+pub fn x86_avx512_fp16_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-fp-kernels-nightly",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        x86_avx512_fp_kernel_runtime_available()
+            && std::arch::is_x86_feature_detected!("avx512fp16")
+    }
+    #[cfg(not(all(
+        feature = "x86-fp-kernels-nightly",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
 pub fn x86_fp_kernel_runtime_available() -> bool {
     #[cfg(all(
         feature = "x86-fp-kernels",
@@ -128,14 +147,31 @@ pub fn x86_fp_kernel_runtime_available() -> bool {
 }
 
 #[inline]
+pub fn x86_f16c_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        x86_fp_kernel_runtime_available() && std::arch::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
 pub fn x86_fp16_kernel_runtime_available() -> bool {
     #[cfg(all(
         feature = "x86-fp-kernels",
         any(target_arch = "x86_64", target_arch = "x86")
     ))]
     {
-        x86_avx512_fp_kernel_runtime_available()
-            || (x86_fp_kernel_runtime_available() && std::arch::is_x86_feature_detected!("f16c"))
+        x86_avx512_fp16_kernel_runtime_available() || x86_f16c_kernel_runtime_available()
     }
     #[cfg(not(all(
         feature = "x86-fp-kernels",
@@ -165,9 +201,49 @@ pub fn x86_i8_kernel_runtime_available() -> bool {
 }
 
 #[inline]
+pub fn x86_avx512_i8_i8_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-int8-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        std::arch::is_x86_feature_detected!("avx")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+    }
+    #[cfg(not(all(
+        feature = "x86-int8-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
+pub fn x86_avx512_i8_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-int8-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        x86_avx512_i8_i8_kernel_runtime_available() && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(all(
+        feature = "x86-int8-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
 pub fn preferred_i8_kernel_backend() -> &'static str {
     if arm64_i8_kernel_runtime_available() {
         "arm64-neon"
+    } else if x86_avx512_i8_kernel_runtime_available() {
+        "x86-avx512bw"
     } else if x86_i8_kernel_runtime_available() {
         "x86-avx2"
     } else {
@@ -205,6 +281,8 @@ mod tests {
         let backend = preferred_i8_kernel_backend();
         if arm64_i8_kernel_runtime_available() {
             assert_eq!(backend, "arm64-neon");
+        } else if x86_avx512_i8_kernel_runtime_available() {
+            assert_eq!(backend, "x86-avx512bw");
         } else if x86_i8_kernel_runtime_available() {
             assert_eq!(backend, "x86-avx2");
         } else {
@@ -234,5 +312,10 @@ mod tests {
     #[test]
     fn x86_fp16_probe_is_never_broader_than_fp_backend_probe() {
         assert!(!x86_fp16_kernel_runtime_available() || x86_fp_kernel_runtime_available());
+    }
+
+    #[test]
+    fn x86_f16c_probe_is_never_broader_than_fp_backend_probe() {
+        assert!(!x86_f16c_kernel_runtime_available() || x86_fp_kernel_runtime_available());
     }
 }

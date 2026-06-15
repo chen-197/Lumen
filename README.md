@@ -1,6 +1,6 @@
 # Lumen
 
-> A compact Rust-first deep learning core with dynamic autograd, flexible dtype control, safetensors loading, quantization-aware inference, and CPU/CUDA Llama runtime work.
+> A compact Rust-first neural-network library for studying and building dtype-aware CPU/CUDA execution, dynamic autograd, reusable layers, and Llama-family inference.
 
 [中文说明](./README_zh-CN.md)
 
@@ -8,105 +8,74 @@
 
 ## What this project is
 
-Lumen is a **small but complete Rust-first ML stack** that connects several layers of the system in one repository:
+Lumen is a **small Rust-first neural-network library and deep-learning core**. It keeps several reusable layers of a modern ML stack in one repository:
 
-- a tensor core with dynamic autograd;
+- a Tensor core with dynamic autograd;
 - reusable layers, modules, losses, and optimizers;
-- a Llama-style decoder implementation;
-- safetensors loading with optional streaming;
+- a Llama-style decoder implementation as a built-in model family;
+- safetensors loading with optional streamed loading;
 - runtime dtype control for parameters, activations, and KV cache;
-- optional on-load or offline `i8` quantization;
-- CPU execution paths and optional CUDA acceleration;
-- benchmark tools for CPU/CUDA kernel work and end-to-end inference experiments.
+- optional on-load and offline `i8` quantization;
+- CPU execution paths with x86/ARM kernel work;
+- optional CUDA acceleration through CUDA C++ kernels and NVIDIA libraries;
+- benchmark tools for CPU kernels, CUDA kernels, training-path checks, and end-to-end Llama prefill/decode tests.
 
-This repository is best understood as:
+The project is best understood as a **learning- and experimentation-oriented neural-network library**. A compact Llama-family implementation is maintained as an important end-to-end model path, but it is not the project's only identity.
 
-- a **learning-oriented deep learning core** mainly written in Rust, and
-- a **CPU/CUDA LLM inference playground** centered on a compact Llama runtime.
+It is not intended to be a production serving system, a full training framework, or a plug-and-play launcher for arbitrary checkpoints.
 
-It is **not** trying to be a full training framework, a production serving stack, or a universal launcher for arbitrary checkpoints.
+Lumen is **Rust-first, not Rust-only**. Rust owns the high-level runtime, tensor/autograd system, model code, loader, tokenizer wrapper, dtype policy, CPU backend, and benchmark tools. The optional CUDA backend uses CUDA C++ kernels, cuBLAS/cuDNN, and an FFI boundary to accelerate selected paths.
 
-Lumen is also **not a pure Rust project**. The high-level runtime, tensor/autograd system, model code, loader, tokenizer wrapper, dtype policy, and CPU backend are written in Rust, while the optional CUDA backend uses CUDA C++ kernels and NVIDIA libraries through an FFI boundary.
+---
 
-A more accurate description is:
+## Status at a glance
 
-> Rust-first, not Rust-only.
+| Area | Current status |
+|---|---|
+| Autograd and training | Dynamic autograd, F32 gradients, SGD/SGD-momentum/Adam, CPU and growing CUDA training paths |
+| DTypes | F32, F16, BF16, and I8 storage/runtime paths; I8 uses explicit quantization scales |
+| CPU kernels | Portable fallback plus opt-in x86 and ARM low-precision kernels |
+| CUDA | CUDA-resident tensors, custom kernels, cuBLAS, optional cuDNN, forward and selected backward/training paths |
+| Model support | Built-in Llama-family decoder path with RoPE, GQA, RMSNorm, SwiGLU-style MLP, and KV cache |
+| Validation | Accuracy checks, F32-gradient checks, SGD loss-trend checks, kernel benchmarks, and real-model text checks |
+
+### Precision contract
+
+- Parameters and activations may remain in F32, F16, BF16, or I8 storage when a supported native path is available.
+- Backward gradients are represented and accumulated in **F32**, including when forward data is low precision.
+- Same-dtype low-precision kernels read low-precision storage directly. Some CPU paths accumulate into wider lanes, such as BF16/F16 into F32 or I8 into I32, without first materializing the full input as F32.
+- I8 is quantized computation, not a floating-point training dtype. Its scale must be finite and positive.
+- Supported native paths are tested against scalar, quantized, or CPU references; tolerances depend on dtype and reduction order.
 
 ---
 
 ## Current focus
 
-The project now has both a mature CPU path and an actively improving CUDA path.
+The current codebase focuses on general tensor/autograd/layer behavior, dtype-aware CPU execution, and actively improving CUDA paths. Llama-family support remains an important built-in model path.
 
-Notable parts of the current codebase:
+Important pieces include:
 
-- dynamic autograd and general tensor ops;
-- a Llama-family decoder with RMSNorm, RoPE, GQA, SwiGLU-style MLP, and KV-cache decoding;
-- support for `f32`, `f16`, `bf16`, and `i8` in storage, loading, and runtime configuration;
+- dynamic autograd and general Tensor ops;
+- reusable neural-network layers and sequence-modeling components, including Llama decoder pieces such as RMSNorm, RoPE, GQA, SwiGLU-style MLP, and KV-cache decode;
+- F32, F16, BF16, and I8 storage, loading, and runtime configurations, with F32 gradients;
 - optional CUDA execution behind the `cuda` feature;
-- cuDNN detection that prefers explicit/system installs and can fall back to Python `nvidia.cudnn`;
-- CUDA-resident tensors, KV-cache updates, forward decode, and a growing training/backward path;
-- optional parameter dtype copies for faster mixed-precision execution;
-- optional streamed weight loading for lower peak memory usage;
-- development-only CPU/CUDA kernel, training, and end-to-end prefill/decode benchmarks.
+- CUDA-resident tensors, KV-cache updates, decode-oriented kernels, forward paths, and a growing backward/training path;
+- x86 backend variants such as AVX-512 BF16, AVX2/F16C, and AVX-512BW/AVX2 I8 kernels;
+- optional parameter dtype copies for mixed-precision execution;
+- optional streamed weight loading to reduce peak memory usage;
+- development-only benchmark binaries for CPU/CUDA tuning and end-to-end inference measurements.
 
 ---
 
-## Highlights
-
-- **Rust-first, not Rust-only** implementation
-  - Rust owns the framework structure and most high-level logic.
-  - CUDA C++ is used for optional GPU acceleration.
-  - CPU-only builds remain available without the `cuda` feature.
-- **Dynamic autograd** built around tensor graph construction
-- **Module-style abstraction** for model components
-- **Separated layers / ops / models** for easier experimentation
-- **Flexible precision system**
-  - parameter dtype
-  - runtime dtype
-  - activation dtype
-  - KV-cache dtype
-- **Quantization-aware loading**
-  - load float weights normally
-  - quantize on load to `i8`
-  - generate offline quantized safetensors
-- **CPU and CUDA execution paths** with explicit kernel/backend work
-- **Hugging Face `tokenizers`** integration
-- **Safetensors** support with memory-mapped and streamed loading modes
-- Release profile tuned with `lto`, `panic = "abort"`, and `strip`
-
----
-
-## Rust and CUDA cooperation
-
-Lumen uses Rust and CUDA for different layers of the system.
-
-Rust is responsible for the high-level framework structure:
-
-- tensor representation and dynamic autograd graph construction;
-- module, layer, loss, optimizer, and model abstractions;
-- dtype and runtime precision configuration;
-- safetensors loading, tokenizer integration, and quantization flow;
-- CPU execution paths and backend dispatch logic;
-- CLI tools, benchmark tools, and inference/training orchestration;
-- safe-ish wrappers around lower-level CUDA calls.
-
-CUDA is used as an optional low-level acceleration backend:
-
-- CUDA kernels live under `src/ops/cuda/lumen_cuda.cu`;
-- the Rust side exposes CUDA-aware operation wrappers and calls the native CUDA functions through FFI;
-- when the `cuda` feature is enabled, `build.rs` locates CUDA/cuDNN, invokes `nvcc`, builds the CUDA source into a native library, and links it with the Rust binary;
-- CUDA handles GPU memory operations, cuBLAS/cuDNN calls, custom kernels, KV-cache updates, decode-oriented kernels, and selected forward/backward operations.
-
-The intended division of responsibilities is:
+## Design overview
 
 ```text
 Rust side
-  ├─ Tensor / autograd graph
-  ├─ Layers, modules, losses, optimizers
-  ├─ Llama model and runtime logic
-  ├─ dtype / precision policy
-  ├─ safetensors / tokenizer / quantization
+  ├─ Tensor representation and dynamic autograd graph
+  ├─ Layers, modules, losses, and optimizers
+  ├─ Model implementations, including Llama-family support
+  ├─ dtype / precision / quantization policy
+  ├─ safetensors loading and tokenizer integration
   ├─ CPU kernels and backend dispatch
   └─ FFI wrappers for CUDA calls
 
@@ -116,29 +85,10 @@ CUDA side
   ├─ cuBLAS-backed matrix operations
   ├─ optional cuDNN-backed primitives
   ├─ KV-cache and decode-oriented kernels
-  └─ selected training/backward kernels
+  └─ selected forward/backward/training kernels
 ```
 
-In other words, Lumen does not try to force every performance-critical operation into Rust. Rust manages the framework logic, type-level organization, runtime policy, and safety boundary, while CUDA is used where direct GPU execution is more appropriate.
-
-CUDA support is optional and gated behind the `cuda` feature:
-
-```bash
-cargo build --release --features cuda
-```
-
-CPU-only builds do not require CUDA:
-
-```bash
-cargo build --release
-```
-
-Development benchmarks can combine `dev-tools` and `cuda`:
-
-```bash
-cargo build --release --features "dev-tools cuda" --bin cuda_cpu_bench
-cargo build --release --features "dev-tools cuda" --bin prefill_decode_bench
-```
+Rust manages the framework structure, type organization, runtime policy, and safety boundary. CUDA is used where direct GPU execution is more appropriate.
 
 ---
 
@@ -151,29 +101,30 @@ src/
 ├─ loader.rs                # Safetensors loading and streamed loading
 ├─ tokenizer.rs             # Tokenizer wrapper
 ├─ precision.rs             # DType / runtime precision configuration
-├─ ops/                     # Tensor ops, CPU kernels, and optional CUDA ops
-│  └─ cuda/lumen_cuda.cu    # CUDA/cuDNN/cuBLAS-backed kernels
+├─ ops/                     # Tensor ops, CPU kernels, optional CUDA ops
+│  └─ cuda/                 # CUDA/cuDNN/cuBLAS-backed kernels and modules
 ├─ layers/                  # Neural-network layers and attention building blocks
 ├─ models/llama.rs          # Llama model implementation
 ├─ main.rs                  # Minimal local inference CLI
 └─ bin/
    ├─ quantize_safetensors.rs  # Offline quantization utility
-   ├─ kernel_bench.rs          # Dev-only kernel benchmark
-   ├─ prefill_decode_bench.rs  # Dev-only end-to-end benchmark
-   └─ cuda_cpu_bench.rs        # Dev-only CPU/CUDA ops, NN, and backward benchmark
+   ├─ kernel_bench.rs          # Development CPU kernel benchmark
+   ├─ prefill_decode_bench.rs  # End-to-end prefill/decode benchmark
+   ├─ cuda_cpu_bench.rs        # CPU/CUDA ops, NN, backward, and path benchmark
+   └─ cuda_cpu_bench_path.rs   # Path checks used by cuda_cpu_bench
 ```
 
 ---
 
 ## Build
 
-Release build:
+CPU-only release build:
 
 ```bash
 cargo build --release
 ```
 
-For better local CPU codegen:
+Use native CPU codegen when collecting local performance numbers:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release
@@ -186,12 +137,13 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo build --release
 ```
 
-Default release builds produce:
+CUDA build:
 
-- `lumen`
-- `quantize_safetensors`
+```bash
+cargo build --release --features cuda
+```
 
-Development benchmarks are intentionally gated behind `dev-tools`:
+Development benchmark builds:
 
 ```bash
 cargo build --release --features dev-tools --bin kernel_bench
@@ -199,20 +151,39 @@ cargo build --release --features dev-tools --bin prefill_decode_bench
 cargo build --release --features dev-tools --bin cuda_cpu_bench
 ```
 
-CUDA builds are intentionally gated behind the `cuda` feature:
+For x86 performance tests, enable the x86 backend features explicitly:
 
 ```bash
-cargo build --release --features cuda
-cargo build --release --features "dev-tools cuda" --bin prefill_decode_bench
+cargo build --release --features "dev-tools x86-fp-kernels x86-int8-kernels" --bin kernel_bench
+cargo build --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin prefill_decode_bench
+cargo build --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench
 ```
 
-The build script searches CUDA from environment variables / `nvcc`, then common platform install paths.
+`x86-fp-kernels` builds on stable Rust and includes the stable AVX2/F16C, AVX-512F, and AVX-512 BF16 paths. True AVX-512 FP16 same-dtype compute depends on nightly Rust's `stdarch_x86_avx512_f16`; use:
 
-cuDNN probing prefers an explicit or system install, then tries the Python `nvidia.cudnn` package. On Windows, a system cuDNN install such as `C:\Program Files\NVIDIA\CUDNN\...` is copied into the target directory for local runs.
+```bash
+cargo +nightly build --release --features "dev-tools x86-fp-kernels-nightly x86-int8-kernels" --bin kernel_bench
+```
+
+The CUDA build script searches for CUDA/cuDNN through environment variables, `nvcc`, and common platform install locations. CPU-only builds do not require CUDA.
+
+### Feature guide
+
+| Feature | Purpose |
+|---|---|
+| `cuda` | Build the optional CUDA C++ backend |
+| `dev-tools` | Build benchmark and path-check binaries |
+| `x86-fp-kernels` | Enable stable x86 BF16/F16/F32 fast paths |
+| `x86-fp-kernels-nightly` | Enable true AVX-512 FP16 intrinsics in addition to `x86-fp-kernels` |
+| `x86-int8-kernels` | Enable x86 I8 fast paths |
+| `arm64-fp-kernels` | Enable ARM64 floating-point/low-precision fast paths |
+| `arm64-int8-kernels` | Enable ARM64 I8 fast paths |
+
+Architecture-specific CPU features are opt-in. Enable them when evaluating CPU or CUDA performance so CPU fallback and helper work are not measured through the portable backend.
 
 ---
 
-## Running the minimal inference CLI
+## Minimal inference CLI
 
 ```bash
 cargo run --release --bin lumen -- \
@@ -240,7 +211,7 @@ Useful flags:
 - `--load-only`
 - `--device cpu|cuda`
 
-Example: BF16 runtime:
+BF16 example:
 
 ```bash
 cargo run --release --bin lumen -- \
@@ -253,7 +224,7 @@ cargo run --release --bin lumen -- \
   --allow-parameter-copies
 ```
 
-Example: `i8` weights with BF16 runtime:
+I8 weights + BF16 runtime example:
 
 ```bash
 cargo run --release --bin lumen -- \
@@ -267,7 +238,7 @@ cargo run --release --bin lumen -- \
   --allow-parameter-copies
 ```
 
-You can print backend diagnostics during startup with:
+Backend diagnostics can be printed with:
 
 ```bash
 LUMEN_SHOW_BACKENDS=1 cargo run --release --bin lumen -- \
@@ -277,14 +248,14 @@ LUMEN_SHOW_BACKENDS=1 cargo run --release --bin lumen -- \
 
 Interactive commands:
 
-- `/reset` — clear chat history and KV cache
-- `/exit` — quit
+- `/reset` clears chat history and KV cache;
+- `/exit` quits the process.
 
 ---
 
 ## Offline quantization
 
-Generate an `i8` safetensors checkpoint ahead of time:
+Generate an `i8` safetensors checkpoint:
 
 ```bash
 cargo run --release --bin quantize_safetensors -- \
@@ -307,130 +278,288 @@ cargo run --release --bin quantize_safetensors -- \
 
 ## Benchmark tools
 
+Use `--release` for performance numbers. Debug builds are useful for correctness work but are not representative for speed.
+
 ### Kernel benchmark
 
 ```bash
 cargo run --release --features "dev-tools x86-fp-kernels x86-int8-kernels" --bin kernel_bench -- \
-  --iters 400 --samples 7 --hidden 2048 --inter 5632 --vocab 32000
+  --iters 400 --samples 8 --hidden 2048 --inter 5632 --vocab 32000
 ```
 
-### End-to-end prefill/decode benchmark
+The `dot_bf16_bf16`, `dot2_bf16_bf16`, `dot3_bf16_bf16`, `dot_f16_f16`, `dot2_f16_f16`, `dot3_f16_f16`, `dot2_i8_i8`, and `dot3_i8_i8` rows are same-dtype low-precision dot microbenchmarks for the bottom-level kernels. BF16 prefers `_mm256_dpbf16_ps` when AVX-512 BF16 is available; otherwise stable `x86-fp-kernels` uses AVX2/FMA to read BF16 storage directly and accumulate in F32 lanes. Stable F16 uses AVX2/F16C to read F16 storage directly and accumulate in F32 lanes; nightly `x86-fp-kernels-nightly` prefers the true `_mm512_*_ph` FP16 kernels when AVX-512 FP16 is available at runtime. I8 same-dtype prefers AVX-512BW; otherwise stable `x86-int8-kernels` uses AVX2 to sign-extend I8 storage to I16, accumulate through `_mm256_madd_epi16` into I32, then apply scales.
+
+To benchmark true AVX-512 FP16 kernels such as `_mm512_loadu_ph`, `_mm512_storeu_ph`, and `_mm512_reduce_add_ph`, use the nightly feature:
 
 ```bash
-cargo run --release --features "dev-tools cuda" --bin prefill_decode_bench -- \
-  --weights path/to/model.safetensors \
-  --tokenizer path/to/tokenizer.json \
-  --prompt "Explain Transformer KV cache." \
-  --runs 5 --warmup 1 --max-gen 128 --mode greedy \
-  --device cuda \
-  --parameter-dtype bf16 \
-  --activation-dtype bf16 \
-  --kv-cache-dtype bf16 \
-  --allow-parameter-copies
+cargo +nightly run --release --features "dev-tools x86-fp-kernels-nightly x86-int8-kernels" --bin kernel_bench -- \
+  --iters 400 --samples 8 --hidden 2048 --inter 5632 --vocab 32000
 ```
 
 ### CPU/CUDA ops and training benchmark
 
 ```bash
-cargo run --release --features "dev-tools cuda" --bin cuda_cpu_bench -- \
-  --suite all --size small --dtype bf16 --runs 5 --warmup 1 --check
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
+  --suite all --size medium --dtype bf16 --runs 5 --warmup 2 --check
 ```
 
-Use `--release` for performance numbers.
+Useful options:
 
-Debug builds are useful for correctness but are not representative for speed.
+- `--suite all|ops|nn|backward|path`
+- `--size small|medium|large`
+- `--dtype f32|f16|bf16|i8`
+- `--case TEXT` to run cases whose names contain `TEXT`
+- `--check` to run CPU/CUDA correctness checks and path checks
+
+### End-to-end prefill/decode benchmark
+
+```bash
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin prefill_decode_bench -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json \
+  --prompt "Explain Transformer KV cache." \
+  --runs 3 --warmup 1 --max-gen 64 --mode greedy \
+  --stop-on-eos --stop-on-chat-marker \
+  --device cuda \
+  --parameter-dtype bf16 \
+  --runtime-dtype bf16 \
+  --activation-dtype bf16 \
+  --kv-cache-dtype bf16 \
+  --allow-parameter-copies
+```
+
+Real-model path check:
+
+```bash
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
+  --suite path --check --path-device cuda \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json \
+  --max-gen 32 --show-output
+```
+
+Path checks are not pure microbenchmarks. They are intended to catch algorithmic problems:
+
+- the training path runs a tiny SGD-like trace and checks that loss behaves plausibly;
+- the inference path can load a real Llama/TinyLlama checkpoint and check generated text for obvious corruption.
 
 ---
 
-## Representative performance on the current baseline
+## Current local performance snapshot
 
-### Local environment used for the snapshot
+The following numbers are a local development snapshot collected on 2026-06-15, not a universal benchmark claim. They were collected on a Windows machine with:
 
-The CUDA numbers below were collected on this local machine:
-
-- OS: Microsoft Windows 11 Home China, `10.0.26200`, 64-bit
 - CPU: AMD Ryzen 9 8945HX with Radeon Graphics
-- RAM: 32.00 GB installed memory reported by Windows
 - GPU: NVIDIA GeForce RTX 5070 Laptop GPU, 8 GB VRAM
-- NVIDIA driver: `596.36`; runtime CUDA reported by `nvidia-smi`: `13.2`
-- CUDA toolkit: `CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0`; `nvcc 13.0.48`
-- cuDNN: `9.21.1`; detected from `C:\Program Files\NVIDIA\CUDNN\v9.21\lib\13.2\x64\cudnn.lib`
-- Rust toolchain: `stable-x86_64-pc-windows-msvc`; `rustc 1.89.0`; `cargo 1.89.0`
+- RAM: 32 GB
+- NVIDIA driver/runtime CUDA reported by `nvidia-smi`: 610.47 / CUDA 13.3
+- CUDA toolkit: 13.0
+- cuDNN: 9.21.1
+- Rust: stable MSVC toolchain, `rustc 1.95.0`
 
-These numbers are a local snapshot, not a universal benchmark claim.
+The most recent rerun enabled both CUDA and x86 backend features:
 
----
-
-### CUDA snapshot
-
-Local release run on 2026-05-01 with TinyLlama weights, `--device cuda`, BF16 parameters/activations/KV cache, greedy decode:
-
-```shell
-cargo run --release --features "dev-tools cuda" --bin cuda_cpu_bench -- --suite all --size small --dtype bf16 --runs 5 --warmup 1 --check
+```text
+backend: float=x86-avx512 bf16_bf16=x86-avx512bf16 f16_f16=x86-avx2-f16c
+         int8=x86-avx512bw i8_i8=x86-avx512bw avx512fp16=unavailable-or-stable-build
 ```
 
-Small BF16 CPU/CUDA benchmark with correctness checks:
+This is important because CPU fallback and CPU-side helper paths should not be measured with the portable backend when evaluating this machine.
 
-| Case | CPU | CUDA | Speedup |
+### Comprehensive accuracy and training checks
+
+Commands:
+
+```bash
+cargo test --release --features "cuda,dev-tools,x86-fp-kernels,x86-int8-kernels"
+cargo test --release --features "cuda,dev-tools,x86-fp-kernels,x86-int8-kernels" -- --ignored --nocapture --test-threads=1
+
+# Run once for each of f32/f16/bf16/i8
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
+  --suite all --size medium --dtype DTYPE --runs 7 --warmup 3 --check
+```
+
+Results:
+
+- all-feature regression: `425 passed; 0 failed; 9 ignored`;
+- all 9 explicit performance smoke tests: `9 passed; 0 failed`;
+- CPU/CUDA forward, backward, F32-gradient, optimizer, and supported Llama training checks passed for F32, F16, BF16, and I8;
+- the built-in real-model path checker passed on CPU and CUDA with identical 32-token F32 output and `replacement=0`, `control=0`;
+- native I8 Adam state and a fully I8 Llama runtime are intentionally skipped; I8 parameters with F32 Adam state and the standalone training path passed.
+
+Representative same-dtype CPU/CUDA differences:
+
+| Check | F32 max abs | F16 max abs | BF16 max abs | I8 max abs |
+|---|---:|---:|---:|---:|
+| matrix matmul forward | `3.815e-6` | `7.629e-6` | `3.008e-2` | `1.144e-5` |
+| matrix matmul lhs grad | `2.384e-7` | `2.384e-7` | `3.576e-7` | `2.384e-7` |
+| matrix matmul rhs grad | `4.768e-7` | `4.768e-7` | `4.768e-7` | `4.768e-7` |
+
+BF16 forward error is visibly larger than F16 because of BF16 mantissa precision and reduction-order differences; gradients remain F32. The BF16 Llama training gradient check has a large relative difference around near-zero values, while its maximum absolute difference is `1.178e-3` and the check passes.
+
+Observed loss trend for the 24-step SGD + momentum path:
+
+| DType | CPU first -> last | CUDA first -> last | Increases during trace |
 |---|---:|---:|---:|
-| `matmul.forward` | 0.873 ms | 0.034 ms | 25.99x |
-| `softmax.forward` | 0.314 ms | 0.015 ms | 21.07x |
-| `cross_entropy.backward` | 0.366 ms | 0.090 ms | 4.05x |
-| `fused_gateup.forward` | 0.324 ms | 0.077 ms | 4.21x |
-| `llama.train.backward` | 1.907 ms | 2.961 ms | 0.64x |
-| `llama.train.step` | 1.718 ms | 2.973 ms | 0.58x |
+| F32 | `9.0 -> 1e-6` | `9.0 -> 1e-6` | 7 |
+| F16 | `9.0 -> 2e-6` | `9.0 -> 2e-6` | 6 |
+| BF16 | `9.0 -> 0` | `9.0 -> 0` | 3 |
+| I8 | `9.0 -> 4e-4` | `9.0 -> 4e-4` | 3 |
 
-Takeaway: CUDA already covers real inference, CUDA-only gradients, and training checks, but small training/backward and tiny fused-QKV cases still need more batching/fusion to beat CPU reliably.
+The traces are not monotonic, but all have a clear downward trend, which is the intended SGD-path criterion.
+
+### CPU kernel snapshot
+
+Command:
+
+```bash
+cargo run --release --features "dev-tools x86-fp-kernels x86-int8-kernels" --bin kernel_bench -- \
+  --iters 300 --samples 7 --hidden 2048 --inter 5632 --vocab 32000
+```
+
+Active backends:
+
+```text
+float=x86-avx512  bf16_bf16=x86-avx512bf16  f16_f16=x86-avx2-f16c
+int8=x86-avx512bw  i8_i8=x86-avx512bw  avx512fp16=unavailable-or-stable-build
+```
+
+| Case | Reference | Fast path | Speedup / ratio | Max abs diff |
+|---|---:|---:|---:|---:|
+| `dot_bf16_bf16` | 1.67 us | 0.06 us | 29.84x | `7.02e-4` |
+| `dot2_bf16_bf16` | 2.92 us | 0.07 us | 38.87x | `7.02e-4` |
+| `dot3_bf16_bf16` | 3.73 us | 0.08 us | 45.50x | `7.02e-4` |
+| `dot_f16_f16` | 4.15 us | 0.09 us | 44.11x | `1.114e-3` |
+| `dot2_f16_f16` | 5.79 us | 0.10 us | 55.15x | `1.114e-3` |
+| `dot3_f16_f16` | 7.49 us | 0.11 us | 65.17x | `1.114e-3` |
+| `dot2_i8_i8` | 0.52 us | 0.07 us | 7.72x | exact I32 accumulation |
+| `dot3_i8_i8` | 0.69 us | 0.10 us | 6.69x | exact I32 accumulation |
+| `tensor_matmul_i8` | 480.66 us | 74.89 us | 6.42x | quantized reference |
+| `fused_qkv_i8` | 557.47 us | 74.89 us | 0.13x time | `0` |
+| `fused_gate_i8` | 1499.38 us | 132.29 us | 0.09x time | `0` |
+| `sgd_bf16` | 2.48 us | 2.18 us | 0.88x time | `0` |
+| `adam_bf16` | 14.59 us | 11.51 us | 0.79x time | `0` |
+| `adam_i8` | 14.59 us | 15.45 us | 1.06x time | `0` |
+
+The true AVX-512 FP16 path still requires nightly Rust and `x86-fp-kernels-nightly`. Cached copies are path-dependent: cached BF16/F16 tensor matmul helped in this run, while cached fused F16 QKV/GateUp was substantially slower than no-copy.
+
+### Detailed CPU/CUDA operator snapshot
+
+Command family:
+
+```bash
+# Run once for each of f32/f16/bf16/i8
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
+  --suite all --size medium --dtype DTYPE --runs 7 --warmup 3 --check
+```
+
+Each cell is `CPU ms / CUDA ms / CUDA speedup`. These are small-to-medium development shapes, not hardware peak-throughput claims.
+
+#### Dense, fused, normalization, and loss operators
+
+| Operator | F32 | F16 | BF16 | I8 |
+|---|---:|---:|---:|---:|
+| `matmul.forward` | 2.146 / 0.055 / 38.73x | 1.207 / 0.023 / 52.70x | 0.798 / 0.026 / 31.04x | 2.070 / 0.327 / 6.34x |
+| `batch_matmul.forward` | 0.008 / 0.014 / 0.56x | 0.040 / 0.011 / 3.60x | 0.014 / 0.014 / 1.03x | 0.141 / 0.073 / 1.93x |
+| `matmul.backward` | 6.712 / 0.663 / 10.13x | 25.320 / 1.162 / 21.79x | 5.270 / 1.943 / 2.71x | 4.619 / 1.250 / 3.70x |
+| `fused_gateup.forward` | 2.939 / 0.071 / 41.69x | 1.599 / 0.114 / 14.04x | 2.858 / 0.129 / 22.23x | 3.169 / 0.135 / 23.52x |
+| `fused_qkv.decode` | 0.005 / 0.047 / 0.10x | 0.008 / 0.046 / 0.18x | 0.004 / 0.073 / 0.05x | 0.007 / 0.072 / 0.09x |
+| `fused_qkv.prefill` | 1.025 / 0.085 / 12.10x | 1.093 / 0.083 / 13.09x | 1.016 / 0.074 / 13.66x | 1.058 / 0.212 / 5.00x |
+| `softmax.forward` | 0.497 / 0.078 / 6.39x | 3.107 / 0.153 / 20.27x | 1.050 / 0.154 / 6.79x | 5.918 / 0.156 / 37.89x |
+| `softmax.backward` | 3.956 / 1.341 / 2.95x | 3.354 / 1.329 / 2.52x | 3.740 / 1.303 / 2.87x | 4.225 / 1.662 / 2.54x |
+| `fused_softmax.forward` | 2.150 / 0.077 / 28.00x | 4.731 / 0.078 / 60.49x | 2.763 / 0.080 / 34.41x | 5.077 / 0.082 / 61.69x |
+| `fused_softmax.backward` | 5.606 / 1.329 / 4.22x | 5.760 / 1.181 / 4.88x | 5.644 / 1.248 / 4.52x | 6.390 / 1.314 / 4.86x |
+| `embedding.forward` | 0.283 / 0.090 / 3.16x | 0.256 / 0.093 / 2.75x | 0.277 / 0.128 / 2.17x | 0.253 / 0.092 / 2.76x |
+| `rms_norm.forward` | 0.279 / 0.032 / 8.87x | 0.319 / 0.036 / 8.95x | 0.277 / 0.038 / 7.31x | 2.207 / 0.113 / 19.44x |
+| `rope.forward` | 0.035 / 0.012 / 2.98x | 0.040 / 0.017 / 2.34x | 0.038 / 0.017 / 2.26x | 0.091 / 0.076 / 1.21x |
+| `cross_entropy.forward` | 0.504 / 0.077 / 6.55x | 1.182 / 0.226 / 5.24x | 1.170 / 0.205 / 5.71x | 8.425 / 0.232 / 36.33x |
+| `cross_entropy.backward` | 0.859 / 0.116 / 7.40x | 1.213 / 0.212 / 5.73x | 1.205 / 0.352 / 3.42x | 5.492 / 0.279 / 19.68x |
+| `mse_loss.forward` | 0.345 / 0.123 / 2.80x | 0.902 / 0.077 / 11.64x | 0.870 / 0.070 / 12.48x | 8.216 / 0.072 / 113.32x |
+| `mse_loss.backward` | 1.567 / 0.108 / 14.48x | 1.468 / 0.110 / 13.41x | 1.562 / 0.115 / 13.63x | 1.373 / 0.111 / 12.38x |
+
+#### Elementwise and broadcast operators
+
+| Operator | F32 | F16 | BF16 | I8 |
+|---|---:|---:|---:|---:|
+| `elementwise.mul_add.forward` | 0.218 / 0.168 / 1.29x | 0.195 / 0.146 / 1.33x | 0.386 / 0.156 / 2.48x | 0.417 / 0.378 / 1.10x |
+| `elementwise.mul_add.backward` | 3.312 / 1.283 / 2.58x | 2.970 / 1.217 / 2.44x | 2.973 / 1.246 / 2.39x | 3.175 / 1.262 / 2.52x |
+| `binary.same_shape.forward` | 0.110 / 0.078 / 1.41x | 0.090 / 0.073 / 1.23x | 0.164 / 0.095 / 1.72x | 0.203 / 0.217 / 0.93x |
+| `binary.row_broadcast.forward` | 1.260 / 0.077 / 16.45x | 0.100 / 0.072 / 1.39x | 0.165 / 0.086 / 1.92x | 0.198 / 0.184 / 1.07x |
+| `binary.row_scalar.forward` | 0.265 / 0.122 / 2.18x | 2.403 / 0.075 / 31.91x | 0.700 / 0.079 / 8.87x | 9.263 / 0.185 / 49.99x |
+| `binary.b1d_1h1.forward` | 0.262 / 0.118 / 2.21x | 2.206 / 0.093 / 23.64x | 0.564 / 0.141 / 4.00x | 7.131 / 0.169 / 42.22x |
+| `binary.b1d_1hd.forward` | 0.112 / 0.106 / 1.06x | 2.071 / 0.078 / 26.66x | 0.391 / 0.078 / 4.99x | 6.873 / 0.203 / 33.91x |
+| `binary.general_broadcast.forward` | 0.112 / 0.122 / 0.92x | 2.062 / 0.077 / 26.86x | 0.451 / 0.080 / 5.60x | 8.020 / 0.260 / 30.91x |
+| `elementwise.mixed_mul.forward` | 0.110 / 0.079 / 1.38x | 0.226 / 0.075 / 3.02x | 0.265 / 0.079 / 3.35x | 0.234 / 0.086 / 2.72x |
+| `elementwise.mixed_broadcast_1hd_mul.forward` | 0.003 / 0.020 / 0.13x | 0.003 / 0.009 / 0.30x | 0.003 / 0.009 / 0.32x | 0.005 / 0.011 / 0.42x |
+| `elementwise.mixed_row_scalar_mul.forward` | 0.003 / 0.017 / 0.15x | 0.001 / 0.009 / 0.10x | 0.001 / 0.009 / 0.10x | 0.001 / 0.009 / 0.13x |
+| `elementwise.mixed_mul.backward` | 2.576 / 0.711 / 3.62x | 2.420 / 1.136 / 2.13x | 2.287 / 1.019 / 2.24x | 2.222 / 1.065 / 2.09x |
+| `elementwise.mixed_row_mul.forward` | 1.268 / 0.077 / 16.41x | 0.199 / 0.072 / 2.78x | 0.215 / 0.166 / 1.30x | 0.222 / 0.086 / 2.58x |
+| `elementwise.mixed_row_mul.backward` | 2.489 / 1.069 / 2.33x | 0.937 / 1.055 / 0.89x | 1.056 / 1.241 / 0.85x | 0.950 / 1.227 / 0.77x |
+| `elementwise.mixed_row_sub.backward` | 2.771 / 1.338 / 2.07x | 1.336 / 1.140 / 1.17x | 1.409 / 1.206 / 1.17x | 1.317 / 1.136 / 1.16x |
+| `elementwise.mixed_scalar_sub.backward` | 1.800 / 1.219 / 1.48x | 1.575 / 1.097 / 1.44x | 1.742 / 1.114 / 1.56x | 1.562 / 1.095 / 1.43x |
+| `elementwise.mixed_scalar_mul.backward` | 2.324 / 1.111 / 2.09x | 2.226 / 1.143 / 1.95x | 1.509 / 1.084 / 1.39x | 1.563 / 1.192 / 1.31x |
+| `elementwise.mixed_broadcast_sub.backward` | 0.074 / 0.290 / 0.25x | 0.081 / 0.140 / 0.58x | 0.069 / 0.275 / 0.25x | 0.097 / 0.146 / 0.66x |
+| `elementwise.mixed_broadcast_1hd_sub.backward` | 0.076 / 0.180 / 0.42x | 0.195 / 0.137 / 1.43x | 0.069 / 0.301 / 0.23x | 0.068 / 0.157 / 0.43x |
+| `elementwise.mixed_broadcast_mul.backward` | 0.013 / 0.289 / 0.04x | 0.013 / 0.131 / 0.10x | 0.013 / 0.281 / 0.05x | 0.014 / 0.147 / 0.09x |
+| `elementwise.mixed_broadcast_1hd_mul.backward` | 0.010 / 0.307 / 0.03x | 0.010 / 0.138 / 0.07x | 0.010 / 0.318 / 0.03x | 0.010 / 0.154 / 0.07x |
+| `elementwise.mixed_row_scalar_mul.backward` | 0.011 / 0.122 / 0.09x | 0.015 / 0.116 / 0.13x | 0.010 / 0.216 / 0.05x | 0.010 / 0.210 / 0.05x |
+| `unary.silu.forward` | 0.295 / 0.103 / 2.86x | 3.001 / 0.072 / 41.69x | 1.051 / 0.072 / 14.57x | 11.391 / 0.164 / 69.50x |
+| `unary.relu.forward` | 0.137 / 0.083 / 1.65x | 2.989 / 0.097 / 30.78x | 0.814 / 0.078 / 10.38x | 11.124 / 0.072 / 154.29x |
+| `unary.silu.backward` | 4.485 / 1.590 / 2.82x | 3.898 / 1.486 / 2.62x | 4.344 / 1.375 / 3.16x | 3.865 / 1.247 / 3.10x |
+
+#### Optimizer, CNN, attention, and compact Llama operators
+
+| Operator | F32 | F16 | BF16 | I8 |
+|---|---:|---:|---:|---:|
+| `optimizer.sgd.step` | 0.140 / 0.109 / 1.29x | 0.120 / 0.116 / 1.03x | 0.141 / 0.105 / 1.34x | 0.131 / 0.124 / 1.06x |
+| `optimizer.adam.step` | 0.864 / 0.269 / 3.21x | 2.261 / 2.143 / 1.05x | 2.264 / 2.305 / 0.98x | skipped |
+| `optimizer.adam_f32_state.step` | 0.812 / 0.222 / 3.66x | 0.267 / 0.240 / 1.11x | 0.260 / 0.244 / 1.06x | 0.279 / 0.260 / 1.07x |
+| `optimizer.sgd_batched.step` | 0.021 / 0.042 / 0.51x | 0.016 / 0.318 / 0.05x | 0.017 / 0.284 / 0.06x | 0.030 / 0.360 / 0.08x |
+| `optimizer.adam_f32_state_batched.step` | 0.201 / 0.087 / 2.31x | 0.060 / 0.369 / 0.16x | 0.062 / 0.357 / 0.17x | 0.073 / 0.465 / 0.16x |
+| `conv2d.forward` | 0.836 / 0.360 / 2.32x | 0.769 / 0.205 / 3.75x | 0.831 / 0.249 / 3.34x | 0.897 / 0.207 / 4.32x |
+| `conv2d.backward` | 2.357 / 1.336 / 1.76x | 2.527 / 1.200 / 2.11x | 2.694 / 1.145 / 2.35x | 2.806 / 1.992 / 1.41x |
+| `max_pool2d.forward` | 0.129 / 0.053 / 2.46x | 0.109 / 0.043 / 2.56x | 0.100 / 0.064 / 1.55x | 0.108 / 0.031 / 3.48x |
+| `max_pool2d.backward` | 0.305 / 0.299 / 1.02x | 0.287 / 0.294 / 0.97x | 0.257 / 0.282 / 0.91x | 0.296 / 0.572 / 0.52x |
+| `self_attention.forward` | 0.314 / 0.238 / 1.32x | 0.694 / 0.439 / 1.58x | 0.464 / 0.783 / 0.59x | skipped |
+| `self_attention.backward` | 0.563 / 0.661 / 0.85x | 2.014 / 0.758 / 2.66x | 1.559 / 1.655 / 0.94x | skipped |
+| `self_attention_bias.backward` | 0.538 / 0.823 / 0.65x | 1.902 / 1.053 / 1.81x | 1.527 / 2.473 / 0.62x | skipped |
+| `llama.infer_last_logits` | 1.187 / 0.699 / 1.70x | 1.464 / 0.731 / 2.00x | 1.234 / 1.387 / 0.89x | skipped |
+| `llama.prefill_decode` | 1.517 / 0.865 / 1.75x | 2.156 / 1.122 / 1.92x | 1.673 / 1.100 / 1.52x | skipped |
+| `llama.train.backward` | 4.799 / 2.309 / 2.08x | 3.285 / 2.411 / 1.36x | 3.314 / 4.124 / 0.80x | skipped |
+| `llama.train.step` | 3.707 / 2.423 / 1.53x | 3.967 / 2.475 / 1.60x | 3.750 / 3.190 / 1.18x | skipped |
+
+All enabled correctness checks passed. CUDA is strongest on dense, fused, softmax, loss, and larger broadcast work. Single-token QKV decode, tiny broadcast reductions, batched optimizer cases, and some compact attention/training cases remain launch- or dispatch-bound.
+
+### End-to-end Llama prefill/decode snapshot
+
+The TinyLlama rerun used `prompt_tokens=43`, `max_gen=64`, greedy decode, 3 measured runs, 1 warmup, and `--stop-on-eos --stop-on-chat-marker`.
+
+| Configuration | Device | Prefill forward | Decode forward | End-to-end decode | Total |
+|---|---|---:|---:|---:|---:|
+| F32 | CPU | 40.47 tok/s | 10.67 tok/s | 9.06 tok/s | 7065.28 ms |
+| F16 | CPU | 135.83 tok/s | 14.30 tok/s | 13.34 tok/s | 4796.53 ms |
+| BF16 | CPU | 146.23 tok/s | 15.48 tok/s | 14.44 tok/s | 4432.81 ms |
+| I8 weights + BF16 runtime | CPU | 143.73 tok/s | 24.28 tok/s | 21.79 tok/s | 2937.74 ms |
+| F32 | CUDA | 931.77 tok/s | 41.51 tok/s | 40.19 tok/s | 1592.42 ms |
+| F16 | CUDA | 382.31 tok/s | 29.13 tok/s | 27.62 tok/s | 2317.07 ms |
+| BF16 | CUDA | 386.51 tok/s | 29.12 tok/s | 27.67 tok/s | 2313.08 ms |
+| I8 weights + BF16 runtime | CUDA | 204.85 tok/s | 30.44 tok/s | 27.57 tok/s | 2320.99 ms |
+
+The separate real-model F32 path checker generated identical fluent CPU/CUDA text for 32 tokens, with `replacement=0` and `control=0`; measured inference throughput was 7.16 tok/s on CPU and 36.20 tok/s on CUDA. The performance rerun shows that real generation is still decode-bound: CUDA decode-forward accounts for roughly 91-97% of measured time. CUDA F32 is fastest end to end on this machine, while CPU I8+BF16 has the strongest CPU decode throughput.
 
 ---
 
-### CPU snapshot
+## Design limitations
 
-The following numbers come from the current **AVX-512 baseline** that successfully enables BF16 kernels on the author's machine.
+`src/main.rs` and some benchmark paths intentionally use a hard-coded `model_config()`. The current Llama runtime is compact and inspectable, but this also means:
 
-Kernel-level snapshot observed during tuning:
+- the loaded checkpoint must match the expected architecture;
+- adapting to a different model may require editing hidden size, layer count, KV-head layout, tokenizer behavior, or prompt formatting;
+- the CLI is a local runner, not a universal inference frontend.
 
-- `backend: float=x86-avx512 int8=x86-avx2`
-- `avx512_bf16_available=true`
-- `matvec_bf16io ≈ 104 us`
-- `fused_qkv ≈ 90 us`
+Benchmark tools are development tools for kernel/runtime tuning. They are useful for regression tracking and local comparison, but they are not a polished public benchmarking suite.
 
-These are not universal claims for every CPU. They are a snapshot of one working baseline on one machine.
-
----
-
-### End-to-end snapshot
-
-For a run with `prompt_tokens=60`, `max_gen=128`, `runs=5`, `warmup=1`:
-
-| Configuration | Prefill forward | Decode forward | End-to-end decode |
-|---|---:|---:|---:|
-| BF16 | 140.70 tok/s | 19.09 tok/s | 17.64 tok/s |
-| F16 | 131.89 tok/s | 14.99 tok/s | 14.04 tok/s |
-| F32 | 44.56 tok/s | 11.18 tok/s | 9.86 tok/s |
-| I8 weights + BF16 runtime | **203.66 tok/s** | **25.13 tok/s** | **23.16 tok/s** |
-
-Practical takeaway on that machine:
-
-- **BF16** is the recommended floating-point path on both CPU and CUDA today.
-- **I8 weights + BF16 runtime** is the fastest tested configuration so far.
-- **F16 is currently not the main optimization target**, since it underperforms BF16 in this implementation.
-
----
-
-## Design notes and limitations
-
-`src/main.rs` intentionally uses a **hard-coded `model_config()`** and a lightweight CLI.
-
-That keeps the example easy to inspect, but it also means:
-
-- the architecture must match the loaded checkpoint;
-- adapting to a different model may require editing dimensions, layer counts, KV-head layout, or prompt formatting;
-- this is a compact local runner, not a universal inference frontend.
-
-Similarly, the benchmark tools are intended for **development and kernel tuning**, not polished public benchmarking infrastructure.
-
-CUDA support is real but still evolving. Single CUDA device operation is the practical target today, while future multi-GPU work still needs explicit device-index plumbing through tensors, modules, and CUDA calls.
+CUDA support is functional but still evolving. Not every operation or dtype combination has an equally optimized CUDA path, and small workloads may be slower than CPU because of launch and dispatch overhead. The practical target today is a single CUDA device. Future multi-GPU work would require explicit device-index plumbing through tensors, modules, and CUDA calls.
 
 ---
 
@@ -438,15 +567,15 @@ CUDA support is real but still evolving. Single CUDA device operation is the pra
 
 Lumen is a good fit if you want to:
 
-- learn how a Rust tensor/autograd core can be structured;
-- study a small Llama runtime without a huge framework wrapped around it;
-- experiment with dtype management, quantization, and CPU/CUDA inference kernels;
+- study how a Rust tensor/autograd core can be structured;
+- inspect a small Llama runtime without a large framework around it;
+- experiment with dtype policy, quantization, CPU kernels, and CUDA kernels;
 - benchmark and tune a compact Rust inference stack on your own machine;
-- inspect how a Rust-first runtime can call into CUDA for selected acceleration paths.
+- explore how Rust high-level runtime code can cooperate with CUDA low-level kernels.
 
-It is probably **not** the right fit if you need:
+It is probably not the right fit if you need:
 
-- large-scale training features;
+- large-scale distributed training;
 - a mature serving system;
 - mature multi-GPU deployment tooling;
 - plug-and-play support for arbitrary model families.

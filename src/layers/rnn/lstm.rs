@@ -84,10 +84,15 @@ impl LSTM {
         // chunk 1: Forget (f) <-- Bias 已经被初始化为 1.0
         // chunk 2: Cell (g)
         // chunk 3: Output (o)
-        let i_raw = slice_last_dim(&gates, 0 * h_size, h_size);
-        let f_raw = slice_last_dim(&gates, 1 * h_size, 2 * h_size);
-        let g_raw = slice_last_dim(&gates, 2 * h_size, 3 * h_size);
-        let o_raw = slice_last_dim(&gates, 3 * h_size, 4 * h_size);
+        let i_start = 0;
+        let f_start = h_size;
+        let g_start = 2 * h_size;
+        let o_start = 3 * h_size;
+        let gate_end = 4 * h_size;
+        let i_raw = slice_last_dim(&gates, i_start, f_start);
+        let f_raw = slice_last_dim(&gates, f_start, g_start);
+        let g_raw = slice_last_dim(&gates, g_start, o_start);
+        let o_raw = slice_last_dim(&gates, o_start, gate_end);
 
         //激活
         let i = self.sigmoid.forward(i_raw);

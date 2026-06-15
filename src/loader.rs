@@ -40,10 +40,9 @@ impl WeightLoadOptions {
         if matches!(
             source_dtype,
             safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16
-        ) {
-            if let Some(dtype) = self.float_source_quantization.storage_dtype() {
-                return dtype;
-            }
+        ) && let Some(dtype) = self.float_source_quantization.storage_dtype()
+        {
+            return dtype;
         }
         current_target_dtype
     }
@@ -254,7 +253,7 @@ impl ModelLoader {
         data_bytes: &[u8],
         name: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        if data_bytes.len() % 4 != 0 {
+        if !data_bytes.len().is_multiple_of(4) {
             return Err(format!(
                 "Tensor {} has invalid F32 byte length {}",
                 name,
@@ -272,7 +271,7 @@ impl ModelLoader {
         data_bytes: &[u8],
         name: &str,
     ) -> Result<Vec<f16>, Box<dyn std::error::Error>> {
-        if data_bytes.len() % 2 != 0 {
+        if !data_bytes.len().is_multiple_of(2) {
             return Err(format!(
                 "Tensor {} has invalid F16 byte length {}",
                 name,
@@ -294,7 +293,7 @@ impl ModelLoader {
         data_bytes: &[u8],
         name: &str,
     ) -> Result<Vec<bf16>, Box<dyn std::error::Error>> {
-        if data_bytes.len() % 2 != 0 {
+        if !data_bytes.len().is_multiple_of(2) {
             return Err(format!(
                 "Tensor {} has invalid BF16 byte length {}",
                 name,
@@ -765,7 +764,7 @@ mod tests {
 
     #[test]
     fn f16_weights_can_be_loaded_and_quantized_to_i8_directly() {
-        let data_f32 = vec![1.0f32, -2.0, 3.5, 4.25];
+        let data_f32 = [1.0f32, -2.0, 3.5, 4.25];
         let data_f16 = data_f32
             .iter()
             .map(|&v| f16::from_f32(v))
@@ -830,7 +829,7 @@ mod tests {
     #[test]
     fn i8_weights_can_load_with_companion_scale_tensor() {
         let quantized = vec![4i8, -8, 7, 9];
-        let expected = vec![2.0f32, -4.0, 3.5, 4.5];
+        let expected = [2.0f32, -4.0, 3.5, 4.5];
         let scale = 0.5f32;
         let path = write_safetensors(vec![
             (
@@ -866,7 +865,7 @@ mod tests {
     #[test]
     fn i8_weights_can_stream_from_disk_with_companion_scale_tensor() {
         let quantized = vec![4i8, -8, 7, 9];
-        let expected = vec![2.0f32, -4.0, 3.5, 4.5];
+        let expected = [2.0f32, -4.0, 3.5, 4.5];
         let scale = 0.5f32;
         let path = write_safetensors(vec![
             (

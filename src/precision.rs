@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DType {
@@ -12,17 +10,6 @@ pub enum DType {
 }
 
 impl DType {
-    #[inline]
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => DType::F32,
-            1 => DType::F16,
-            2 => DType::BF16,
-            3 => DType::I8,
-            _ => DType::F32,
-        }
-    }
-
     #[inline]
     pub fn is_float(self) -> bool {
         matches!(self, DType::F32 | DType::F16 | DType::BF16)
@@ -176,12 +163,12 @@ impl Default for PrecisionConfig {
 
 pub struct PrecisionConfigGuard {
     previous: PrecisionConfig,
-    _lock: Option<MutexGuard<'static, ()>>,
+    _scope: Option<()>,
 }
 
 pub struct ParameterQuantizationGuard {
     previous: ParameterQuantization,
-    _lock: Option<MutexGuard<'static, ()>>,
+    _scope: Option<()>,
 }
 
 pub struct RuntimeComponentDTypesGuard {
@@ -189,37 +176,49 @@ pub struct RuntimeComponentDTypesGuard {
     previous_activation_follows_runtime: bool,
     previous_kv_cache_dtype: DType,
     previous_kv_cache_follows_runtime: bool,
-    _lock: Option<MutexGuard<'static, ()>>,
+    _scope: Option<()>,
 }
 
-static DEFAULT_PARAMETER_DTYPE: AtomicU8 = AtomicU8::new(DType::F32 as u8);
-static DEFAULT_RUNTIME_DTYPE: AtomicU8 = AtomicU8::new(DType::F32 as u8);
-static DEFAULT_ACTIVATION_DTYPE: AtomicU8 = AtomicU8::new(DType::F32 as u8);
-static DEFAULT_KV_CACHE_DTYPE: AtomicU8 = AtomicU8::new(DType::F32 as u8);
-static ACTIVATION_DTYPE_FOLLOWS_RUNTIME: AtomicBool = AtomicBool::new(true);
-static KV_CACHE_DTYPE_FOLLOWS_RUNTIME: AtomicBool = AtomicBool::new(true);
-static ALLOW_PARAMETER_DTYPE_COPIES: AtomicBool = AtomicBool::new(false);
-static PRECISION_CONFIG_LOCK: Mutex<()> = Mutex::new(());
-const DISABLED_PARAMETER_QUANTIZATION_DTYPE: u8 = u8::MAX;
-static DEFAULT_PARAMETER_QUANTIZATION_DTYPE: AtomicU8 =
-    AtomicU8::new(DISABLED_PARAMETER_QUANTIZATION_DTYPE);
-static DEFAULT_PARAMETER_QUANTIZATION_SCALE_IS_MANUAL: AtomicBool = AtomicBool::new(false);
-static DEFAULT_PARAMETER_QUANTIZATION_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+struct GlobalConfigWriteGuard {
+    _scope: Option<()>,
+}
+
+#[derive(Clone, Copy)]
+struct PrecisionState {
+    parameter_dtype: DType,
+    runtime_dtype: DType,
+    activation_dtype: DType,
+    activation_dtype_follows_runtime: bool,
+    kv_cache_dtype: DType,
+    kv_cache_dtype_follows_runtime: bool,
+    allow_parameter_dtype_copies: bool,
+    parameter_quantization: ParameterQuantization,
+}
+
+impl PrecisionState {
+    const DEFAULT: Self = Self {
+        parameter_dtype: DType::F32,
+        runtime_dtype: DType::F32,
+        activation_dtype: DType::F32,
+        activation_dtype_follows_runtime: true,
+        kv_cache_dtype: DType::F32,
+        kv_cache_dtype_follows_runtime: true,
+        allow_parameter_dtype_copies: false,
+        parameter_quantization: ParameterQuantization::Disabled,
+    };
+}
 
 thread_local! {
     static GLOBAL_CONFIG_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static PRECISION_STATE: Cell<PrecisionState> = const { Cell::new(PrecisionState::DEFAULT) };
 }
 
 #[inline]
-fn begin_global_config_scope(lock_message: &'static str) -> Option<MutexGuard<'static, ()>> {
+fn begin_global_config_scope(_lock_message: &'static str) -> Option<()> {
     GLOBAL_CONFIG_SCOPE_DEPTH.with(|depth| {
         let current = depth.get();
         depth.set(current + 1);
-        if current == 0 {
-            Some(PRECISION_CONFIG_LOCK.lock().expect(lock_message))
-        } else {
-            None
-        }
+        (current == 0).then_some(())
     })
 }
 
@@ -233,57 +232,49 @@ fn end_global_config_scope(scope_name: &'static str) {
 }
 
 #[inline]
+fn global_config_write_guard(lock_message: &'static str) -> GlobalConfigWriteGuard {
+    GlobalConfigWriteGuard {
+        _scope: begin_global_config_scope(lock_message),
+    }
+}
+
+#[inline]
+fn precision_state() -> PrecisionState {
+    PRECISION_STATE.with(|state| state.get())
+}
+
+#[inline]
+fn update_precision_state(update: impl FnOnce(&mut PrecisionState)) {
+    PRECISION_STATE.with(|cell| {
+        let mut state = cell.get();
+        update(&mut state);
+        cell.set(state);
+    });
+}
+
+#[inline]
 pub fn default_parameter_dtype() -> DType {
-    DType::from_u8(DEFAULT_PARAMETER_DTYPE.load(Ordering::Relaxed))
+    precision_state().parameter_dtype
 }
 
 #[inline]
 pub fn set_default_parameter_dtype(dtype: DType) {
-    DEFAULT_PARAMETER_DTYPE.store(dtype as u8, Ordering::Relaxed);
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| state.parameter_dtype = dtype);
 }
 
 #[inline]
 pub fn default_parameter_quantization() -> ParameterQuantization {
-    let storage_dtype_raw = DEFAULT_PARAMETER_QUANTIZATION_DTYPE.load(Ordering::Relaxed);
-    let storage_dtype = if storage_dtype_raw == DISABLED_PARAMETER_QUANTIZATION_DTYPE {
-        None
-    } else {
-        Some(DType::from_u8(storage_dtype_raw))
-    };
-    let scale = if DEFAULT_PARAMETER_QUANTIZATION_SCALE_IS_MANUAL.load(Ordering::Relaxed) {
-        QuantizationScale::Manual(f32::from_bits(
-            DEFAULT_PARAMETER_QUANTIZATION_SCALE_BITS.load(Ordering::Relaxed),
-        ))
-    } else {
-        QuantizationScale::Auto
-    };
-    let quantization = ParameterQuantization {
-        storage_dtype,
-        scale,
-    };
+    let quantization = precision_state().parameter_quantization;
     quantization.validate();
     quantization
 }
 
 #[inline]
 pub fn set_default_parameter_quantization(quantization: ParameterQuantization) {
+    let _guard = global_config_write_guard("global config lock poisoned");
     quantization.validate();
-    DEFAULT_PARAMETER_QUANTIZATION_DTYPE.store(
-        quantization
-            .storage_dtype()
-            .map(|dtype| dtype as u8)
-            .unwrap_or(DISABLED_PARAMETER_QUANTIZATION_DTYPE),
-        Ordering::Relaxed,
-    );
-    match quantization.scale() {
-        QuantizationScale::Auto => {
-            DEFAULT_PARAMETER_QUANTIZATION_SCALE_IS_MANUAL.store(false, Ordering::Relaxed);
-        }
-        QuantizationScale::Manual(scale) => {
-            DEFAULT_PARAMETER_QUANTIZATION_SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
-            DEFAULT_PARAMETER_QUANTIZATION_SCALE_IS_MANUAL.store(true, Ordering::Relaxed);
-        }
-    }
+    update_precision_state(|state| state.parameter_quantization = quantization);
 }
 
 #[inline]
@@ -293,6 +284,7 @@ pub fn default_parameter_quantization_dtype() -> Option<DType> {
 
 #[inline]
 pub fn set_default_parameter_quantization_dtype(storage_dtype: Option<DType>) {
+    let _guard = global_config_write_guard("global config lock poisoned");
     let current = default_parameter_quantization();
     let updated = match storage_dtype {
         Some(storage_dtype) => ParameterQuantization::new(storage_dtype),
@@ -309,6 +301,7 @@ pub fn default_parameter_quantization_scale() -> Option<f32> {
 
 #[inline]
 pub fn set_default_parameter_quantization_scale(scale: Option<f32>) {
+    let _guard = global_config_write_guard("global config lock poisoned");
     let current = default_parameter_quantization();
     set_default_parameter_quantization(current.with_optional_scale(scale));
 }
@@ -320,6 +313,7 @@ pub fn parameter_quantization_enabled() -> bool {
 
 #[inline]
 pub fn set_parameter_quantization_enabled(enabled: bool) {
+    let _guard = global_config_write_guard("global config lock poisoned");
     let current = default_parameter_quantization();
     set_default_parameter_quantization(if enabled {
         if current.is_enabled() {
@@ -341,62 +335,77 @@ pub fn default_parameter_storage_dtype() -> DType {
 
 #[inline]
 pub fn default_runtime_dtype() -> DType {
-    DType::from_u8(DEFAULT_RUNTIME_DTYPE.load(Ordering::Relaxed))
+    precision_state().runtime_dtype
 }
 
 #[inline]
 pub fn set_default_runtime_dtype(dtype: DType) {
-    DEFAULT_RUNTIME_DTYPE.store(dtype as u8, Ordering::Relaxed);
-    if ACTIVATION_DTYPE_FOLLOWS_RUNTIME.load(Ordering::Relaxed) {
-        DEFAULT_ACTIVATION_DTYPE.store(dtype as u8, Ordering::Relaxed);
-    }
-    if KV_CACHE_DTYPE_FOLLOWS_RUNTIME.load(Ordering::Relaxed) {
-        DEFAULT_KV_CACHE_DTYPE.store(dtype as u8, Ordering::Relaxed);
-    }
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| {
+        state.runtime_dtype = dtype;
+        if state.activation_dtype_follows_runtime {
+            state.activation_dtype = dtype;
+        }
+        if state.kv_cache_dtype_follows_runtime {
+            state.kv_cache_dtype = dtype;
+        }
+    });
 }
 
 #[inline]
 pub fn default_activation_dtype() -> DType {
-    DType::from_u8(DEFAULT_ACTIVATION_DTYPE.load(Ordering::Relaxed))
+    precision_state().activation_dtype
 }
 
 #[inline]
 pub fn set_default_activation_dtype(dtype: DType) {
-    DEFAULT_ACTIVATION_DTYPE.store(dtype as u8, Ordering::Relaxed);
-    ACTIVATION_DTYPE_FOLLOWS_RUNTIME.store(false, Ordering::Relaxed);
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| {
+        state.activation_dtype = dtype;
+        state.activation_dtype_follows_runtime = false;
+    });
 }
 
 #[inline]
 pub fn reset_default_activation_dtype_to_runtime() {
-    DEFAULT_ACTIVATION_DTYPE.store(default_runtime_dtype() as u8, Ordering::Relaxed);
-    ACTIVATION_DTYPE_FOLLOWS_RUNTIME.store(true, Ordering::Relaxed);
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| {
+        state.activation_dtype = state.runtime_dtype;
+        state.activation_dtype_follows_runtime = true;
+    });
 }
 
 #[inline]
 pub fn activation_dtype_follows_runtime() -> bool {
-    ACTIVATION_DTYPE_FOLLOWS_RUNTIME.load(Ordering::Relaxed)
+    precision_state().activation_dtype_follows_runtime
 }
 
 #[inline]
 pub fn default_kv_cache_dtype() -> DType {
-    DType::from_u8(DEFAULT_KV_CACHE_DTYPE.load(Ordering::Relaxed))
+    precision_state().kv_cache_dtype
 }
 
 #[inline]
 pub fn set_default_kv_cache_dtype(dtype: DType) {
-    DEFAULT_KV_CACHE_DTYPE.store(dtype as u8, Ordering::Relaxed);
-    KV_CACHE_DTYPE_FOLLOWS_RUNTIME.store(false, Ordering::Relaxed);
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| {
+        state.kv_cache_dtype = dtype;
+        state.kv_cache_dtype_follows_runtime = false;
+    });
 }
 
 #[inline]
 pub fn reset_default_kv_cache_dtype_to_runtime() {
-    DEFAULT_KV_CACHE_DTYPE.store(default_runtime_dtype() as u8, Ordering::Relaxed);
-    KV_CACHE_DTYPE_FOLLOWS_RUNTIME.store(true, Ordering::Relaxed);
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| {
+        state.kv_cache_dtype = state.runtime_dtype;
+        state.kv_cache_dtype_follows_runtime = true;
+    });
 }
 
 #[inline]
 pub fn kv_cache_dtype_follows_runtime() -> bool {
-    KV_CACHE_DTYPE_FOLLOWS_RUNTIME.load(Ordering::Relaxed)
+    precision_state().kv_cache_dtype_follows_runtime
 }
 
 #[inline]
@@ -429,16 +438,18 @@ pub fn set_default_dtype(dtype: DType) {
 
 #[inline]
 pub fn allow_parameter_dtype_copies() -> bool {
-    ALLOW_PARAMETER_DTYPE_COPIES.load(Ordering::Relaxed)
+    precision_state().allow_parameter_dtype_copies
 }
 
 #[inline]
 pub fn set_allow_parameter_dtype_copies(allow: bool) {
-    ALLOW_PARAMETER_DTYPE_COPIES.store(allow, Ordering::Relaxed);
+    let _guard = global_config_write_guard("global config lock poisoned");
+    update_precision_state(|state| state.allow_parameter_dtype_copies = allow);
 }
 
 #[inline]
 pub fn set_precision_config(config: PrecisionConfig) {
+    let _guard = global_config_write_guard("global config lock poisoned");
     set_default_parameter_dtype(config.parameter_dtype);
     set_default_runtime_dtype(config.runtime_dtype);
     set_allow_parameter_dtype_copies(config.allow_parameter_dtype_copies);
@@ -451,7 +462,7 @@ pub fn precision_guard(config: PrecisionConfig) -> PrecisionConfigGuard {
     set_precision_config(config);
     PrecisionConfigGuard {
         previous,
-        _lock: lock,
+        _scope: lock,
     }
 }
 
@@ -470,7 +481,7 @@ pub fn parameter_quantization_guard(
     set_default_parameter_quantization(quantization);
     ParameterQuantizationGuard {
         previous,
-        _lock: lock,
+        _scope: lock,
     }
 }
 
@@ -506,7 +517,7 @@ pub fn runtime_component_dtypes_guard(
         previous_activation_follows_runtime,
         previous_kv_cache_dtype,
         previous_kv_cache_follows_runtime,
-        _lock: lock,
+        _scope: lock,
     }
 }
 
@@ -567,6 +578,12 @@ impl Drop for RuntimeComponentDTypesGuard {
     }
 }
 
+impl Drop for GlobalConfigWriteGuard {
+    fn drop(&mut self) {
+        end_global_config_scope("global config write");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +612,42 @@ mod tests {
         assert_eq!(precision_config().parameter_dtype, DType::F32);
         assert_eq!(precision_config().runtime_dtype, DType::F32);
         assert!(!precision_config().allow_parameter_dtype_copies);
+    }
+
+    #[test]
+    fn precision_config_is_thread_local() {
+        set_precision_config(PrecisionConfig::default());
+
+        let scoped = PrecisionConfig {
+            parameter_dtype: DType::BF16,
+            runtime_dtype: DType::F16,
+            allow_parameter_dtype_copies: true,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _guard = precision_guard(scoped);
+            tx.send(precision_config())
+                .expect("send thread-local precision config");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            tx.send(precision_config())
+                .expect("send thread-local precision config");
+        });
+
+        assert_eq!(rx.recv().expect("receive spawned precision config"), scoped);
+        assert_eq!(
+            precision_config(),
+            PrecisionConfig::default(),
+            "main thread should not inherit spawned thread's precision config"
+        );
+        assert_eq!(rx.recv().expect("receive spawned precision config"), scoped);
+        assert_eq!(
+            precision_config(),
+            PrecisionConfig::default(),
+            "main thread should keep its own precision config"
+        );
+
+        handle.join().expect("join precision config thread");
+        set_precision_config(PrecisionConfig::default());
     }
 
     #[test]

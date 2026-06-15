@@ -1,6 +1,7 @@
 use half::{bf16, f16};
 use memmap2::MmapOptions;
 use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize_to_file};
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -88,10 +89,10 @@ fn parse_args() -> Result<Args, String> {
 
     let input = input.ok_or("必须提供 --input")?;
     let output = output.ok_or("必须提供 --output")?;
-    if let Some(scale) = manual_scale {
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(format!("--scale 必须是有限且 > 0 的数，收到 {scale}"));
-        }
+    if let Some(scale) = manual_scale
+        && (!scale.is_finite() || scale <= 0.0)
+    {
+        return Err(format!("--scale 必须是有限且 > 0 的数，收到 {scale}"));
     }
 
     Ok(Args {
@@ -115,7 +116,7 @@ fn bytes_from_f32(data: &[f32]) -> Vec<u8> {
 }
 
 fn decode_f32_bytes(data: &[u8], name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
         return Err(format!("{} has invalid F32 byte length {}", name, data.len()).into());
     }
     Ok(data
@@ -125,7 +126,7 @@ fn decode_f32_bytes(data: &[u8], name: &str) -> Result<Vec<f32>, Box<dyn std::er
 }
 
 fn decode_f16_bytes(data: &[u8], name: &str) -> Result<Vec<f16>, Box<dyn std::error::Error>> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(format!("{} has invalid F16 byte length {}", name, data.len()).into());
     }
     Ok(data
@@ -139,7 +140,7 @@ fn decode_f16_bytes(data: &[u8], name: &str) -> Result<Vec<f16>, Box<dyn std::er
 }
 
 fn decode_bf16_bytes(data: &[u8], name: &str) -> Result<Vec<bf16>, Box<dyn std::error::Error>> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(format!("{} has invalid BF16 byte length {}", name, data.len()).into());
     }
     Ok(data
@@ -152,55 +153,90 @@ fn decode_bf16_bytes(data: &[u8], name: &str) -> Result<Vec<bf16>, Box<dyn std::
         .collect())
 }
 
-fn quantize_f32_slice_to_i8(data: &[f32], scale_override: Option<f32>) -> (Vec<i8>, f32) {
+fn finite_max_abs(values: impl Iterator<Item = f32>) -> Result<f32, Box<dyn std::error::Error>> {
+    let mut max_abs = 0.0f32;
+    for value in values {
+        if !value.is_finite() {
+            return Err(format!("cannot quantize non-finite value to I8: {value}").into());
+        }
+        max_abs = max_abs.max(value.abs());
+    }
+    Ok(max_abs)
+}
+
+fn quantize_f32_slice_to_i8(
+    data: &[f32],
+    scale_override: Option<f32>,
+) -> Result<(Vec<i8>, f32), Box<dyn std::error::Error>> {
+    let max_abs = finite_max_abs(data.iter().copied())?;
     let scale = if let Some(scale) = scale_override {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("quantization scale must be finite and > 0, got {scale}").into());
+        }
         scale
     } else {
-        let max_abs = data.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-        if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+        if max_abs > 0.0 {
+            (max_abs / 127.0).max(f32::MIN_POSITIVE)
+        } else {
+            1.0
+        }
     };
     let inv_scale = 1.0 / scale;
     let quantized = data
         .iter()
         .map(|&v| (v * inv_scale).round().clamp(-127.0, 127.0) as i8)
         .collect::<Vec<_>>();
-    (quantized, scale)
+    Ok((quantized, scale))
 }
 
-fn quantize_f16_slice_to_i8(data: &[f16], scale_override: Option<f32>) -> (Vec<i8>, f32) {
+fn quantize_f16_slice_to_i8(
+    data: &[f16],
+    scale_override: Option<f32>,
+) -> Result<(Vec<i8>, f32), Box<dyn std::error::Error>> {
+    let max_abs = finite_max_abs(data.iter().map(|&v| v.to_f32()))?;
     let scale = if let Some(scale) = scale_override {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("quantization scale must be finite and > 0, got {scale}").into());
+        }
         scale
     } else {
-        let max_abs = data
-            .iter()
-            .map(|&v| v.to_f32().abs())
-            .fold(0.0f32, f32::max);
-        if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+        if max_abs > 0.0 {
+            (max_abs / 127.0).max(f32::MIN_POSITIVE)
+        } else {
+            1.0
+        }
     };
     let inv_scale = 1.0 / scale;
     let quantized = data
         .iter()
         .map(|&v| (v.to_f32() * inv_scale).round().clamp(-127.0, 127.0) as i8)
         .collect::<Vec<_>>();
-    (quantized, scale)
+    Ok((quantized, scale))
 }
 
-fn quantize_bf16_slice_to_i8(data: &[bf16], scale_override: Option<f32>) -> (Vec<i8>, f32) {
+fn quantize_bf16_slice_to_i8(
+    data: &[bf16],
+    scale_override: Option<f32>,
+) -> Result<(Vec<i8>, f32), Box<dyn std::error::Error>> {
+    let max_abs = finite_max_abs(data.iter().map(|&v| v.to_f32()))?;
     let scale = if let Some(scale) = scale_override {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("quantization scale must be finite and > 0, got {scale}").into());
+        }
         scale
     } else {
-        let max_abs = data
-            .iter()
-            .map(|&v| v.to_f32().abs())
-            .fold(0.0f32, f32::max);
-        if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 }
+        if max_abs > 0.0 {
+            (max_abs / 127.0).max(f32::MIN_POSITIVE)
+        } else {
+            1.0
+        }
     };
     let inv_scale = 1.0 / scale;
     let quantized = data
         .iter()
         .map(|&v| (v.to_f32() * inv_scale).round().clamp(-127.0, 127.0) as i8)
         .collect::<Vec<_>>();
-    (quantized, scale)
+    Ok((quantized, scale))
 }
 
 fn quantize_tensor_view(
@@ -210,11 +246,10 @@ fn quantize_tensor_view(
 ) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
     let shape = view.shape().to_vec();
     let data = view.data();
-    let data = data.as_ref();
     let (quantized, scale) = match view.dtype() {
-        Dtype::F32 => quantize_f32_slice_to_i8(&decode_f32_bytes(data, name)?, scale_override),
-        Dtype::F16 => quantize_f16_slice_to_i8(&decode_f16_bytes(data, name)?, scale_override),
-        Dtype::BF16 => quantize_bf16_slice_to_i8(&decode_bf16_bytes(data, name)?, scale_override),
+        Dtype::F32 => quantize_f32_slice_to_i8(&decode_f32_bytes(data, name)?, scale_override)?,
+        Dtype::F16 => quantize_f16_slice_to_i8(&decode_f16_bytes(data, name)?, scale_override)?,
+        Dtype::BF16 => quantize_bf16_slice_to_i8(&decode_bf16_bytes(data, name)?, scale_override)?,
         other => {
             return Err(format!("{} 不是可量化浮点张量: {:?}", name, other).into());
         }
@@ -236,6 +271,39 @@ fn quantize_tensor_view(
     ])
 }
 
+fn existing_i8_tensor_names(
+    tensors: &SafeTensors<'_>,
+    names: &[String],
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    let available_names = names.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut i8_names = HashSet::new();
+    for name in names {
+        if tensors.tensor(name)?.dtype() == Dtype::I8 {
+            let scale_name = format!("{name}.scale");
+            if !available_names.contains(scale_name.as_str()) {
+                return Err(
+                    format!("existing I8 tensor {name} is missing companion {scale_name}").into(),
+                );
+            }
+            let scale_view = tensors.tensor(&scale_name)?;
+            if scale_view.dtype() != Dtype::F32 || scale_view.shape().iter().product::<usize>() != 1
+            {
+                return Err(format!(
+                    "existing I8 tensor {name} requires scalar F32 companion {scale_name}"
+                )
+                .into());
+            }
+            i8_names.insert(name.clone());
+        }
+    }
+    Ok(i8_names)
+}
+
+fn is_existing_i8_scale_name(name: &str, i8_names: &HashSet<String>) -> bool {
+    name.strip_suffix(".scale")
+        .is_some_and(|base_name| i8_names.contains(base_name))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| format!("参数错误: {e}"))?;
     if args.quant_dtype != Dtype::I8 {
@@ -254,6 +322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
     names.sort();
+    let existing_i8_names = existing_i8_tensor_names(&tensors, &names)?;
 
     println!(
         "Quantizing {} tensors from {} -> {}",
@@ -266,6 +335,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for name in names {
         let view = tensors.tensor(&name)?;
         match view.dtype() {
+            _ if is_existing_i8_scale_name(&name, &existing_i8_names) => {
+                println!("copied: {name} ({:?}, existing I8 scale)", view.dtype());
+                entries.push(Entry {
+                    name,
+                    dtype: view.dtype(),
+                    shape: view.shape().to_vec(),
+                    bytes: view.data().to_owned(),
+                });
+            }
             Dtype::F32 | Dtype::F16 | Dtype::BF16 => {
                 let mut quantized_entries = quantize_tensor_view(&name, &view, args.manual_scale)?;
                 println!("quantized: {name} ({:?} -> I8)", view.dtype());
@@ -293,4 +371,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("done: {}", args.output.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_i8_quantization_rejects_non_finite_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(quantize_f32_slice_to_i8(&[value], None).is_err());
+            assert!(quantize_f16_slice_to_i8(&[f16::from_f32(value)], None).is_err());
+            assert!(quantize_bf16_slice_to_i8(&[bf16::from_f32(value)], None).is_err());
+        }
+    }
+
+    #[test]
+    fn offline_i8_quantization_rejects_invalid_manual_scale() {
+        for scale in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert!(quantize_f32_slice_to_i8(&[1.0], Some(scale)).is_err());
+        }
+    }
+
+    #[test]
+    fn offline_i8_quantization_keeps_subnormal_scale_positive() {
+        let (_, scale) =
+            quantize_f32_slice_to_i8(&[f32::from_bits(1)], None).expect("quantize subnormal");
+        assert_eq!(scale, f32::MIN_POSITIVE);
+    }
+
+    #[test]
+    fn existing_i8_scale_name_is_preserved() {
+        let mut i8_names = HashSet::new();
+        i8_names.insert("layer.weight".to_string());
+        assert!(is_existing_i8_scale_name("layer.weight.scale", &i8_names));
+        assert!(!is_existing_i8_scale_name("layer.bias.scale", &i8_names));
+        assert!(!is_existing_i8_scale_name("layer.weight", &i8_names));
+    }
 }

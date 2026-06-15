@@ -3,7 +3,7 @@ use crate::precision::{DType, default_parameter_dtype, default_parameter_quantiz
 use ndarray::{Array, ArrayD, IxDyn};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::{Normal, Uniform};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::cell::Cell;
 
 pub enum InitType {
     XavierUniform, // For Tanh/Sigmoid (Glorot)
@@ -14,21 +14,13 @@ pub enum InitType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParameterInitMode {
-    Full = 0,
-    Placeholder = 1,
+    Full,
+    Placeholder,
 }
 
-impl ParameterInitMode {
-    #[inline]
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Placeholder,
-            _ => Self::Full,
-        }
-    }
+thread_local! {
+    static PARAMETER_INIT_MODE: Cell<ParameterInitMode> = const { Cell::new(ParameterInitMode::Full) };
 }
-
-static PARAMETER_INIT_MODE: AtomicU8 = AtomicU8::new(ParameterInitMode::Full as u8);
 
 pub struct ParameterInitModeGuard {
     previous: ParameterInitMode,
@@ -36,12 +28,12 @@ pub struct ParameterInitModeGuard {
 
 #[inline]
 pub fn parameter_init_mode() -> ParameterInitMode {
-    ParameterInitMode::from_u8(PARAMETER_INIT_MODE.load(Ordering::Relaxed))
+    PARAMETER_INIT_MODE.with(|mode| mode.get())
 }
 
 #[inline]
 pub fn set_parameter_init_mode(mode: ParameterInitMode) {
-    PARAMETER_INIT_MODE.store(mode as u8, Ordering::Relaxed);
+    PARAMETER_INIT_MODE.with(|cell| cell.set(mode));
 }
 
 #[inline]

@@ -41,8 +41,7 @@ pub trait Module {
         let checkpoint = ModelCheckpoint { params: data_list };
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, &checkpoint)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        bincode::serialize_into(writer, &checkpoint).map_err(std::io::Error::other)?;
         println!("Model saved to {} (Binary format)", path);
         Ok(())
     }
@@ -50,8 +49,8 @@ pub trait Module {
     fn load(&self, path: &str) -> std::io::Result<()> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let checkpoint: ModelCheckpoint = bincode::deserialize_from(reader)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let checkpoint: ModelCheckpoint =
+            bincode::deserialize_from(reader).map_err(std::io::Error::other)?;
 
         let my_params = self.parameters();
         if checkpoint.params.len() != my_params.len() {
@@ -65,7 +64,7 @@ pub trait Module {
             ));
         }
 
-        for (param, tensor_blob) in my_params.iter().zip(checkpoint.params.into_iter()) {
+        for (param, tensor_blob) in my_params.iter().zip(checkpoint.params) {
             param
                 .import_raw(tensor_blob.shape, tensor_blob.dtype, tensor_blob.raw)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

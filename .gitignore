@@ -1,0 +1,24 @@
+/target/
+
+# Rust compiler and debugger artifacts
+*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+*.ilk
+*.obj
+
+# Local tooling and environment
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+
+# Operating system metadata
+.DS_Store
+Thumbs.db

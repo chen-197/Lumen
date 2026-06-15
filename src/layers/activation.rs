@@ -5,9 +5,60 @@ use crate::autograd::{
 use crate::module::Module;
 use crate::ops::cuda;
 use crate::precision::DType;
-use ndarray::{Array2, Zip};
+use ndarray::{Array2, IxDyn, Zip};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+const CPU_UNARY_SERIAL_FAST_LEN: usize = 1 << 16;
+
+fn try_cuda_unary_native_lowp_buffer(
+    input: &Tensor,
+    cuda_op: cuda::UnaryOp,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    if input.device() != Device::Cuda || input.is_empty() {
+        return None;
+    }
+
+    let (dtype, buffer, scale) = input.cloned_cuda_native_lowp_buffer()?;
+    Some(match dtype {
+        DType::F16 => cuda::unary_f16_buffer(&buffer, cuda_op),
+        DType::BF16 => cuda::unary_bf16_buffer(&buffer, cuda_op),
+        DType::I8 => cuda::unary_i8_buffer(&buffer, scale?, cuda_op),
+        DType::F32 => return None,
+    })
+}
+
+fn try_cuda_unary_backward_native_lowp_buffer(
+    input: &Tensor,
+    output: &cuda::CudaBuffer,
+    grad: &cuda::CudaBuffer,
+    cuda_op: cuda::UnaryOp,
+) -> Option<Result<cuda::CudaBuffer, String>> {
+    if input.device() != Device::Cuda || input.is_empty() {
+        return None;
+    }
+
+    let (dtype, buffer, scale) = input.cloned_cuda_native_lowp_buffer()?;
+    Some(match dtype {
+        DType::F16 => cuda::unary_backward_f16_buffer(&buffer, output, grad, cuda_op),
+        DType::BF16 => cuda::unary_backward_bf16_buffer(&buffer, output, grad, cuda_op),
+        DType::I8 => cuda::unary_backward_i8_buffer(&buffer, scale?, output, grad, cuda_op),
+        DType::F32 => return None,
+    })
+}
+
+fn cuda_unary_backward_buffer(
+    input: &Tensor,
+    output: &cuda::CudaBuffer,
+    grad: &cuda::CudaBuffer,
+    cuda_op: cuda::UnaryOp,
+) -> Result<cuda::CudaBuffer, String> {
+    try_cuda_unary_backward_native_lowp_buffer(input, output, grad, cuda_op).unwrap_or_else(|| {
+        input.with_cuda_f32_buffer(|input_buf| {
+            cuda::unary_backward_f32_buffer(input_buf, output, grad, cuda_op)
+        })
+    })
+}
 
 fn unary_no_grad(
     input: &Tensor,
@@ -16,6 +67,47 @@ fn unary_no_grad(
 ) -> Tensor {
     let output_dtype = input.dtype();
     let output_device = input.device();
+    if input.is_empty() {
+        return Tensor::from_f32_data_no_grad_with_device_dtype(
+            ndarray::ArrayD::<f32>::zeros(IxDyn(&input.shape_vec())),
+            output_dtype,
+            output_device,
+        );
+    }
+    if output_device == Device::Cuda
+        && (cuda::should_accelerate_elementwise(input.len()) || is_strict_device_execution())
+    {
+        if let Some((dtype, buffer, scale)) = input.cloned_cuda_native_lowp_buffer()
+            && dtype == output_dtype
+        {
+            let typed_out = match dtype {
+                DType::F16 => cuda::unary_f16_typed_output_buffer(&buffer, cuda_op).ok(),
+                DType::BF16 => cuda::unary_bf16_typed_output_buffer(&buffer, cuda_op).ok(),
+                DType::I8 if cuda_op == cuda::UnaryOp::Relu => {
+                    cuda::unary_i8_relu_typed_output_buffer(&buffer).ok()
+                }
+                DType::F32 | DType::I8 => None,
+            };
+            if let Some(buffer) = typed_out {
+                return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                    &input.shape_vec(),
+                    buffer,
+                    output_device,
+                    output_dtype,
+                    if dtype == DType::I8 { scale } else { None },
+                );
+            }
+        }
+        if let Some(Ok(buffer)) = try_cuda_unary_native_lowp_buffer(input, cuda_op) {
+            return Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+                &input.shape_vec(),
+                buffer,
+                output_device,
+                output_dtype,
+            );
+        }
+    }
+
     input.with_storage_view_preferring(StoragePreference::F32Compute, |input_view| {
         let input_f32 = match input_view {
             TensorStorageView::F32(view) => view,
@@ -27,7 +119,8 @@ fn unary_no_grad(
             }
         };
         if output_device == crate::autograd::Device::Cuda
-            && cuda::should_accelerate_elementwise(input_f32.len())
+            && (cuda::should_accelerate_elementwise(input_f32.len())
+                || is_strict_device_execution())
         {
             if output_dtype == DType::F32 {
                 let cuda_out = input
@@ -55,6 +148,20 @@ fn unary_no_grad(
                 }
             }
         }
+        if input_f32.len() <= CPU_UNARY_SERIAL_FAST_LEN
+            && let Some(input_slice) = input_f32.as_slice_memory_order()
+        {
+            let mut out = Vec::with_capacity(input_slice.len());
+            out.extend(input_slice.iter().map(|&x| op(x)));
+            let data = ndarray::Array::from_shape_vec(input_f32.raw_dim(), out)
+                .expect("CPU unary output shape build failed")
+                .into_dyn();
+            return Tensor::from_f32_data_no_grad_with_device_dtype(
+                data,
+                output_dtype,
+                output_device,
+            );
+        }
         let data = Zip::from(&input_f32).par_map_collect(|&x| op(x)).into_dyn();
         Tensor::from_f32_data_no_grad_with_device_dtype(data, output_dtype, output_device)
     })
@@ -67,6 +174,53 @@ fn softmax_no_grad(input: &Tensor, axis: usize) -> Tensor {
         DType::F32
     };
     let output_device = input.device();
+
+    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        let shape = input.shape_vec();
+        assert!(!shape.is_empty(), "Softmax expects at least 1D input");
+        assert_eq!(
+            axis,
+            shape.len() - 1,
+            "Softmax currently only supports the last dimension in this implementation"
+        );
+        let last_dim = shape[axis];
+        assert!(
+            last_dim > 0,
+            "Softmax last dimension must be greater than zero"
+        );
+        let outer_dim = input.len() / last_dim;
+        if cuda::should_accelerate_softmax(outer_dim, last_dim)
+            && let Some((dtype, input_buf, scale)) = input.cloned_cuda_native_lowp_buffer()
+        {
+            if output_dtype == DType::F32 {
+                if let Ok(buffer) = cuda::softmax_lastdim_typed_no_host(
+                    &input_buf, dtype, scale, outer_dim, last_dim,
+                ) {
+                    return Tensor::from_cuda_f32_buffer_no_host(&shape, buffer, output_device);
+                }
+            } else if let Ok(buffer) =
+                cuda::softmax_lastdim_typed_no_host(&input_buf, dtype, scale, outer_dim, last_dim)
+            {
+                match cuda::f32_to_lowp_storage_no_host(&buffer, output_dtype) {
+                    Ok(lowp_buffer) => {
+                        return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                            &shape,
+                            lowp_buffer,
+                            output_device,
+                            output_dtype,
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            !is_strict_device_execution(),
+                            "softmax CUDA low precision output conversion failed while strict device execution is enabled: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     input.with_storage_view_preferring(StoragePreference::F32Compute, |input_view| {
         let input_view = match input_view {
@@ -104,18 +258,26 @@ fn softmax_no_grad(input: &Tensor, axis: usize) -> Tensor {
                 }
             } else {
                 let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-                    cuda::softmax_lastdim_f32(input_buf, outer_dim, last_dim)
+                    cuda::softmax_lastdim_f32_no_host(input_buf, outer_dim, last_dim)
                 });
-                if let Ok((buffer, out)) = cuda_out {
-                    let out = ndarray::Array::from_shape_vec(ndarray::IxDyn(&shape), out)
-                        .expect("CUDA softmax output shape build failed")
-                        .into_dyn();
-                    return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
-                        out,
-                        output_dtype,
-                        output_device,
-                        Some(buffer),
-                    );
+                if let Ok(buffer) = cuda_out {
+                    match cuda::f32_to_lowp_storage_no_host(&buffer, output_dtype) {
+                        Ok(lowp_buffer) => {
+                            return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
+                                &shape,
+                                lowp_buffer,
+                                output_device,
+                                output_dtype,
+                                None,
+                            );
+                        }
+                        Err(err) => {
+                            assert!(
+                                !is_strict_device_execution(),
+                                "softmax CUDA low precision output conversion failed while strict device execution is enabled: {err}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -183,14 +345,14 @@ fn silu_backward_f32(x: f32, _y: f32, grad: f32) -> f32 {
 }
 
 fn gelu_f32(x: f32) -> f32 {
-    const C: f32 = 0.7978845608;
+    const C: f32 = 0.797_884_6;
     const K: f32 = 0.044715;
     let x3 = x * x * x;
     0.5 * x * (1.0 + (C * (x + K * x3)).tanh())
 }
 
 fn gelu_backward_f32(x: f32, _y: f32, grad: f32) -> f32 {
-    const C: f32 = 0.7978845608;
+    const C: f32 = 0.797_884_6;
     const K: f32 = 0.044715;
     let x3 = x * x * x;
     let inner = C * (x + K * x3);
@@ -201,6 +363,15 @@ fn gelu_backward_f32(x: f32, _y: f32, grad: f32) -> f32 {
 
 fn cpu_unary_activation_data(input: &Tensor, forward: fn(f32) -> f32) -> ndarray::ArrayD<f32> {
     let input_ref = input.data_ref();
+    if input_ref.len() <= CPU_UNARY_SERIAL_FAST_LEN
+        && let Some(input_slice) = input_ref.as_slice_memory_order()
+    {
+        let mut out = Vec::with_capacity(input_slice.len());
+        out.extend(input_slice.iter().map(|&x| forward(x)));
+        return ndarray::Array::from_shape_vec(input_ref.raw_dim(), out)
+            .expect("CPU unary activation output shape build failed")
+            .into_dyn();
+    }
     Zip::from(&*input_ref)
         .par_map_collect(|&x| forward(x))
         .into_dyn()
@@ -213,6 +384,25 @@ fn cpu_unary_activation_grad(
     backward: fn(f32, f32, f32) -> f32,
 ) -> ndarray::ArrayD<f32> {
     let input_ref = input.data_ref();
+    if grad.len() <= CPU_UNARY_SERIAL_FAST_LEN
+        && let (Some(grad_slice), Some(input_slice), Some(output_slice)) = (
+            grad.as_slice_memory_order(),
+            input_ref.as_slice_memory_order(),
+            output_data.as_slice_memory_order(),
+        )
+    {
+        let mut out = Vec::with_capacity(grad_slice.len());
+        out.extend(
+            grad_slice
+                .iter()
+                .zip(input_slice)
+                .zip(output_slice)
+                .map(|((&g, &x), &y)| backward(x, y, g)),
+        );
+        return ndarray::Array::from_shape_vec(grad.raw_dim(), out)
+            .expect("CPU unary activation grad shape build failed")
+            .into_dyn();
+    }
     let mut grad_input = grad.to_owned().into_dyn();
     Zip::from(grad_input.view_mut())
         .and(&*input_ref)
@@ -240,10 +430,11 @@ fn unary_activation_with_backward(
     let cuda_native_supported = output_device == Device::Cuda;
     assert_native_device_support(output_device, op_name, cuda_native_supported);
 
-    if output_device == Device::Cuda && input.len() > 0 {
+    if output_device == Device::Cuda && !input.is_empty() {
         let shape = input.shape_vec();
-        let cuda_out =
-            input.with_cuda_f32_buffer(|input_buf| cuda::unary_f32_buffer(input_buf, cuda_op));
+        let cuda_out = try_cuda_unary_native_lowp_buffer(&input, cuda_op).unwrap_or_else(|| {
+            input.with_cuda_f32_buffer(|input_buf| cuda::unary_f32_buffer(input_buf, cuda_op))
+        });
         match cuda_out {
             Ok(buffer) => {
                 let output_buffer = buffer.clone();
@@ -257,6 +448,9 @@ fn unary_activation_with_backward(
                     bf16_data: None,
                     i8_data: None,
                     cuda_f32_data: Some(buffer),
+                    cuda_f16_data: None,
+                    cuda_bf16_data: None,
+                    cuda_i8_data: None,
                     i8_scale: None,
                     has_f32_data: false,
                     storage_dtype: crate::precision::DType::F32,
@@ -274,14 +468,12 @@ fn unary_activation_with_backward(
                             .filter(|grad_buf| grad_buf.len() == grad.len());
                         let cuda_grad = if let Some(grad_buf) = upstream_cuda_grad {
                             if is_strict_device_execution() {
-                                match input_clone.with_cuda_f32_buffer(|input_buf| {
-                                    cuda::unary_backward_f32_buffer(
-                                        input_buf,
-                                        &output_buffer,
-                                        &grad_buf,
-                                        cuda_op,
-                                    )
-                                }) {
+                                match cuda_unary_backward_buffer(
+                                    &input_clone,
+                                    &output_buffer,
+                                    &grad_buf,
+                                    cuda_op,
+                                ) {
                                     Ok(grad_buffer) => {
                                         input_clone.add_cuda_grad_buffer_only(grad_buffer);
                                         return;
@@ -293,24 +485,28 @@ fn unary_activation_with_backward(
                                     }
                                 }
                             }
-                            input_clone.with_cuda_f32_buffer(|input_buf| {
-                                cuda::unary_backward_f32(
-                                    input_buf,
-                                    &output_buffer,
-                                    &grad_buf,
-                                    cuda_op,
-                                )
+                            cuda_unary_backward_buffer(
+                                &input_clone,
+                                &output_buffer,
+                                &grad_buf,
+                                cuda_op,
+                            )
+                            .and_then(|grad_buffer| {
+                                cuda::download_f32(&grad_buffer)
+                                    .map(|grad_host| (grad_buffer, grad_host))
                             })
                         } else {
                             let grad_host = grad.iter().copied().collect::<Vec<_>>();
                             cuda::upload_f32(&grad_host).and_then(|grad_buf| {
-                                input_clone.with_cuda_f32_buffer(|input_buf| {
-                                    cuda::unary_backward_f32(
-                                        input_buf,
-                                        &output_buffer,
-                                        &grad_buf,
-                                        cuda_op,
-                                    )
+                                cuda_unary_backward_buffer(
+                                    &input_clone,
+                                    &output_buffer,
+                                    &grad_buf,
+                                    cuda_op,
+                                )
+                                .and_then(|grad_buffer| {
+                                    cuda::download_f32(&grad_buffer)
+                                        .map(|grad_host| (grad_buffer, grad_host))
                                 })
                             })
                         };
@@ -373,6 +569,9 @@ fn unary_activation_with_backward(
         bf16_data: None,
         i8_data: None,
         cuda_f32_data: None,
+        cuda_f16_data: None,
+        cuda_bf16_data: None,
+        cuda_i8_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
@@ -394,6 +593,12 @@ pub struct ReLU;
 impl ReLU {
     pub fn new() -> Self {
         ReLU
+    }
+}
+
+impl Default for ReLU {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -419,6 +624,12 @@ impl Sigmoid {
     }
 }
 
+impl Default for Sigmoid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Module for Sigmoid {
     fn forward(&self, input: Tensor) -> Tensor {
         unary_activation_with_backward(
@@ -441,6 +652,12 @@ impl Tanh {
     }
 }
 
+impl Default for Tanh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Module for Tanh {
     fn forward(&self, input: Tensor) -> Tensor {
         unary_activation_with_backward(
@@ -460,6 +677,12 @@ pub struct SiLU;
 impl SiLU {
     pub fn new() -> Self {
         SiLU
+    }
+}
+
+impl Default for SiLU {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -514,10 +737,16 @@ impl Module for Softmax {
         let cuda_native_supported = output_device == Device::Cuda;
         assert_native_device_support(output_device, "softmax", cuda_native_supported);
 
-        if output_device == Device::Cuda && input.len() > 0 {
-            let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
-                cuda::softmax_lastdim_f32_no_host(input_buf, outer_dim, last_dim)
-            });
+        if output_device == Device::Cuda && !input.is_empty() {
+            let cuda_out = if let Some((dtype, input_buf, scale)) =
+                input.cloned_cuda_native_lowp_buffer()
+            {
+                cuda::softmax_lastdim_typed_no_host(&input_buf, dtype, scale, outer_dim, last_dim)
+            } else {
+                input.with_cuda_f32_buffer(|input_buf| {
+                    cuda::softmax_lastdim_f32_no_host(input_buf, outer_dim, last_dim)
+                })
+            };
             match cuda_out {
                 Ok(buffer) => {
                     let output_buffer = buffer.clone();
@@ -531,6 +760,9 @@ impl Module for Softmax {
                         bf16_data: None,
                         i8_data: None,
                         cuda_f32_data: Some(buffer),
+                        cuda_f16_data: None,
+                        cuda_bf16_data: None,
+                        cuda_i8_data: None,
                         i8_scale: None,
                         has_f32_data: false,
                         storage_dtype: crate::precision::DType::F32,
@@ -704,6 +936,9 @@ impl Module for Softmax {
             bf16_data: None,
             i8_data: None,
             cuda_f32_data: None,
+            cuda_f16_data: None,
+            cuda_bf16_data: None,
+            cuda_i8_data: None,
             i8_scale: None,
             has_f32_data: true,
             storage_dtype: crate::precision::DType::F32,
@@ -755,6 +990,12 @@ impl Gelu {
     }
 }
 
+impl Default for Gelu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Module for Gelu {
     fn forward(&self, input: Tensor) -> Tensor {
         unary_activation_with_backward(
@@ -796,6 +1037,13 @@ mod tests {
                 .into_dyn(),
             true,
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn make_training_tensor_with_dtype(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
+        let tensor = make_training_tensor(shape, data);
+        tensor.cast_inplace(dtype);
+        tensor
     }
 
     #[cfg(feature = "cuda")]
@@ -946,6 +1194,146 @@ mod tests {
                 "softmax got {got}, expect {expect}"
             );
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_lowp_relu_uses_resident_forward_buffer_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let input = make_tensor(&[2, 2], vec![-1.0, 0.0, 0.5, 2.0], dtype).to_cuda();
+            assert!(input.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!input.has_host_f32_data());
+
+            let out = no_grad(|| ReLU::new().forward(input.clone()));
+
+            assert!(out.is_cuda());
+            assert_eq!(out.dtype(), dtype);
+            {
+                let inner = out.0.borrow();
+                match dtype {
+                    DType::F16 => {
+                        assert!(inner.cuda_f32_data.is_none());
+                        assert!(inner.cuda_f16_data.is_some());
+                    }
+                    DType::BF16 => {
+                        assert!(inner.cuda_f32_data.is_none());
+                        assert!(inner.cuda_bf16_data.is_some());
+                    }
+                    DType::I8 => {
+                        assert!(inner.cuda_f32_data.is_none());
+                        assert!(inner.cuda_i8_data.is_some());
+                        assert!(inner.i8_scale.is_some());
+                    }
+                    DType::F32 => unreachable!("test only covers low precision dtypes"),
+                }
+            }
+            assert!(!out.has_host_f32_data());
+            assert!(!input.has_host_f32_data());
+            let vals = out.data_ref().iter().copied().collect::<Vec<_>>();
+            for (got, expected) in vals.iter().zip([0.0f32, 0.0, 0.5, 2.0]) {
+                assert!(
+                    (got - expected).abs() <= 0.03,
+                    "{dtype:?} relu got {got}, expected {expected}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_lowp_softmax_uses_resident_forward_buffer_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let values = (0..(64 * 256))
+                .map(|i| (i as f32 % 29.0) / 11.0 - 1.3)
+                .collect::<Vec<_>>();
+            let input = make_tensor(&[64, 256], values.clone(), dtype).to_cuda();
+            assert!(input.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(input.0.borrow().cuda_f32_data.is_none());
+
+            let out = no_grad(|| Softmax::new(1).forward(input.clone()));
+
+            assert!(out.is_cuda());
+            assert_eq!(
+                out.dtype(),
+                if dtype == DType::I8 {
+                    DType::F32
+                } else {
+                    dtype
+                }
+            );
+            assert!(input.0.borrow().cuda_f32_data.is_none());
+            assert!(!input.has_host_f32_data());
+            if dtype == DType::I8 {
+                assert!(out.cloned_cuda_f32_buffer().is_some());
+            } else {
+                assert!(out.cloned_cuda_native_lowp_buffer().is_some());
+                assert!(out.0.borrow().cuda_f32_data.is_none());
+            }
+            assert!(!out.has_host_f32_data());
+
+            let cpu_input = make_tensor(&[64, 256], values, dtype);
+            let cpu_out = no_grad(|| Softmax::new(1).forward(cpu_input));
+            let tol = if dtype == DType::F16 { 2e-3 } else { 8e-3 };
+            for (got, expect) in out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
+                assert!(
+                    (got - expect).abs() <= tol,
+                    "{dtype:?} softmax got {got}, expected {expect}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_lowp_relu_backward_keeps_f32_grad_and_no_operand_f32_materialization() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let input = make_training_tensor_with_dtype(&[2, 2], vec![-1.0, 0.0, 0.5, 2.0], dtype)
+                .to_cuda();
+            assert!(input.cloned_cuda_native_lowp_buffer().is_some());
+
+            let out = ReLU::new().forward(input.clone());
+            out.backward();
+
+            assert!(input.cloned_cuda_f32_grad().is_some());
+            assert!(!input.has_host_f32_data());
+            let grad = input.grad().expect("CUDA lowp relu grad");
+            for (got, expected) in grad.iter().zip([0.0f32, 0.0, 1.0, 1.0]) {
+                assert!(
+                    (got - expected).abs() <= 1e-6,
+                    "{dtype:?} relu grad got {got}, expected {expected}"
+                );
+            }
+        }
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
     }
 
     #[cfg(feature = "cuda")]
