@@ -265,6 +265,33 @@ extern "C" int lumen_cuda_f32_to_lowp_storage_device(
     return check_cuda_launch("CUDA f32 to lowp storage kernel launch failed") ? 0 : 1;
 }
 
+extern "C" int lumen_cuda_f32_to_i8_storage_device(
+    uint64_t input_handle,
+    uint64_t out_handle,
+    size_t len,
+    float scale) {
+    if (!validate_handle(input_handle, "CUDA f32 to i8 input handle") ||
+        !validate_handle(out_handle, "CUDA f32 to i8 output handle")) {
+        return 1;
+    }
+    if (!(scale > 0.0f && isfinite(scale))) {
+        set_error("CUDA f32 to i8 scale must be finite and > 0");
+        return 1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+
+    constexpr unsigned int block_size = 256;
+    const unsigned int grid_size = linear_grid_size(len, block_size);
+    f32_to_i8_storage_kernel<<<grid_size, block_size>>>(
+        handle_to_ptr(input_handle),
+        reinterpret_cast<int8_t*>(handle_to_ptr(out_handle)),
+        len,
+        scale);
+    return check_cuda_launch("CUDA f32 to i8 storage kernel launch failed") ? 0 : 1;
+}
+
 extern "C" int lumen_cuda_sgd_momentum_update_f32_device(
     uint64_t param_handle,
     uint64_t grad_handle,

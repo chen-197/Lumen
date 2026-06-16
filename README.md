@@ -368,31 +368,46 @@ This is important because CPU fallback and CPU-side helper paths should not be m
 
 ### Comprehensive accuracy and training checks
 
-Commands:
+Commands run for this refresh:
 
 ```bash
+cargo fmt --all -- --check
 cargo test --release --all-targets --features "cuda x86-fp-kernels x86-int8-kernels"
 cargo test --release --lib --features "cuda x86-fp-kernels x86-int8-kernels" -- --ignored --nocapture
 cargo test --release --lib --no-default-features --features "x86-fp-kernels x86-int8-kernels"
 cargo clippy --release --all-targets --features "cuda x86-fp-kernels x86-int8-kernels" -- -D warnings
-cargo clippy --release --all-targets --no-default-features --features "x86-fp-kernels x86-int8-kernels" -- -D warnings
+cargo clippy --release --lib --no-default-features --features "x86-fp-kernels x86-int8-kernels" -- -D warnings
 
 # Run once for each of f32/f16/bf16/i8
 cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
-  --suite all --size medium --dtype DTYPE --runs 7 --warmup 3 --check
+  --suite all --size medium --dtype DTYPE --runs 3 --warmup 1 --check
+
+# Run once for each of f32/f16/bf16/i8
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
+  --suite path --check --case path.train --dtype DTYPE --runs 1 --warmup 0
+
+# Run for CPU and CUDA across f32/f16/bf16/i8+bf16
+cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin prefill_decode_bench -- \
+  --weights C:\Users\chen-\Downloads\model.safetensors \
+  --tokenizer C:\Users\chen-\Downloads\tokenizer.json \
+  --device DEVICE --parameter-dtype PARAM_DTYPE --runtime-dtype RUNTIME_DTYPE \
+  --activation-dtype ACTIVATION_DTYPE --kv-cache-dtype KV_DTYPE --quantize QUANTIZE \
+  --max-gen 24 --max-seq-len 256 --runs 1 --warmup 0 --mode greedy \
+  --stop-on-eos --stop-on-chat-marker --system "You are a concise assistant." \
+  --prompt "Write one short sentence about neural networks." --show-output
 ```
 
 Results:
 
-- CUDA all-target regression: library `436 passed; 0 failed; 9 ignored`, quantization tool `4 passed; 0 failed`;
+- CUDA all-target regression: library `440 passed; 0 failed; 9 ignored`, empty main binary test target passed, quantization tool `4 passed; 0 failed`;
 - all 9 explicit performance smoke tests: `9 passed; 0 failed`;
-- CPU-only regression: `249 passed; 0 failed; 6 ignored`;
+- CPU-only regression: `251 passed; 0 failed; 6 ignored`;
 - CUDA and CPU clippy with `-D warnings`: passed;
-- TinyLlama real-model inference passed for CPU and CUDA across F32, F16, BF16, and I8 weights + BF16 runtime, with `replacement=0` and `control=0` in every generated text sample;
-- CPU/CUDA forward, backward, F32-gradient, optimizer, compact Llama F32/F16/BF16 training checks, and standalone I8 parameter-training checks passed;
-- native I8 Adam state and a fully I8 Llama runtime are intentionally skipped; I8 parameters with F32 optimizer state and the standalone training path passed.
+- TinyLlama real-model inference passed for CPU and CUDA across F32, F16, BF16, and I8 weights + BF16 runtime, with `replacement=0`, `trailing_replacement=0`, and `control=0` in every generated sample;
+- CPU/CUDA forward, backward, F32-gradient, optimizer, compact Llama F32/F16/BF16 training checks, and I8 parameter-training checks passed;
+- native I8 Adam state and a fully I8 Llama runtime are intentionally skipped; I8 parameters with F32 optimizer state and I8 + BF16 runtime path checks passed.
 
-Representative same-dtype CPU/CUDA differences:
+Representative same-dtype CPU/CUDA differences from `cuda_cpu_bench --suite all --check`:
 
 | Check | F32 max abs | F16 max abs | BF16 max abs | I8 max abs |
 |---|---:|---:|---:|---:|
@@ -400,7 +415,9 @@ Representative same-dtype CPU/CUDA differences:
 | matrix matmul lhs grad | `2.384e-7` | `2.384e-7` | `3.576e-7` | `2.384e-7` |
 | matrix matmul rhs grad | `4.768e-7` | `4.768e-7` | `4.768e-7` | `4.768e-7` |
 
-BF16 forward error is visibly larger than F16 because of BF16 mantissa precision and reduction-order differences; gradients remain F32. The BF16 Llama training gradient check has a large relative difference around near-zero values, while its maximum absolute difference is `1.178e-3` and the check passes.
+BF16 forward error is visibly larger than F16 because of BF16 mantissa precision and reduction-order differences; gradients remain F32. The I8 forward numbers are quantized-path checks, not proof of floating-equivalent arithmetic.
+
+The training-path check now covers 21 CPU/CUDA paths for each dtype: scalar SGD, MLP, GELU MLP, Dropout MLP, BatchMatMul, gated MLP, Embedding classifier, shape/view chain, shared/tied parameter reuse, gradient accumulation, SGD batched optimizer update, RMSNorm, RNN, GRU, LSTM, Adam, Adam batched optimizer update, Conv2D, Conv2D+MaxPool, SelfAttention, and a compact Transformer block. I8 attention and Transformer block checks use I8 parameters with BF16 runtime/KV-cache data.
 
 Observed loss trend for the 24-step SGD + momentum path:
 
@@ -411,33 +428,48 @@ Observed loss trend for the 24-step SGD + momentum path:
 | BF16 | `9.0 -> 0` | `9.0 -> 0` | 3 |
 | I8 | `9.0 -> 4e-4` | `9.0 -> 4e-4` | 3 |
 
-The traces are not monotonic, but all have a clear downward trend, which is the intended SGD-path criterion.
+These traces are not monotonic, but all have a clear downward trend, which is the intended SGD-path criterion.
 
-Latest 2026-06-16 path timing for this tiny 24-step SGD + momentum check:
+Latest 2026-06-16 timing for the tiny 24-step SGD + momentum check:
 
 | DType | CPU us/step | CUDA us/step | Notes |
 |---|---:|---:|---|
-| F32 | 125.76 | 2646.00 | CUDA gradients and momentum state remained F32 |
-| F16 | 134.58 | 2443.51 | low-precision parameters, F32 gradients |
-| BF16 | 47.66 | 2533.73 | low-precision parameters, F32 gradients |
-| I8 | 119.11 | 2287.18 | quantized parameters, F32 gradients |
+| F32 | 51.72 | 2197.00 | CUDA gradients and momentum state remained F32 |
+| F16 | 79.85 | 2778.32 | low-precision parameters, F32 gradients |
+| BF16 | 51.07 | 2282.88 | low-precision parameters, F32 gradients |
+| I8 | 134.49 | 2433.09 | quantized parameters, F32 gradients |
 
-Compact Llama training checks also passed for F32/F16/BF16 on CPU and CUDA. The I8 compact Llama training case is skipped by design because the compact Llama bench constructor requires floating runtime and KV-cache dtypes; I8 parameter training is covered by `path.train`.
+Batched optimizer path timing snapshot. Both CUDA paths assert that pointer-batched optimizer kernels were used, while gradients and optimizer state remain F32:
+
+| Path | DType | CPU us/step | CUDA us/step | Loss first -> last |
+|---|---:|---:|---:|---:|
+| SGD momentum batched update | F32 | 576.59 | 2992.01 | `0.042612 -> 0.035707` |
+| SGD momentum batched update | F16 | 3133.51 | 4016.52 | `0.042624 -> 0.035717` |
+| SGD momentum batched update | BF16 | 2022.76 | 1878.86 | `0.042695 -> 0.035773` |
+| SGD momentum batched update | I8 | 1940.68 | 4371.20 | `0.042661 -> 0.037453` |
+| Adam batched update | F32 | 807.70 | 1610.01 | `0.032873 -> 0.000897` |
+| Adam batched update | F16 | 2955.92 | 1607.95 | `0.032875 -> 0.000898` |
+| Adam batched update | BF16 | 2394.90 | 1625.08 | `0.032754 -> 0.000915` |
+| Adam batched update | I8 | 2052.58 | 3984.49 | `0.032910 -> 0.017634` |
+
+These are small end-to-end training graphs with eight Linear shards, so CUDA is still often launch- and dispatch-bound outside the optimizer update itself.
 
 Latest 2026-06-16 performance-smoke highlights:
 
 | Case | Result |
 |---|---:|
 | BF16 same-dtype dot/dot2/dot3 backend | `x86-avx512bf16` |
-| BF16 dot / dot2 / dot3 | 0.305 / 0.348 / 0.426 us |
+| BF16 dot / dot2 / dot3 | 0.411 / 0.549 / 0.620 us |
 | F16 same-dtype dot/dot2/dot3 backend | `x86-avx2-f16c` |
-| F16 dot / dot2 / dot3 | 0.402 / 0.428 / 0.463 us |
+| F16 dot / dot2 / dot3 | 0.382 / 0.405 / 0.448 us |
 | I8 same-dtype dot2 / dot3 backend | `x86-avx512bw` |
-| I8 dot2 / dot3 | 0.237 / 0.340 us |
-| CUDA dynamic I8 quantize, 1M elements | 239.2 us |
-| CUDA I8xI8 matmul, F32 out | 24.6 us, `kernel_err=0.00002` |
-| CUDA I8xI8 matmul, typed I8 out | 120.3 us, `quant_err=1.00382` |
-| CUDA I8xI8 batch matmul, F32 / typed I8 out | 13.4 / 90.1 us |
+| I8 dot2 / dot3 | 0.260 / 0.332 us |
+| CPU batch matmul backward, BF16xBF16 / I8xI8 / BF16xI8 / F32xI8 | 2019.7 / 391.0 / 325.7 / 274.4 us |
+| CUDA dynamic I8 quantize, 1M elements | 99.0 us |
+| CUDA lowp sum, 1M elements F32 / F16 / BF16 / I8 | 1374.4 / 319.9 / 303.6 / 394.3 us |
+| CUDA I8xI8 matmul, F32 out | 18.5 us, `kernel_err=0.00002` |
+| CUDA I8xI8 matmul, typed I8 out | 82.0 us, `quant_err=1.00382` |
+| CUDA I8xI8 batch matmul, F32 / typed I8 out | 13.5 / 69.9 us |
 
 ### CPU kernel snapshot
 
@@ -481,102 +513,54 @@ Command family:
 ```bash
 # Run once for each of f32/f16/bf16/i8
 cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
-  --suite all --size medium --dtype DTYPE --runs 7 --warmup 3 --check
+  --suite all --size medium --dtype DTYPE --runs 3 --warmup 1 --check
 ```
 
 Each cell is `CPU ms / CUDA ms / CUDA speedup`. These are small-to-medium development shapes, not hardware peak-throughput claims.
 
-#### Dense, fused, normalization, and loss operators
-
 | Operator | F32 | F16 | BF16 | I8 |
 |---|---:|---:|---:|---:|
-| `matmul.forward` | 2.146 / 0.055 / 38.73x | 1.207 / 0.023 / 52.70x | 0.798 / 0.026 / 31.04x | 2.070 / 0.327 / 6.34x |
-| `batch_matmul.forward` | 0.008 / 0.014 / 0.56x | 0.040 / 0.011 / 3.60x | 0.014 / 0.014 / 1.03x | 0.141 / 0.073 / 1.93x |
-| `matmul.backward` | 6.712 / 0.663 / 10.13x | 25.320 / 1.162 / 21.79x | 5.270 / 1.943 / 2.71x | 4.619 / 1.250 / 3.70x |
-| `fused_gateup.forward` | 2.939 / 0.071 / 41.69x | 1.599 / 0.114 / 14.04x | 2.858 / 0.129 / 22.23x | 3.169 / 0.135 / 23.52x |
-| `fused_qkv.decode` | 0.005 / 0.047 / 0.10x | 0.008 / 0.046 / 0.18x | 0.004 / 0.073 / 0.05x | 0.007 / 0.072 / 0.09x |
-| `fused_qkv.prefill` | 1.025 / 0.085 / 12.10x | 1.093 / 0.083 / 13.09x | 1.016 / 0.074 / 13.66x | 1.058 / 0.212 / 5.00x |
-| `softmax.forward` | 0.497 / 0.078 / 6.39x | 3.107 / 0.153 / 20.27x | 1.050 / 0.154 / 6.79x | 5.918 / 0.156 / 37.89x |
-| `softmax.backward` | 3.956 / 1.341 / 2.95x | 3.354 / 1.329 / 2.52x | 3.740 / 1.303 / 2.87x | 4.225 / 1.662 / 2.54x |
-| `fused_softmax.forward` | 2.150 / 0.077 / 28.00x | 4.731 / 0.078 / 60.49x | 2.763 / 0.080 / 34.41x | 5.077 / 0.082 / 61.69x |
-| `fused_softmax.backward` | 5.606 / 1.329 / 4.22x | 5.760 / 1.181 / 4.88x | 5.644 / 1.248 / 4.52x | 6.390 / 1.314 / 4.86x |
-| `embedding.forward` | 0.283 / 0.090 / 3.16x | 0.256 / 0.093 / 2.75x | 0.277 / 0.128 / 2.17x | 0.253 / 0.092 / 2.76x |
-| `rms_norm.forward` | 0.279 / 0.032 / 8.87x | 0.319 / 0.036 / 8.95x | 0.277 / 0.038 / 7.31x | 2.207 / 0.113 / 19.44x |
-| `rope.forward` | 0.035 / 0.012 / 2.98x | 0.040 / 0.017 / 2.34x | 0.038 / 0.017 / 2.26x | 0.091 / 0.076 / 1.21x |
-| `cross_entropy.forward` | 0.504 / 0.077 / 6.55x | 1.182 / 0.226 / 5.24x | 1.170 / 0.205 / 5.71x | 8.425 / 0.232 / 36.33x |
-| `cross_entropy.backward` | 0.859 / 0.116 / 7.40x | 1.213 / 0.212 / 5.73x | 1.205 / 0.352 / 3.42x | 5.492 / 0.279 / 19.68x |
-| `mse_loss.forward` | 0.345 / 0.123 / 2.80x | 0.902 / 0.077 / 11.64x | 0.870 / 0.070 / 12.48x | 8.216 / 0.072 / 113.32x |
-| `mse_loss.backward` | 1.567 / 0.108 / 14.48x | 1.468 / 0.110 / 13.41x | 1.562 / 0.115 / 13.63x | 1.373 / 0.111 / 12.38x |
-
-#### Elementwise and broadcast operators
-
-| Operator | F32 | F16 | BF16 | I8 |
-|---|---:|---:|---:|---:|
-| `elementwise.mul_add.forward` | 0.218 / 0.168 / 1.29x | 0.195 / 0.146 / 1.33x | 0.386 / 0.156 / 2.48x | 0.417 / 0.378 / 1.10x |
-| `elementwise.mul_add.backward` | 3.312 / 1.283 / 2.58x | 2.970 / 1.217 / 2.44x | 2.973 / 1.246 / 2.39x | 3.175 / 1.262 / 2.52x |
-| `binary.same_shape.forward` | 0.110 / 0.078 / 1.41x | 0.090 / 0.073 / 1.23x | 0.164 / 0.095 / 1.72x | 0.203 / 0.217 / 0.93x |
-| `binary.row_broadcast.forward` | 1.260 / 0.077 / 16.45x | 0.100 / 0.072 / 1.39x | 0.165 / 0.086 / 1.92x | 0.198 / 0.184 / 1.07x |
-| `binary.row_scalar.forward` | 0.265 / 0.122 / 2.18x | 2.403 / 0.075 / 31.91x | 0.700 / 0.079 / 8.87x | 9.263 / 0.185 / 49.99x |
-| `binary.b1d_1h1.forward` | 0.262 / 0.118 / 2.21x | 2.206 / 0.093 / 23.64x | 0.564 / 0.141 / 4.00x | 7.131 / 0.169 / 42.22x |
-| `binary.b1d_1hd.forward` | 0.112 / 0.106 / 1.06x | 2.071 / 0.078 / 26.66x | 0.391 / 0.078 / 4.99x | 6.873 / 0.203 / 33.91x |
-| `binary.general_broadcast.forward` | 0.112 / 0.122 / 0.92x | 2.062 / 0.077 / 26.86x | 0.451 / 0.080 / 5.60x | 8.020 / 0.260 / 30.91x |
-| `elementwise.mixed_mul.forward` | 0.110 / 0.079 / 1.38x | 0.226 / 0.075 / 3.02x | 0.265 / 0.079 / 3.35x | 0.234 / 0.086 / 2.72x |
-| `elementwise.mixed_broadcast_1hd_mul.forward` | 0.003 / 0.020 / 0.13x | 0.003 / 0.009 / 0.30x | 0.003 / 0.009 / 0.32x | 0.005 / 0.011 / 0.42x |
-| `elementwise.mixed_row_scalar_mul.forward` | 0.003 / 0.017 / 0.15x | 0.001 / 0.009 / 0.10x | 0.001 / 0.009 / 0.10x | 0.001 / 0.009 / 0.13x |
-| `elementwise.mixed_mul.backward` | 2.576 / 0.711 / 3.62x | 2.420 / 1.136 / 2.13x | 2.287 / 1.019 / 2.24x | 2.222 / 1.065 / 2.09x |
-| `elementwise.mixed_row_mul.forward` | 1.268 / 0.077 / 16.41x | 0.199 / 0.072 / 2.78x | 0.215 / 0.166 / 1.30x | 0.222 / 0.086 / 2.58x |
-| `elementwise.mixed_row_mul.backward` | 2.489 / 1.069 / 2.33x | 0.937 / 1.055 / 0.89x | 1.056 / 1.241 / 0.85x | 0.950 / 1.227 / 0.77x |
-| `elementwise.mixed_row_sub.backward` | 2.771 / 1.338 / 2.07x | 1.336 / 1.140 / 1.17x | 1.409 / 1.206 / 1.17x | 1.317 / 1.136 / 1.16x |
-| `elementwise.mixed_scalar_sub.backward` | 1.800 / 1.219 / 1.48x | 1.575 / 1.097 / 1.44x | 1.742 / 1.114 / 1.56x | 1.562 / 1.095 / 1.43x |
-| `elementwise.mixed_scalar_mul.backward` | 2.324 / 1.111 / 2.09x | 2.226 / 1.143 / 1.95x | 1.509 / 1.084 / 1.39x | 1.563 / 1.192 / 1.31x |
-| `elementwise.mixed_broadcast_sub.backward` | 0.074 / 0.290 / 0.25x | 0.081 / 0.140 / 0.58x | 0.069 / 0.275 / 0.25x | 0.097 / 0.146 / 0.66x |
-| `elementwise.mixed_broadcast_1hd_sub.backward` | 0.076 / 0.180 / 0.42x | 0.195 / 0.137 / 1.43x | 0.069 / 0.301 / 0.23x | 0.068 / 0.157 / 0.43x |
-| `elementwise.mixed_broadcast_mul.backward` | 0.013 / 0.289 / 0.04x | 0.013 / 0.131 / 0.10x | 0.013 / 0.281 / 0.05x | 0.014 / 0.147 / 0.09x |
-| `elementwise.mixed_broadcast_1hd_mul.backward` | 0.010 / 0.307 / 0.03x | 0.010 / 0.138 / 0.07x | 0.010 / 0.318 / 0.03x | 0.010 / 0.154 / 0.07x |
-| `elementwise.mixed_row_scalar_mul.backward` | 0.011 / 0.122 / 0.09x | 0.015 / 0.116 / 0.13x | 0.010 / 0.216 / 0.05x | 0.010 / 0.210 / 0.05x |
-| `unary.silu.forward` | 0.295 / 0.103 / 2.86x | 3.001 / 0.072 / 41.69x | 1.051 / 0.072 / 14.57x | 11.391 / 0.164 / 69.50x |
-| `unary.relu.forward` | 0.137 / 0.083 / 1.65x | 2.989 / 0.097 / 30.78x | 0.814 / 0.078 / 10.38x | 11.124 / 0.072 / 154.29x |
-| `unary.silu.backward` | 4.485 / 1.590 / 2.82x | 3.898 / 1.486 / 2.62x | 4.344 / 1.375 / 3.16x | 3.865 / 1.247 / 3.10x |
-
-#### Optimizer, CNN, attention, and compact Llama operators
-
-| Operator | F32 | F16 | BF16 | I8 |
-|---|---:|---:|---:|---:|
-| `optimizer.sgd.step` | 0.140 / 0.109 / 1.29x | 0.120 / 0.116 / 1.03x | 0.141 / 0.105 / 1.34x | 0.131 / 0.124 / 1.06x |
-| `optimizer.adam.step` | 0.864 / 0.269 / 3.21x | 2.261 / 2.143 / 1.05x | 2.264 / 2.305 / 0.98x | skipped |
-| `optimizer.adam_f32_state.step` | 0.812 / 0.222 / 3.66x | 0.267 / 0.240 / 1.11x | 0.260 / 0.244 / 1.06x | 0.279 / 0.260 / 1.07x |
-| `optimizer.sgd_batched.step` | 0.021 / 0.042 / 0.51x | 0.016 / 0.318 / 0.05x | 0.017 / 0.284 / 0.06x | 0.030 / 0.360 / 0.08x |
-| `optimizer.adam_f32_state_batched.step` | 0.201 / 0.087 / 2.31x | 0.060 / 0.369 / 0.16x | 0.062 / 0.357 / 0.17x | 0.073 / 0.465 / 0.16x |
-| `conv2d.forward` | 0.836 / 0.360 / 2.32x | 0.769 / 0.205 / 3.75x | 0.831 / 0.249 / 3.34x | 0.897 / 0.207 / 4.32x |
-| `conv2d.backward` | 2.357 / 1.336 / 1.76x | 2.527 / 1.200 / 2.11x | 2.694 / 1.145 / 2.35x | 2.806 / 1.992 / 1.41x |
-| `max_pool2d.forward` | 0.129 / 0.053 / 2.46x | 0.109 / 0.043 / 2.56x | 0.100 / 0.064 / 1.55x | 0.108 / 0.031 / 3.48x |
-| `max_pool2d.backward` | 0.305 / 0.299 / 1.02x | 0.287 / 0.294 / 0.97x | 0.257 / 0.282 / 0.91x | 0.296 / 0.572 / 0.52x |
-| `self_attention.forward` | 0.314 / 0.238 / 1.32x | 0.694 / 0.439 / 1.58x | 0.464 / 0.783 / 0.59x | skipped |
-| `self_attention.backward` | 0.563 / 0.661 / 0.85x | 2.014 / 0.758 / 2.66x | 1.559 / 1.655 / 0.94x | skipped |
-| `self_attention_bias.backward` | 0.538 / 0.823 / 0.65x | 1.902 / 1.053 / 1.81x | 1.527 / 2.473 / 0.62x | skipped |
-| `llama.infer_last_logits` | 1.187 / 0.699 / 1.70x | 1.464 / 0.731 / 2.00x | 1.234 / 1.387 / 0.89x | skipped |
-| `llama.prefill_decode` | 1.517 / 0.865 / 1.75x | 2.156 / 1.122 / 1.92x | 1.673 / 1.100 / 1.52x | skipped |
-| `llama.train.backward` | 4.799 / 2.309 / 2.08x | 3.285 / 2.411 / 1.36x | 3.314 / 4.124 / 0.80x | skipped |
-| `llama.train.step` | 3.707 / 2.423 / 1.53x | 3.967 / 2.475 / 1.60x | 3.750 / 3.190 / 1.18x | skipped |
+| `matmul.forward` | 2.094 / 0.053 / 39.66x | 1.184 / 0.032 / 36.99x | 0.644 / 0.025 / 25.96x | 1.946 / 0.097 / 20.12x |
+| `batch_matmul.forward` | 0.009 / 0.014 / 0.64x | 0.041 / 0.023 / 1.74x | 0.016 / 0.012 / 1.27x | 0.133 / 0.078 / 1.71x |
+| `matmul.backward` | 6.839 / 0.578 / 11.83x | 19.856 / 0.785 / 25.30x | 4.765 / 0.758 / 6.29x | 4.307 / 0.665 / 6.47x |
+| `elementwise.mul_add.forward` | 0.232 / 0.160 / 1.45x | 0.166 / 0.156 / 1.06x | 0.304 / 0.148 / 2.05x | 0.392 / 0.335 / 1.17x |
+| `elementwise.mul_add.backward` | 2.978 / 1.117 / 2.67x | 2.926 / 1.284 / 2.28x | 2.773 / 0.994 / 2.79x | 3.096 / 1.167 / 2.65x |
+| `binary.row_broadcast.forward` | 1.259 / 0.079 / 15.95x | 0.091 / 0.076 / 1.19x | 0.150 / 0.078 / 1.93x | 0.195 / 0.153 / 1.27x |
+| `elementwise.mixed_mul.backward` | 2.361 / 0.989 / 2.39x | 2.084 / 3.625 / 0.57x | 1.925 / 0.647 / 2.98x | 3.091 / 0.700 / 4.42x |
+| `unary.silu.forward` | 0.285 / 0.078 / 3.68x | 2.717 / 0.075 / 36.37x | 1.077 / 0.080 / 13.46x | 10.602 / 0.202 / 52.49x |
+| `unary.silu.backward` | 4.066 / 1.518 / 2.68x | 4.304 / 1.111 / 3.87x | 4.769 / 1.105 / 4.31x | 4.833 / 1.302 / 3.71x |
+| `fused_gateup.forward` | 2.454 / 0.039 / 62.60x | 1.421 / 0.130 / 10.95x | 2.253 / 0.112 / 20.06x | 3.429 / 0.111 / 31.03x |
+| `fused_qkv.prefill` | 0.897 / 0.078 / 11.55x | 0.918 / 0.181 / 5.07x | 0.955 / 0.085 / 11.18x | 1.043 / 0.130 / 8.00x |
+| `softmax.forward` | 0.456 / 0.078 / 5.87x | 3.228 / 0.172 / 18.79x | 1.023 / 0.152 / 6.71x | 5.240 / 0.154 / 33.98x |
+| `fused_softmax.forward` | 2.122 / 0.072 / 29.43x | 4.901 / 0.091 / 53.56x | 2.820 / 0.090 / 31.36x | 4.655 / 0.088 / 53.14x |
+| `cross_entropy.forward` | 0.542 / 0.075 / 7.19x | 1.131 / 0.197 / 5.76x | 0.992 / 0.221 / 4.49x | 9.869 / 0.200 / 49.44x |
+| `mse_loss.forward` | 0.425 / 0.115 / 3.68x | 0.827 / 0.095 / 8.75x | 0.891 / 0.071 / 12.57x | 6.447 / 0.102 / 63.02x |
+| `optimizer.sgd.step` | 0.128 / 0.109 / 1.17x | 0.108 / 0.107 / 1.01x | 0.122 / 0.144 / 0.85x | 0.119 / 0.144 / 0.82x |
+| `optimizer.adam_f32_state.step` | 0.781 / 0.266 / 2.94x | 0.300 / 0.257 / 1.16x | 0.287 / 0.284 / 1.01x | 0.285 / 0.224 / 1.27x |
+| `conv2d.forward` | 0.750 / 0.369 / 2.03x | 0.866 / 0.218 / 3.97x | 0.835 / 0.225 / 3.71x | 0.705 / 0.223 / 3.16x |
+| `conv2d.backward` | 2.440 / 1.671 / 1.46x | 3.090 / 1.319 / 2.34x | 2.515 / 1.331 / 1.89x | 2.777 / 1.623 / 1.71x |
+| `self_attention.forward` | 0.371 / 0.220 / 1.69x | 0.722 / 0.807 / 0.89x | 0.554 / 0.400 / 1.38x | skipped |
+| `llama.prefill_decode` | 1.719 / 1.677 / 1.02x | 2.013 / 2.109 / 0.95x | 1.562 / 1.049 / 1.49x | skipped |
+| `llama.train.step` | 3.966 / 2.143 / 1.85x | 3.565 / 4.265 / 0.84x | 3.344 / 4.403 / 0.76x | skipped |
 
 All enabled correctness checks passed. CUDA is strongest on dense, fused, softmax, loss, and larger broadcast work. Single-token QKV decode, tiny broadcast reductions, batched optimizer cases, and some compact attention/training cases remain launch- or dispatch-bound.
 
 ### End-to-end Llama prefill/decode snapshot
 
-The TinyLlama rerun used the local `tokenizer.json` and `model.safetensors`, `prompt_tokens=48`, `max_gen=24`, greedy decode, 1 measured run, 0 warmup, and `--stop-on-eos --stop-on-chat-marker`.
+The TinyLlama rerun used the local `tokenizer.json` and `model.safetensors`, `prompt_tokens=42`, `max_gen=24`, greedy decode, 1 measured run, 0 warmup, and `--stop-on-eos --stop-on-chat-marker`.
 
 | Configuration | Device | Prefill forward | Decode forward | End-to-end decode | Total |
 |---|---|---:|---:|---:|---:|
-| F32 | CPU | 40.38 tok/s | 9.76 tok/s | 6.57 tok/s | 3650.59 ms |
-| F16 | CPU | 128.27 tok/s | 15.12 tok/s | 12.22 tok/s | 1963.40 ms |
-| BF16 | CPU | 127.66 tok/s | 15.20 tok/s | 12.27 tok/s | 1956.53 ms |
-| I8 weights + BF16 runtime | CPU | 178.60 tok/s | 22.69 tok/s | 18.07 tok/s | 1327.90 ms |
-| F32 | CUDA | 302.18 tok/s | 42.20 tok/s | 32.92 tok/s | 729.12 ms |
-| F16 | CUDA | 159.93 tok/s | 32.56 tok/s | 22.79 tok/s | 1052.92 ms |
-| BF16 | CUDA | 163.08 tok/s | 29.39 tok/s | 21.53 tok/s | 1114.71 ms |
-| I8 weights + BF16 runtime | CUDA | 222.98 tok/s | 67.49 tok/s | 41.93 tok/s | 572.42 ms |
+| F32 | CPU | 40.30 tok/s | 11.23 tok/s | 6.31 tok/s | 2379.06 ms |
+| F16 | CPU | 136.67 tok/s | 18.05 tok/s | 13.11 tok/s | 1143.85 ms |
+| BF16 | CPU | 163.92 tok/s | 18.00 tok/s | 13.61 tok/s | 1101.90 ms |
+| I8 weights + BF16 runtime | CPU | 198.42 tok/s | 26.33 tok/s | 19.17 tok/s | 782.40 ms |
+| F32 | CUDA | 272.01 tok/s | 45.27 tok/s | 30.82 tok/s | 486.69 ms |
+| F16 | CUDA | 155.84 tok/s | 29.12 tok/s | 19.10 tok/s | 785.49 ms |
+| BF16 | CUDA | 165.50 tok/s | 29.24 tok/s | 19.54 tok/s | 767.56 ms |
+| I8 weights + BF16 runtime | CUDA | 220.54 tok/s | 73.38 tok/s | 37.90 tok/s | 395.82 ms |
 
-All eight generated samples were fluent for the short prompt and reported `replacement=0`, `trailing_replacement=0`, and `control=0`. F32/F16/BF16 produced the same opening text about the Transformer architecture storing intermediate results; I8+BF16 produced a slightly different but still coherent sentence about storing intermediate results in Transformer-based models. The rerun shows that real generation is still decode-bound: decode-forward dominates measured CUDA time. Device-only CUDA hot paths now rely on default-stream ordering and synchronize only at explicit host-observation boundaries. Same-dtype F16/BF16 decode QKV and GateUp use cuBLAS `GemmEx` while preserving low-precision storage. Aligned and sufficiently large batched I8×I8 use signed-I8 cuBLAS GEMM with exact I32 accumulation. Inference-only F16/BF16×I8 prefill uses device-resident row-wise activation quantization before INT8 GEMM, and fused QKV/GateUp reuse the quantized activation. Training keeps direct F16/BF16×I8 forward computation so its F32 backward differentiates the same function. Mixed-I8 prefill remains materially slower than native F16/BF16 GEMM, but I8+BF16 has the best measured end-to-end decode throughput in this short real-model run.
+All eight generated samples were fluent for the short prompt and reported `replacement=0`, `trailing_replacement=0`, and `control=0`. Every configuration generated: "Neural networks are a powerful tool for analyzing and understanding complex data." The rerun shows real generation remains decode-bound: decode-forward dominates measured time, while I8 weights with BF16 runtime/activation/KV cache have the best measured end-to-end decode throughput in this short real-model run.
 
 ---
 

@@ -2,11 +2,13 @@ use crate::autograd::Tensor;
 use crate::module::Module;
 use ndarray::prelude::*;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand::{SeedableRng, rngs::StdRng};
 use ndarray_rand::rand_distr::Bernoulli;
 
 pub struct Dropout {
     p: f32,
     training: bool,
+    seed: Option<u64>,
 }
 impl Dropout {
     pub fn new(p: f32) -> Self {
@@ -14,7 +16,17 @@ impl Dropout {
             (0.0..1.0).contains(&p),
             "Dropout probability must be in [0, 1), got {p}"
         );
-        Dropout { p, training: true }
+        Dropout {
+            p,
+            training: true,
+            seed: None,
+        }
+    }
+
+    pub fn new_with_seed(p: f32, seed: u64) -> Self {
+        let mut dropout = Self::new(p);
+        dropout.seed = Some(seed);
+        dropout
     }
 }
 impl Module for Dropout {
@@ -22,8 +34,13 @@ impl Module for Dropout {
         if self.training && self.p > 0.0 {
             let shape = input.shape_vec();
             let dist = Bernoulli::new(1.0 - self.p as f64).unwrap();
-            let mask_arr = Array::random(ndarray::IxDyn(&shape), dist)
-                .mapv(|x| if x { 1.0f32 } else { 0.0f32 });
+            let mask_arr = if let Some(seed) = self.seed {
+                let mut rng = StdRng::seed_from_u64(seed);
+                Array::random_using(ndarray::IxDyn(&shape), dist, &mut rng)
+            } else {
+                Array::random(ndarray::IxDyn(&shape), dist)
+            }
+            .mapv(|x| if x { 1.0f32 } else { 0.0f32 });
             let scale = 1.0 / (1.0 - self.p);
             let mask = mask_arr * scale;
             let mask_tensor =
@@ -49,13 +66,30 @@ mod tests {
     use super::*;
     #[cfg(feature = "cuda")]
     use crate::autograd::{Tensor, set_strict_device_execution};
-    #[cfg(feature = "cuda")]
     use ndarray::{Array, IxDyn};
 
     #[test]
     #[should_panic(expected = "Dropout probability must be in [0, 1)")]
     fn dropout_rejects_probability_one() {
         let _ = Dropout::new(1.0);
+    }
+
+    #[test]
+    fn seeded_dropout_reuses_same_mask() {
+        let dropout = Dropout::new_with_seed(0.4, 42);
+        let input = Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(
+                IxDyn(&[2, 5]),
+                vec![0.5, -0.3, 0.8, 1.1, -1.4, 0.7, 0.2, -0.9, 1.3, -0.6],
+            )
+            .expect("input shape mismatch")
+            .into_dyn(),
+            false,
+        );
+
+        let first = dropout.forward(input.clone());
+        let second = dropout.forward(input);
+        assert_eq!(first.data_ref().as_slice(), second.data_ref().as_slice());
     }
 
     #[cfg(feature = "cuda")]

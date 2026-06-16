@@ -1377,18 +1377,42 @@ impl Tensor {
 
         let mut inner = self.0.borrow_mut();
         let storage_dtype = inner.storage_dtype;
-        if storage_dtype == DType::F32 {
-            Self::clear_non_f32_storage(&mut inner);
-        }
+        let i8_scale = inner.i8_scale;
+        Self::clear_non_f32_storage(&mut inner);
+        let native_lowp_buffer = match storage_dtype {
+            DType::F16 | DType::BF16 => {
+                crate::ops::cuda::f32_to_lowp_storage_no_host(&buffer, storage_dtype).ok()
+            }
+            DType::I8 => i8_scale
+                .and_then(|scale| crate::ops::cuda::f32_to_i8_storage_no_host(&buffer, scale).ok()),
+            DType::F32 => None,
+        };
         inner.data = ArrayD::<f32>::zeros(IxDyn(&shape)).into_shared();
         inner.has_f32_data = false;
         inner.storage_dtype = storage_dtype;
-        inner.cache_dirty = storage_dtype != DType::F32;
+        inner.i8_scale = if storage_dtype == DType::I8 {
+            i8_scale
+        } else {
+            None
+        };
+        inner.cache_dirty = storage_dtype != DType::F32 && native_lowp_buffer.is_none();
         inner.device = Device::Cuda;
         inner.cuda_f32_data = Some(buffer);
-        inner.cuda_f16_data = None;
-        inner.cuda_bf16_data = None;
-        inner.cuda_i8_data = None;
+        inner.cuda_f16_data = if storage_dtype == DType::F16 {
+            native_lowp_buffer.clone()
+        } else {
+            None
+        };
+        inner.cuda_bf16_data = if storage_dtype == DType::BF16 {
+            native_lowp_buffer.clone()
+        } else {
+            None
+        };
+        inner.cuda_i8_data = if storage_dtype == DType::I8 {
+            native_lowp_buffer
+        } else {
+            None
+        };
         inner.grad = None;
         inner.cuda_f32_grad = None;
     }

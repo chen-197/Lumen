@@ -48,6 +48,7 @@ pub struct SGD {
     momentum: f32,
     state_dtype: DType,
     velocities: Vec<Option<Tensor>>,
+    last_cuda_batched_update_count: usize,
 }
 
 impl SGD {
@@ -68,6 +69,7 @@ impl SGD {
             momentum: 0.0, // 默认无动量
             state_dtype,
             velocities: vec![None; len],
+            last_cuda_batched_update_count: 0,
         }
     }
 
@@ -88,7 +90,7 @@ impl Optimizer for SGD {
     }
 
     fn step(&mut self) {
-        let cuda_updated = if self.momentum == 0.0 {
+        let (cuda_updated, cuda_batched_update_count) = if self.momentum == 0.0 {
             try_cuda_sgd_step_batched(&self.params, self.lr)
         } else if self.state_dtype == DType::F32 {
             for index in 0..self.params.len() {
@@ -103,8 +105,9 @@ impl Optimizer for SGD {
                 self.momentum,
             )
         } else {
-            vec![false; self.params.len()]
+            (vec![false; self.params.len()], 0)
         };
+        self.last_cuda_batched_update_count = cuda_batched_update_count;
 
         for i in 0..self.params.len() {
             if cuda_updated.get(i).copied().unwrap_or(false) {
@@ -225,9 +228,14 @@ impl SGD {
                 && !velocity.dev_has_host_f32_data()
         })
     }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_last_cuda_batched_update_count(&self) -> usize {
+        self.last_cuda_batched_update_count
+    }
 }
 
-fn try_cuda_sgd_step_batched(params: &[Tensor], lr: f32) -> Vec<bool> {
+fn try_cuda_sgd_step_batched(params: &[Tensor], lr: f32) -> (Vec<bool>, usize) {
     let mut updated = vec![false; params.len()];
     let mut indices = Vec::new();
     let mut param_bufs = Vec::new();
@@ -249,7 +257,7 @@ fn try_cuda_sgd_step_batched(params: &[Tensor], lr: f32) -> Vec<bool> {
     }
 
     if indices.len() < 2 {
-        return updated;
+        return (updated, 0);
     }
     let total_elements = param_bufs
         .iter()
@@ -261,16 +269,17 @@ fn try_cuda_sgd_step_batched(params: &[Tensor], lr: f32) -> Vec<bool> {
                 updated[slot] = finalize_cuda_param_update(&params[slot], param_buf);
             }
         }
-        return updated;
+        return (updated, 0);
     }
     if cuda::sgd_update_f32_batched_no_host(&param_bufs, &grad_bufs, lr).is_err() {
-        return updated;
+        return (updated, 0);
     }
 
+    let batched_update_count = indices.len();
     for (slot, param_buf) in indices.iter().copied().zip(param_bufs) {
         updated[slot] = finalize_cuda_param_update(&params[slot], param_buf);
     }
-    updated
+    (updated, batched_update_count)
 }
 
 fn try_cuda_sgd_momentum_step_batched(
@@ -278,7 +287,7 @@ fn try_cuda_sgd_momentum_step_batched(
     velocities: &[Option<Tensor>],
     lr: f32,
     momentum: f32,
-) -> Vec<bool> {
+) -> (Vec<bool>, usize) {
     let mut updated = vec![false; params.len()];
     let mut indices = Vec::new();
     let mut param_bufs = Vec::new();
@@ -311,7 +320,7 @@ fn try_cuda_sgd_momentum_step_batched(
     }
 
     if indices.len() < 2 {
-        return updated;
+        return (updated, 0);
     }
     let total_elements = param_bufs
         .iter()
@@ -340,7 +349,7 @@ fn try_cuda_sgd_momentum_step_batched(
                 updated[slot] = true;
             }
         }
-        return updated;
+        return (updated, 0);
     }
     if cuda::sgd_momentum_update_f32_batched_no_host(
         &param_bufs,
@@ -351,9 +360,10 @@ fn try_cuda_sgd_momentum_step_batched(
     )
     .is_err()
     {
-        return updated;
+        return (updated, 0);
     }
 
+    let batched_update_count = indices.len();
     for ((slot, param_buf), velocity_buf) in
         indices.iter().copied().zip(param_bufs).zip(velocity_bufs)
     {
@@ -364,7 +374,7 @@ fn try_cuda_sgd_momentum_step_batched(
             updated[slot] = true;
         }
     }
-    updated
+    (updated, batched_update_count)
 }
 
 fn try_cuda_sgd_step(param: &Tensor, lr: f32) -> bool {
@@ -419,6 +429,7 @@ pub struct Adam {
     state_dtype: DType,
     exp_avg: Vec<Option<Tensor>>,    // m (一阶矩)
     exp_avg_sq: Vec<Option<Tensor>>, // v (二阶矩)
+    last_cuda_batched_update_count: usize,
 }
 
 impl Adam {
@@ -442,6 +453,7 @@ impl Adam {
             state_dtype,
             exp_avg: vec![None; len],
             exp_avg_sq: vec![None; len],
+            last_cuda_batched_update_count: 0,
         }
     }
 
@@ -466,6 +478,41 @@ impl Adam {
         self.exp_avg[index] = Some(exp_avg);
         self.exp_avg_sq[index] = Some(exp_avg_sq);
     }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_state_pair_count(&self) -> usize {
+        self.exp_avg
+            .iter()
+            .zip(self.exp_avg_sq.iter())
+            .filter(|(exp_avg, exp_avg_sq)| exp_avg.is_some() && exp_avg_sq.is_some())
+            .count()
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_all_states_are_f32_cuda_resident(&self) -> bool {
+        self.exp_avg
+            .iter()
+            .zip(self.exp_avg_sq.iter())
+            .all(|(exp_avg, exp_avg_sq)| {
+                let (Some(exp_avg), Some(exp_avg_sq)) = (exp_avg.as_ref(), exp_avg_sq.as_ref())
+                else {
+                    return false;
+                };
+                exp_avg.dtype() == DType::F32
+                    && exp_avg_sq.dtype() == DType::F32
+                    && exp_avg.is_cuda()
+                    && exp_avg_sq.is_cuda()
+                    && exp_avg.cloned_cuda_f32_buffer().is_some()
+                    && exp_avg_sq.cloned_cuda_f32_buffer().is_some()
+                    && !exp_avg.dev_has_host_f32_data()
+                    && !exp_avg_sq.dev_has_host_f32_data()
+            })
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub fn dev_last_cuda_batched_update_count(&self) -> usize {
+        self.last_cuda_batched_update_count
+    }
 }
 
 impl Optimizer for Adam {
@@ -487,7 +534,7 @@ impl Optimizer for Adam {
             }
         }
 
-        let cuda_updated = if self.state_dtype == DType::F32 {
+        let (cuda_updated, cuda_batched_update_count) = if self.state_dtype == DType::F32 {
             try_cuda_adam_step_batched(
                 &self.params,
                 &self.exp_avg,
@@ -500,8 +547,9 @@ impl Optimizer for Adam {
                 self.eps,
             )
         } else {
-            vec![false; self.params.len()]
+            (vec![false; self.params.len()], 0)
         };
+        self.last_cuda_batched_update_count = cuda_batched_update_count;
 
         for i in 0..self.params.len() {
             if cuda_updated.get(i).copied().unwrap_or(false) {
@@ -605,7 +653,7 @@ fn try_cuda_adam_step_batched(
     bias_correction1: f32,
     bias_correction2: f32,
     eps: f32,
-) -> Vec<bool> {
+) -> (Vec<bool>, usize) {
     let mut updated = vec![false; params.len()];
     let mut indices = Vec::new();
     let mut param_bufs = Vec::new();
@@ -646,7 +694,7 @@ fn try_cuda_adam_step_batched(
     }
 
     if indices.len() < 2 {
-        return updated;
+        return (updated, 0);
     }
     let total_elements = param_bufs
         .iter()
@@ -684,7 +732,7 @@ fn try_cuda_adam_step_batched(
                 updated[slot] = true;
             }
         }
-        return updated;
+        return (updated, 0);
     }
     if cuda::adam_update_f32_batched_no_host(
         &param_bufs,
@@ -700,7 +748,7 @@ fn try_cuda_adam_step_batched(
     )
     .is_err()
     {
-        return updated;
+        return (updated, 0);
     }
 
     for (((slot, param_buf), exp_avg_buf), exp_avg_sq_buf) in indices
@@ -720,7 +768,7 @@ fn try_cuda_adam_step_batched(
             updated[slot] = true;
         }
     }
-    updated
+    (updated, indices.len())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,6 +1243,8 @@ mod tests {
 
             assert!(cuda_param.is_cuda());
             assert!(cuda_param.cloned_cuda_f32_buffer().is_some());
+            assert!(cuda_param.cloned_cuda_native_lowp_buffer().is_some());
+            assert!(!cuda_param.has_host_f32_data());
             assert_eq!(cuda_param.dtype(), dtype);
 
             let cuda_values = cuda_param.data_ref().iter().copied().collect::<Vec<_>>();
@@ -1346,6 +1396,8 @@ mod tests {
 
         assert!(cuda_param.is_cuda());
         assert!(cuda_param.cloned_cuda_f32_buffer().is_some());
+        assert!(cuda_param.cloned_cuda_native_lowp_buffer().is_some());
+        assert!(!cuda_param.has_host_f32_data());
         assert_eq!(cuda_param.dtype(), DType::BF16);
         let cuda_exp_avg_tensor = cuda_opt.exp_avg[0].as_ref().expect("cuda exp_avg");
         let cuda_exp_avg_sq_tensor = cuda_opt.exp_avg_sq[0].as_ref().expect("cuda exp_avg_sq");
@@ -1383,6 +1435,45 @@ mod tests {
                 "BF16 Adam CUDA exp_avg_sq got {got}, expected {expect}"
             );
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn adam_step_preserves_lowp_cuda_native_buffer_after_update() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        for dtype in [DType::F16, DType::BF16, DType::I8] {
+            let param = Tensor::parameter_with_dtype(
+                ArrayD::from_shape_vec(IxDyn(&[4]), vec![0.2, -0.1, 0.3, -0.2]).unwrap(),
+                dtype,
+            )
+            .to_cuda();
+            let grad = ArrayD::from_shape_vec(IxDyn(&[4]), vec![0.05, -0.03, 0.02, -0.04]).unwrap();
+            let grad_buffer =
+                crate::ops::cuda::upload_f32(grad.as_slice().expect("contiguous grad")).unwrap();
+            param.add_grad_with_cuda_buffer(grad, Some(grad_buffer));
+
+            let mut opt = Adam::new_with_dtype(vec![param.clone()], 0.01, DType::F32);
+            opt.step();
+
+            assert_eq!(param.dtype(), dtype);
+            assert!(
+                param.cloned_cuda_f32_buffer().is_some(),
+                "{dtype:?} Adam update should keep a CUDA f32 optimizer buffer"
+            );
+            assert!(
+                param.cloned_cuda_native_lowp_buffer().is_some(),
+                "{dtype:?} Adam update should keep a native lowp CUDA buffer"
+            );
+            assert!(
+                !param.has_host_f32_data(),
+                "{dtype:?} Adam update should not materialize host f32 parameter data"
+            );
+        }
+        crate::ops::cuda::set_enabled(false);
     }
 
     #[cfg(feature = "cuda")]

@@ -1810,6 +1810,12 @@ mod imp {
             len: usize,
             dtype: c_int,
         ) -> c_int;
+        fn lumen_cuda_f32_to_i8_storage_device(
+            input_handle: u64,
+            out_handle: u64,
+            len: usize,
+            scale: f32,
+        ) -> c_int;
         fn lumen_cuda_sgd_momentum_update_f32_device(
             param_handle: u64,
             grad_handle: u64,
@@ -8116,6 +8122,22 @@ mod imp {
         Ok(out)
     }
 
+    pub fn f32_to_i8_storage_no_host(input: &CudaBuffer, scale: f32) -> Result<CudaBuffer, String> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(format!(
+                "CUDA f32 to i8 storage expects finite positive scale, got {scale}"
+            ));
+        }
+        let out = alloc_storage(input.len())?;
+        let status = unsafe {
+            lumen_cuda_f32_to_i8_storage_device(input.handle(), out.handle(), input.len(), scale)
+        };
+        if status != 0 {
+            return Err(last_error_message());
+        }
+        Ok(out)
+    }
+
     pub fn sgd_momentum_update_f32(
         param: &CudaBuffer,
         grad: &CudaBuffer,
@@ -13692,6 +13714,13 @@ mod imp {
         Err("CUDA feature is disabled".to_string())
     }
 
+    pub fn f32_to_i8_storage_no_host(
+        _input: &CudaBuffer,
+        _scale: f32,
+    ) -> Result<CudaBuffer, String> {
+        Err("CUDA feature is disabled".to_string())
+    }
+
     pub fn sgd_momentum_update_f32(
         _param: &CudaBuffer,
         _grad: &CudaBuffer,
@@ -16719,6 +16748,10 @@ pub fn f32_to_lowp_storage_no_host(
     dtype: crate::precision::DType,
 ) -> Result<CudaBuffer, String> {
     imp::f32_to_lowp_storage_no_host(input, dtype)
+}
+
+pub fn f32_to_i8_storage_no_host(input: &CudaBuffer, scale: f32) -> Result<CudaBuffer, String> {
+    imp::f32_to_i8_storage_no_host(input, scale)
 }
 
 pub fn sgd_momentum_update_f32(

@@ -1180,6 +1180,21 @@ __global__ void f32_to_lowp_storage_kernel(
     }
 }
 
+__global__ void f32_to_i8_storage_kernel(
+    const float* input,
+    int8_t* output,
+    size_t len,
+    float scale) {
+    const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    const float inv_scale = 1.0f / scale;
+    for (size_t idx = start; idx < len; idx += stride) {
+        float q = nearbyintf(input[idx] * inv_scale);
+        q = fminf(127.0f, fmaxf(-127.0f, q));
+        output[idx] = static_cast<int8_t>(q);
+    }
+}
+
 __global__ void sgd_momentum_update_kernel(
     float* param,
     const float* grad,

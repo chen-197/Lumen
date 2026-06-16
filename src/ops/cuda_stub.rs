@@ -1816,6 +1816,10 @@ pub fn f32_to_lowp_storage_no_host(
     Err("CUDA feature is disabled".to_string())
 }
 
+pub fn f32_to_i8_storage_no_host(_input: &CudaBuffer, _scale: f32) -> Result<CudaBuffer, String> {
+    Err("CUDA feature is disabled".to_string())
+}
+
 pub fn sgd_momentum_update_f32(
     _param: &CudaBuffer,
     _grad: &CudaBuffer,
