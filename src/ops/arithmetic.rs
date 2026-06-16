@@ -8709,6 +8709,59 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_async_general_broadcast_chain_matches_cpu_after_metadata_and_buffer_reuse() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        {
+            let a = make_tensor(
+                &[2, 1, 1, 3],
+                vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0],
+                DType::F32,
+            );
+            let b = make_tensor(
+                &[1, 4, 2, 3],
+                (0..24).map(|i| (i as f32 % 11.0) * 0.2 - 0.75).collect(),
+                DType::F32,
+            );
+            let c = make_tensor(
+                &[2, 4, 1, 1],
+                (0..8).map(|i| 0.5 + i as f32 * 0.125).collect(),
+                DType::F32,
+            );
+            let d = make_tensor(
+                &[1, 1, 2, 3],
+                vec![0.25, -0.5, 1.0, -1.5, 0.75, 0.125],
+                DType::F32,
+            );
+            let cpu_out = no_grad(|| ((a.clone() + b.clone()) * c.clone()) - d.clone());
+
+            crate::ops::cuda::set_enabled(true);
+            crate::autograd::set_strict_device_execution(true);
+            let cuda_out = no_grad(|| ((a.to_cuda() + b.to_cuda()) * c.to_cuda()) - d.to_cuda());
+            assert!(cuda_out.is_cuda());
+            assert!(!cuda_out.has_host_f32_data());
+            crate::autograd::set_strict_device_execution(false);
+            crate::ops::cuda::set_enabled(false);
+
+            for (idx, (got, expected)) in cuda_out
+                .data_ref()
+                .iter()
+                .zip(cpu_out.data_ref().iter())
+                .enumerate()
+            {
+                assert!(
+                    (got - expected).abs() <= 1e-6,
+                    "async general broadcast chain mismatch at {idx}: got {got}, expected {expected}"
+                );
+            }
+        }
+        crate::ops::cuda::release_cached_memory().expect("release CUDA cached memory");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     #[should_panic(expected = "same device")]
     fn add_panics_on_mixed_devices() {
         if !crate::ops::cuda::is_available() {

@@ -130,7 +130,7 @@ extern "C" int lumen_cuda_permute_f32_device(
         d_out_strides,
         d_mapped_input_strides,
         len);
-    bool ok = sync_cuda("CUDA permute kernel failed");
+    bool ok = check_cuda_launch("CUDA permute kernel launch failed");
     return ok ? 0 : 1;
 }
 
@@ -192,7 +192,7 @@ int launch_permute_typed(
         d_out_strides,
         d_mapped_input_strides,
         len);
-    bool ok = sync_cuda("CUDA typed permute kernel failed");
+    bool ok = check_cuda_launch("CUDA typed permute kernel launch failed");
     return ok ? 0 : 1;
 }
 
@@ -285,7 +285,7 @@ extern "C" int lumen_cuda_slice_lastdim_f32_device(
         input_last_dim,
         start,
         slice_len);
-    if (!sync_cuda("CUDA slice kernel failed")) {
+    if (!check_cuda_launch("CUDA slice kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -351,7 +351,7 @@ extern "C" int lumen_cuda_slice_lastdim_typed_device(
             set_error("unsupported dtype for CUDA typed slice_lastdim");
             return 1;
     }
-    if (!sync_cuda("CUDA typed slice kernel failed")) {
+    if (!check_cuda_launch("CUDA typed slice kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -405,7 +405,7 @@ extern "C" int lumen_cuda_slice_lastdim_backward_f32_device(
         input_last_dim,
         start,
         slice_len);
-    if (!sync_cuda("CUDA slice_lastdim backward kernel failed")) {
+    if (!check_cuda_launch("CUDA slice_lastdim backward kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -475,7 +475,7 @@ extern "C" int lumen_cuda_cat_f32_device(
         lhs_axis_len,
         len);
 
-    bool ok = sync_cuda("CUDA cat kernel failed");
+    bool ok = check_cuda_launch("CUDA cat kernel launch failed");
     return ok ? 0 : 1;
 }
 
@@ -526,7 +526,7 @@ int launch_cat_typed(
         lhs_axis_len,
         len);
 
-    bool ok = sync_cuda("CUDA typed cat kernel failed");
+    bool ok = check_cuda_launch("CUDA typed cat kernel launch failed");
     return ok ? 0 : 1;
 }
 
@@ -665,7 +665,7 @@ extern "C" int lumen_cuda_cat_backward_slice_f32_device(
         axis_start,
         len);
 
-    bool ok = sync_cuda("CUDA cat backward kernel failed");
+    bool ok = check_cuda_launch("CUDA cat backward kernel launch failed");
     return ok ? 0 : 1;
 }
 

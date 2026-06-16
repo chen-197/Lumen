@@ -1534,18 +1534,17 @@ extern "C" int lumen_cuda_matvec_argmax_bf16_i8_device(
                 hidden_size,
                 weight_scale);
         } else {
-            dim3 block(16, 8);
-            dim3 grid(
-                static_cast<unsigned int>((vocab_size + 15) / 16),
-                static_cast<unsigned int>((batch_size + 7) / 8));
-            matmul_floatlike_i8_tiled_kernel<<<grid, block>>>(
+            if (!launch_matmul_floatlike_i8_compute(
                 reinterpret_cast<const __nv_bfloat16*>(handle_to_ptr(input_handle)),
                 reinterpret_cast<const int8_t*>(handle_to_ptr(weight_handle)),
                 static_cast<float*>(logits_tmp.ptr),
                 batch_size,
                 vocab_size,
                 hidden_size,
-                weight_scale);
+                weight_scale,
+                "CUDA BF16xI8 batched argmax logits kernel launch failed")) {
+                return 1;
+            }
         }
         argmax_rows_kernel<<<linear_grid_size(batch_size, 1), block_size>>>(
             static_cast<float*>(logits_tmp.ptr),
@@ -1658,18 +1657,17 @@ extern "C" int lumen_cuda_matvec_argmax_f16_i8_device(
                 hidden_size,
                 weight_scale);
         } else {
-            dim3 block(16, 8);
-            dim3 grid(
-                static_cast<unsigned int>((vocab_size + 15) / 16),
-                static_cast<unsigned int>((batch_size + 7) / 8));
-            matmul_floatlike_i8_tiled_kernel<<<grid, block>>>(
+            if (!launch_matmul_floatlike_i8_compute(
                 reinterpret_cast<const __half*>(handle_to_ptr(input_handle)),
                 reinterpret_cast<const int8_t*>(handle_to_ptr(weight_handle)),
                 static_cast<float*>(logits_tmp.ptr),
                 batch_size,
                 vocab_size,
                 hidden_size,
-                weight_scale);
+                weight_scale,
+                "CUDA F16xI8 batched argmax logits kernel launch failed")) {
+                return 1;
+            }
         }
         argmax_rows_kernel<<<linear_grid_size(batch_size, 1), block_size>>>(
             static_cast<float*>(logits_tmp.ptr),
@@ -1782,18 +1780,17 @@ extern "C" int lumen_cuda_matvec_argmax_f32_i8_device(
                 hidden_size,
                 weight_scale);
         } else {
-            dim3 block(16, 8);
-            dim3 grid(
-                static_cast<unsigned int>((vocab_size + 15) / 16),
-                static_cast<unsigned int>((batch_size + 7) / 8));
-            matmul_floatlike_i8_tiled_kernel<<<grid, block>>>(
+            if (!launch_matmul_floatlike_i8_compute(
                 handle_to_ptr(input_handle),
                 reinterpret_cast<const int8_t*>(handle_to_ptr(weight_handle)),
                 static_cast<float*>(logits_tmp.ptr),
                 batch_size,
                 vocab_size,
                 hidden_size,
-                weight_scale);
+                weight_scale,
+                "CUDA F32xI8 batched argmax logits kernel launch failed")) {
+                return 1;
+            }
         }
         argmax_rows_kernel<<<linear_grid_size(batch_size, 1), block_size>>>(
             static_cast<float*>(logits_tmp.ptr),
@@ -1838,9 +1835,9 @@ extern "C" int lumen_cuda_matvec_argmax_i8_i8_device(
         set_error("CUDA I8xI8 argmax dimensions must be greater than zero");
         return 1;
     }
-    if (!std::isfinite(input_scale) || input_scale <= 0.0f ||
-        !std::isfinite(weight_scale) || weight_scale <= 0.0f) {
-        set_error("CUDA I8xI8 argmax scales must be finite and > 0");
+    float scale = 0.0f;
+    if (!checked_scale_product(
+            "CUDA I8xI8 argmax", input_scale, weight_scale, &scale)) {
         return 1;
     }
 
@@ -1863,7 +1860,6 @@ extern "C" int lumen_cuda_matvec_argmax_i8_i8_device(
     }
 
     constexpr int block_size = 256;
-    const float scale = input_scale * weight_scale;
     if (batch_size == 1 && vocab_size <= 4096) {
         const size_t partial_count = vocab_size < 1024 ? vocab_size : 1024;
         thread_local ReusableCudaWorkspace best_values_tmp;
@@ -2662,9 +2658,8 @@ extern "C" int lumen_cuda_matmul_i8_host_device(
     if (!validate_handle(out_handle, "CUDA I8 matmul output handle") || !validate_dims(m, n, k)) {
         return 1;
     }
-    if (!std::isfinite(a_scale) || a_scale <= 0.0f ||
-        !std::isfinite(b_scale) || b_scale <= 0.0f) {
-        set_error("CUDA I8 matmul scales must be finite and > 0");
+    float scale = 0.0f;
+    if (!checked_scale_product("CUDA I8 matmul", a_scale, b_scale, &scale)) {
         return 1;
     }
 
@@ -2682,7 +2677,7 @@ extern "C" int lumen_cuda_matmul_i8_host_device(
         m,
         n,
         k,
-        a_scale * b_scale,
+        scale,
         "CUDA I8 matmul kernel launch failed")) {
         return 1;
     }
@@ -2707,9 +2702,8 @@ extern "C" int lumen_cuda_matmul_i8_device(
         !validate_dims(m, n, k)) {
         return 1;
     }
-    if (!std::isfinite(a_scale) || a_scale <= 0.0f ||
-        !std::isfinite(b_scale) || b_scale <= 0.0f) {
-        set_error("CUDA I8 resident matmul scales must be finite and > 0");
+    float scale = 0.0f;
+    if (!checked_scale_product("CUDA I8 resident matmul", a_scale, b_scale, &scale)) {
         return 1;
     }
 
@@ -2720,7 +2714,7 @@ extern "C" int lumen_cuda_matmul_i8_device(
         m,
         n,
         k,
-        a_scale * b_scale,
+        scale,
         "CUDA I8 resident matmul kernel launch failed")) {
         return 1;
     }
@@ -3147,9 +3141,9 @@ extern "C" int lumen_cuda_matmul_i8_typed_out_device(
         set_error("CUDA I8 typed-output matmul scale output is null");
         return 1;
     }
-    if (!std::isfinite(a_scale) || a_scale <= 0.0f ||
-        !std::isfinite(b_scale) || b_scale <= 0.0f) {
-        set_error("CUDA I8 typed-output matmul scales must be finite and > 0");
+    float scale = 0.0f;
+    if (!checked_scale_product(
+            "CUDA I8 typed-output matmul", a_scale, b_scale, &scale)) {
         return 1;
     }
 
@@ -3173,7 +3167,7 @@ extern "C" int lumen_cuda_matmul_i8_typed_out_device(
         m,
         n,
         k,
-        a_scale * b_scale,
+        scale,
         "CUDA I8 typed-output matmul f32 kernel launch failed")) {
         return 1;
     }
@@ -3753,9 +3747,9 @@ extern "C" int lumen_cuda_batch_matmul_i8_device(
     if (!validate_dims(m, n, k)) {
         return 1;
     }
-    if (!std::isfinite(lhs_scale) || lhs_scale <= 0.0f ||
-        !std::isfinite(rhs_scale) || rhs_scale <= 0.0f) {
-        set_error("CUDA I8 batch_matmul scales must be finite and > 0");
+    float scale = 0.0f;
+    if (!checked_scale_product(
+            "CUDA I8 batch_matmul", lhs_scale, rhs_scale, &scale)) {
         return 1;
     }
     const size_t max_size = static_cast<size_t>(-1);
@@ -3772,7 +3766,7 @@ extern "C" int lumen_cuda_batch_matmul_i8_device(
                m,
                n,
                k,
-               lhs_scale * rhs_scale,
+               scale,
                "CUDA I8 batch_matmul kernel launch failed")
                ? 0
                : 1;
@@ -3805,9 +3799,9 @@ extern "C" int lumen_cuda_batch_matmul_i8_typed_out_device(
     if (!validate_dims(m, n, k)) {
         return 1;
     }
-    if (!std::isfinite(lhs_scale) || lhs_scale <= 0.0f ||
-        !std::isfinite(rhs_scale) || rhs_scale <= 0.0f) {
-        set_error("CUDA I8 typed-output batch_matmul scales must be finite and > 0");
+    float scale = 0.0f;
+    if (!checked_scale_product(
+            "CUDA I8 typed-output batch_matmul", lhs_scale, rhs_scale, &scale)) {
         return 1;
     }
     const size_t max_size = static_cast<size_t>(-1);
@@ -3838,7 +3832,7 @@ extern "C" int lumen_cuda_batch_matmul_i8_typed_out_device(
             m,
             n,
             k,
-            lhs_scale * rhs_scale,
+            scale,
             "CUDA I8 typed-output batch_matmul f32 kernel launch failed")) {
         return 1;
     }

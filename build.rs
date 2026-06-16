@@ -782,6 +782,11 @@ fn main() {
         .current_dir(&staging_cuda_dir)
         .arg("--lib")
         .arg("-std=c++17")
+        // The shared CUDA buffer pool may reuse asynchronously released
+        // allocations across host threads. Legacy default-stream ordering is
+        // therefore a required correctness invariant until reuse is event-gated.
+        .arg("--default-stream")
+        .arg("legacy")
         .arg(format!(
             "-DLUMEN_HAS_CUDNN={}",
             if cudnn_install.is_some() { 1 } else { 0 }

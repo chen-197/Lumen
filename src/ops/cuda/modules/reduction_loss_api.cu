@@ -202,14 +202,18 @@ extern "C" int lumen_cuda_sum_lastdim_f32_device(
         set_error("CUDA sum_lastdim received invalid dimensions");
         return 1;
     }
+    size_t len = 0;
+    if (!checked_product("CUDA sum_lastdim length overflow", {rows, last_dim}, &len)) {
+        return 1;
+    }
     constexpr int block_size = 256;
     if (rows < 64) {
-        cudaError_t status = cudaMemset(handle_to_ptr(out_handle), 0, last_dim * sizeof(float));
-        if (status != cudaSuccess) {
-            set_cuda_error("CUDA sum_lastdim output initialization failed", status);
+        if (!zero_f32_buffer(
+                handle_to_ptr(out_handle),
+                last_dim,
+                "CUDA sum_lastdim output initialization failed")) {
             return 1;
         }
-        size_t len = rows * last_dim;
         const unsigned int grid_size = linear_grid_size(len, block_size);
         sum_lastdim_atomic_kernel<<<grid_size, block_size>>>(
             handle_to_ptr(input_handle),
@@ -245,7 +249,13 @@ extern "C" int lumen_cuda_bshd_to_bhsd_add_bias_f32_device(
         return 1;
     }
 
-    size_t len = batch * seq * heads * dim;
+    size_t len = 0;
+    if (!checked_product(
+            "CUDA BSHD to BHSD add bias length overflow",
+            {batch, seq, heads, dim},
+            &len)) {
+        return 1;
+    }
     constexpr int block_size = 256;
     if (dim % 4 == 0) {
         size_t vec_len = len / 4;

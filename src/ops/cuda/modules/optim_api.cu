@@ -1,3 +1,19 @@
+bool append_optimizer_metadata_block(
+    size_t count,
+    size_t element_size,
+    size_t alignment,
+    size_t* cursor,
+    size_t* offset,
+    const char* context) {
+    size_t bytes = 0;
+    if (!checked_align_up(context, *cursor, alignment, offset) ||
+        !checked_product(context, {count, element_size}, &bytes) ||
+        !checked_add(context, *offset, bytes, cursor)) {
+        return false;
+    }
+    return true;
+}
+
 extern "C" int lumen_cuda_sgd_update_f32_device(
     uint64_t param_handle,
     uint64_t grad_handle,
@@ -39,6 +55,9 @@ extern "C" int lumen_cuda_sgd_update_f32_batched_device(
         set_error("CUDA batched SGD count must be greater than zero");
         return 1;
     }
+    if (!validate_grid_yz_dimension("CUDA batched SGD count exceeds grid.y range", count)) {
+        return 1;
+    }
 
     thread_local std::vector<float*> param_ptrs;
     thread_local std::vector<const float*> grad_ptrs;
@@ -59,10 +78,33 @@ extern "C" int lumen_cuda_sgd_update_f32_batched_device(
         max_len = std::max(max_len, lens[i]);
     }
 
-    const size_t params_offset = 0;
-    const size_t grads_offset = align_up(params_offset + count * sizeof(float*), alignof(const float*));
-    const size_t lens_offset = align_up(grads_offset + count * sizeof(const float*), alignof(size_t));
-    const size_t metadata_bytes = lens_offset + count * sizeof(size_t);
+    size_t metadata_bytes = 0;
+    size_t params_offset = 0;
+    size_t grads_offset = 0;
+    size_t lens_offset = 0;
+    if (!append_optimizer_metadata_block(
+            count,
+            sizeof(float*),
+            alignof(float*),
+            &metadata_bytes,
+            &params_offset,
+            "CUDA batched SGD metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(const float*),
+            alignof(const float*),
+            &metadata_bytes,
+            &grads_offset,
+            "CUDA batched SGD metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(size_t),
+            alignof(size_t),
+            &metadata_bytes,
+            &lens_offset,
+            "CUDA batched SGD metadata length overflow")) {
+        return 1;
+    }
     thread_local std::vector<unsigned char> metadata;
     metadata.resize(metadata_bytes);
     std::memcpy(metadata.data() + params_offset, param_ptrs.data(), count * sizeof(float*));
@@ -81,8 +123,7 @@ extern "C" int lumen_cuda_sgd_update_f32_batched_device(
 
     char* d_base = reinterpret_cast<char*>(d_metadata.ptr);
     constexpr int block_size = 256;
-    unsigned int grid_x = static_cast<unsigned int>((max_len + block_size - 1) / block_size);
-    grid_x = std::max(1u, std::min(grid_x, 1024u));
+    const unsigned int grid_x = std::min(linear_grid_size(max_len, block_size), 1024u);
     dim3 grid(grid_x, static_cast<unsigned int>(count), 1);
     sgd_update_batched_kernel<<<grid, block_size>>>(
         reinterpret_cast<float**>(d_base + params_offset),
@@ -273,6 +314,10 @@ extern "C" int lumen_cuda_sgd_momentum_update_f32_batched_device(
         set_error("CUDA batched SGD momentum count must be greater than zero");
         return 1;
     }
+    if (!validate_grid_yz_dimension(
+            "CUDA batched SGD momentum count exceeds grid.y range", count)) {
+        return 1;
+    }
 
     thread_local std::vector<float*> param_ptrs;
     thread_local std::vector<const float*> grad_ptrs;
@@ -297,11 +342,41 @@ extern "C" int lumen_cuda_sgd_momentum_update_f32_batched_device(
         max_len = std::max(max_len, lens[i]);
     }
 
-    const size_t params_offset = 0;
-    const size_t grads_offset = align_up(params_offset + count * sizeof(float*), alignof(const float*));
-    const size_t velocities_offset = align_up(grads_offset + count * sizeof(const float*), alignof(float*));
-    const size_t lens_offset = align_up(velocities_offset + count * sizeof(float*), alignof(size_t));
-    const size_t metadata_bytes = lens_offset + count * sizeof(size_t);
+    size_t metadata_bytes = 0;
+    size_t params_offset = 0;
+    size_t grads_offset = 0;
+    size_t velocities_offset = 0;
+    size_t lens_offset = 0;
+    if (!append_optimizer_metadata_block(
+            count,
+            sizeof(float*),
+            alignof(float*),
+            &metadata_bytes,
+            &params_offset,
+            "CUDA batched SGD momentum metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(const float*),
+            alignof(const float*),
+            &metadata_bytes,
+            &grads_offset,
+            "CUDA batched SGD momentum metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(float*),
+            alignof(float*),
+            &metadata_bytes,
+            &velocities_offset,
+            "CUDA batched SGD momentum metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(size_t),
+            alignof(size_t),
+            &metadata_bytes,
+            &lens_offset,
+            "CUDA batched SGD momentum metadata length overflow")) {
+        return 1;
+    }
     thread_local std::vector<unsigned char> metadata;
     metadata.resize(metadata_bytes);
     std::memcpy(metadata.data() + params_offset, param_ptrs.data(), count * sizeof(float*));
@@ -321,8 +396,7 @@ extern "C" int lumen_cuda_sgd_momentum_update_f32_batched_device(
 
     char* d_base = reinterpret_cast<char*>(d_metadata.ptr);
     constexpr int block_size = 256;
-    unsigned int grid_x = static_cast<unsigned int>((max_len + block_size - 1) / block_size);
-    grid_x = std::max(1u, std::min(grid_x, 1024u));
+    const unsigned int grid_x = std::min(linear_grid_size(max_len, block_size), 1024u);
     dim3 grid(grid_x, static_cast<unsigned int>(count), 1);
     sgd_momentum_update_batched_kernel<<<grid, block_size>>>(
         reinterpret_cast<float**>(d_base + params_offset),
@@ -419,6 +493,9 @@ extern "C" int lumen_cuda_adam_update_f32_batched_device(
         set_error("CUDA batched Adam count must be greater than zero");
         return 1;
     }
+    if (!validate_grid_yz_dimension("CUDA batched Adam count exceeds grid.y range", count)) {
+        return 1;
+    }
 
     thread_local std::vector<float*> param_ptrs;
     thread_local std::vector<const float*> grad_ptrs;
@@ -447,12 +524,49 @@ extern "C" int lumen_cuda_adam_update_f32_batched_device(
         max_len = std::max(max_len, lens[i]);
     }
 
-    const size_t params_offset = 0;
-    const size_t grads_offset = align_up(params_offset + count * sizeof(float*), alignof(const float*));
-    const size_t exp_avgs_offset = align_up(grads_offset + count * sizeof(const float*), alignof(float*));
-    const size_t exp_avg_sqs_offset = align_up(exp_avgs_offset + count * sizeof(float*), alignof(float*));
-    const size_t lens_offset = align_up(exp_avg_sqs_offset + count * sizeof(float*), alignof(size_t));
-    const size_t metadata_bytes = lens_offset + count * sizeof(size_t);
+    size_t metadata_bytes = 0;
+    size_t params_offset = 0;
+    size_t grads_offset = 0;
+    size_t exp_avgs_offset = 0;
+    size_t exp_avg_sqs_offset = 0;
+    size_t lens_offset = 0;
+    if (!append_optimizer_metadata_block(
+            count,
+            sizeof(float*),
+            alignof(float*),
+            &metadata_bytes,
+            &params_offset,
+            "CUDA batched Adam metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(const float*),
+            alignof(const float*),
+            &metadata_bytes,
+            &grads_offset,
+            "CUDA batched Adam metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(float*),
+            alignof(float*),
+            &metadata_bytes,
+            &exp_avgs_offset,
+            "CUDA batched Adam metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(float*),
+            alignof(float*),
+            &metadata_bytes,
+            &exp_avg_sqs_offset,
+            "CUDA batched Adam metadata length overflow") ||
+        !append_optimizer_metadata_block(
+            count,
+            sizeof(size_t),
+            alignof(size_t),
+            &metadata_bytes,
+            &lens_offset,
+            "CUDA batched Adam metadata length overflow")) {
+        return 1;
+    }
     thread_local std::vector<unsigned char> metadata;
     metadata.resize(metadata_bytes);
     std::memcpy(metadata.data() + params_offset, param_ptrs.data(), count * sizeof(float*));
@@ -473,8 +587,7 @@ extern "C" int lumen_cuda_adam_update_f32_batched_device(
 
     char* d_base = reinterpret_cast<char*>(d_metadata.ptr);
     constexpr int block_size = 256;
-    unsigned int grid_x = static_cast<unsigned int>((max_len + block_size - 1) / block_size);
-    grid_x = std::max(1u, std::min(grid_x, 1024u));
+    const unsigned int grid_x = std::min(linear_grid_size(max_len, block_size), 1024u);
     dim3 grid(grid_x, static_cast<unsigned int>(count), 1);
     adam_update_batched_kernel<<<grid, block_size>>>(
         reinterpret_cast<float**>(d_base + params_offset),

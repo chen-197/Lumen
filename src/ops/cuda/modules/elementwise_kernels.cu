@@ -3568,7 +3568,7 @@ void launch_add_sub_same_shape_backward_kernel(
     }
 }
 
-void launch_add_sub_row_broadcast_backward_kernel(
+bool launch_add_sub_row_broadcast_backward_kernel(
     const float* grad,
     float* grad_lhs,
     float* grad_rhs,
@@ -3583,7 +3583,12 @@ void launch_add_sub_row_broadcast_backward_kernel(
     bool use_atomic = rows < 64;
     if (vector_on_rhs) {
         if (use_atomic) {
-            cudaMemset(grad_rhs, 0, last_dim * sizeof(float));
+            if (!zero_f32_buffer(
+                    grad_rhs,
+                    last_dim,
+                    "CUDA add/sub row-broadcast rhs grad initialization failed")) {
+                return false;
+            }
             add_sub_row_broadcast_backward_atomic_combined_kernel<<<full_grid, block_size>>>(
                 grad, grad_lhs, grad_rhs, len, last_dim, 1.0f, rhs_sign);
         } else {
@@ -3593,7 +3598,12 @@ void launch_add_sub_row_broadcast_backward_kernel(
         }
     } else {
         if (use_atomic) {
-            cudaMemset(grad_lhs, 0, last_dim * sizeof(float));
+            if (!zero_f32_buffer(
+                    grad_lhs,
+                    last_dim,
+                    "CUDA add/sub row-broadcast lhs grad initialization failed")) {
+                return false;
+            }
             add_sub_row_broadcast_backward_atomic_combined_kernel<<<full_grid, block_size>>>(
                 grad, grad_rhs, grad_lhs, len, last_dim, rhs_sign, 1.0f);
         } else {
@@ -3602,6 +3612,7 @@ void launch_add_sub_row_broadcast_backward_kernel(
                 grad, grad_lhs, rows, last_dim, 1.0f);
         }
     }
+    return true;
 }
 
 void launch_add_sub_scalar_broadcast_backward_kernel(

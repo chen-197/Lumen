@@ -169,7 +169,7 @@ extern "C" int lumen_cuda_conv2d_f32_device(
         }
     }
 
-    if (!sync_cuda("CUDA conv2d failed")) {
+    if (!check_cuda_launch("CUDA conv2d launch failed")) {
         return 1;
     }
     return 0;
@@ -263,7 +263,13 @@ int launch_conv2d_typed_bias(
     size_t stride_w,
     size_t out_h,
     size_t out_w) {
-    size_t total = batch_size * out_channels * out_h * out_w;
+    size_t total = 0;
+    if (!checked_product(
+            "CUDA typed conv2d output length overflow",
+            {batch_size, out_channels, out_h, out_w},
+            &total)) {
+        return 1;
+    }
     constexpr int block_size = 256;
     const unsigned int grid_size = linear_grid_size(total, block_size);
     conv2d_typed_forward_kernel<InputT, WeightT, BiasT><<<grid_size, block_size>>>(
@@ -289,7 +295,7 @@ int launch_conv2d_typed_bias(
         stride_w,
         out_h,
         out_w);
-    return sync_cuda("CUDA typed conv2d forward failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed conv2d forward kernel launch failed") ? 0 : 1;
 }
 
 template <typename InputT, typename WeightT>
@@ -674,7 +680,7 @@ extern "C" int lumen_cuda_conv2d_backward_f32_device(
         }
     }
 
-    if (!sync_cuda("CUDA conv2d backward failed")) {
+    if (!check_cuda_launch("CUDA conv2d backward launch failed")) {
         return 1;
     }
     return 0;
@@ -870,7 +876,13 @@ extern "C" int lumen_cuda_max_pool2d_f32_device(
         return 1;
     }
 
-    size_t total = batch_size * channels * out_h * out_w;
+    size_t total = 0;
+    if (!checked_product(
+            "CUDA max_pool2d output length overflow",
+            {batch_size, channels, out_h, out_w},
+            &total)) {
+        return 1;
+    }
     constexpr int block_size = 256;
     const unsigned int grid_size = linear_grid_size(total, block_size);
     max_pool2d_forward_kernel<<<grid_size, block_size>>>(
@@ -886,7 +898,7 @@ extern "C" int lumen_cuda_max_pool2d_f32_device(
         stride_w,
         out_h,
         out_w);
-    if (!sync_cuda("CUDA max_pool2d forward failed")) {
+    if (!check_cuda_launch("CUDA max_pool2d forward kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -907,7 +919,13 @@ int launch_max_pool2d_typed(
     size_t stride_w,
     size_t out_h,
     size_t out_w) {
-    size_t total = batch_size * channels * out_h * out_w;
+    size_t total = 0;
+    if (!checked_product(
+            "CUDA typed max_pool2d output length overflow",
+            {batch_size, channels, out_h, out_w},
+            &total)) {
+        return 1;
+    }
     constexpr int block_size = 256;
     const unsigned int grid_size = linear_grid_size(total, block_size);
     max_pool2d_forward_typed_kernel<T><<<grid_size, block_size>>>(
@@ -924,7 +942,7 @@ int launch_max_pool2d_typed(
         stride_w,
         out_h,
         out_w);
-    return sync_cuda("CUDA typed max_pool2d forward failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed max_pool2d forward kernel launch failed") ? 0 : 1;
 }
 
 extern "C" int lumen_cuda_max_pool2d_typed_device(
@@ -1083,7 +1101,7 @@ extern "C" int lumen_cuda_max_pool2d_backward_f32_device(
         stride_w,
         out_h,
         out_w);
-    if (!sync_cuda("CUDA max_pool2d backward failed")) {
+    if (!check_cuda_launch("CUDA max_pool2d backward kernel launch failed")) {
         return 1;
     }
     return 0;
@@ -1140,7 +1158,7 @@ int launch_max_pool2d_backward_typed(
         stride_w,
         out_h,
         out_w);
-    return sync_cuda("CUDA typed max_pool2d backward failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed max_pool2d backward kernel launch failed") ? 0 : 1;
 }
 
 extern "C" int lumen_cuda_max_pool2d_backward_typed_device(

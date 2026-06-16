@@ -966,7 +966,8 @@ extern "C" int lumen_cuda_rope_f32_device(
         !checked_product(
             "CUDA RoPE pair count overflow",
             {seq_len, half},
-            &pairs_per_head)) {
+            &pairs_per_head) ||
+        !validate_grid_yz_dimension("CUDA RoPE batch/head count exceeds grid.y range", batch_heads)) {
         return 1;
     }
     constexpr int block_size = 256;
@@ -1023,10 +1024,17 @@ extern "C" int lumen_cuda_rope_typed_device(
         return 1;
     }
     size_t total = 0;
+    size_t batch_heads = 0;
     if (!checked_product(
             "CUDA typed RoPE element count overflow",
             {batch_size, num_heads, seq_len, dim},
-            &total)) {
+            &total) ||
+        !checked_product(
+            "CUDA typed RoPE batch/head count overflow",
+            {batch_size, num_heads},
+            &batch_heads) ||
+        !validate_grid_yz_dimension(
+            "CUDA typed RoPE batch/head count exceeds grid.y range", batch_heads)) {
         return 1;
     }
 
@@ -1138,10 +1146,17 @@ extern "C" int lumen_cuda_rope_typed_i8_dynamic_device(
         return 1;
     }
     size_t total = 0;
+    size_t batch_heads = 0;
     if (!checked_product(
             "CUDA typed RoPE dynamic i8 element count overflow",
             {batch_size, num_heads, seq_len, dim},
-            &total)) {
+            &total) ||
+        !checked_product(
+            "CUDA typed RoPE dynamic i8 batch/head count overflow",
+            {batch_size, num_heads},
+            &batch_heads) ||
+        !validate_grid_yz_dimension(
+            "CUDA typed RoPE dynamic i8 batch/head count exceeds grid.y range", batch_heads)) {
         return 1;
     }
 
@@ -1257,7 +1272,9 @@ extern "C" int lumen_cuda_rope_backward_f32_device(
         !checked_product(
             "CUDA RoPE backward pair count overflow",
             {seq_len, half},
-            &pairs_per_head)) {
+            &pairs_per_head) ||
+        !validate_grid_yz_dimension(
+            "CUDA RoPE backward batch/head count exceeds grid.y range", batch_heads)) {
         return 1;
     }
     constexpr int block_size = 256;

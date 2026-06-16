@@ -39,10 +39,6 @@ constexpr int kDTypeF16 = 1;
 constexpr int kDTypeBF16 = 2;
 constexpr int kDTypeI8 = 3;
 
-size_t align_up(size_t value, size_t alignment) {
-    return (value + alignment - 1) / alignment * alignment;
-}
-
 float* handle_to_ptr(uint64_t handle) {
     return reinterpret_cast<float*>(handle);
 }
@@ -77,20 +73,49 @@ struct CublasHandle {
     int device = -1;
 
     ~CublasHandle() {
-        if (owns && handle != nullptr) {
-            int current_device = -1;
-            const bool restore = cudaGetDevice(&current_device) == cudaSuccess && device >= 0 &&
-                                 current_device != device;
-            if (restore && cudaSetDevice(device) != cudaSuccess) {
-                return;
-            }
-            cublasDestroy(handle);
-            if (restore) {
-                cudaSetDevice(current_device);
+        // CUDA's Windows hybrid runtime can tear down per-thread state before C++
+        // thread_local destructors run. Do not call CUDA APIs from TLS teardown;
+        // cached handles are reclaimed with the CUDA context.
+    }
+
+    bool release(const char* context) {
+        if (!owns || handle == nullptr) {
+            return true;
+        }
+        int current_device = -1;
+        cudaError_t device_status = cudaGetDevice(&current_device);
+        if (device_status != cudaSuccess) {
+            set_cuda_error(context, device_status);
+            return false;
+        }
+        const bool restore = device >= 0 && current_device != device;
+        if (restore) {
+            cudaError_t switch_status = cudaSetDevice(device);
+            if (switch_status != cudaSuccess) {
+                set_cuda_error(context, switch_status);
+                return false;
             }
         }
+        cublasStatus_t destroy_status = cublasDestroy(handle);
+        cudaError_t restore_status = restore ? cudaSetDevice(current_device) : cudaSuccess;
+        if (destroy_status != CUBLAS_STATUS_SUCCESS) {
+            set_cublas_error(context, destroy_status);
+            return false;
+        }
+        handle = nullptr;
+        device = -1;
+        if (restore_status != cudaSuccess) {
+            set_cuda_error(context, restore_status);
+            return false;
+        }
+        return true;
     }
 };
+
+CublasHandle& thread_cublas_handle() {
+    thread_local CublasHandle cached;
+    return cached;
+}
 
 #if LUMEN_HAS_CUDNN
 struct CudnnHandle {
@@ -99,20 +124,48 @@ struct CudnnHandle {
     int device = -1;
 
     ~CudnnHandle() {
-        if (owns && handle != nullptr) {
-            int current_device = -1;
-            const bool restore = cudaGetDevice(&current_device) == cudaSuccess && device >= 0 &&
-                                 current_device != device;
-            if (restore && cudaSetDevice(device) != cudaSuccess) {
-                return;
-            }
-            cudnnDestroy(handle);
-            if (restore) {
-                cudaSetDevice(current_device);
+        // See CublasHandle: cached TLS resources must not call CUDA APIs while
+        // the runtime is tearing down thread state.
+    }
+
+    bool release(const char* context) {
+        if (!owns || handle == nullptr) {
+            return true;
+        }
+        int current_device = -1;
+        cudaError_t device_status = cudaGetDevice(&current_device);
+        if (device_status != cudaSuccess) {
+            set_cuda_error(context, device_status);
+            return false;
+        }
+        const bool restore = device >= 0 && current_device != device;
+        if (restore) {
+            cudaError_t switch_status = cudaSetDevice(device);
+            if (switch_status != cudaSuccess) {
+                set_cuda_error(context, switch_status);
+                return false;
             }
         }
+        cudnnStatus_t destroy_status = cudnnDestroy(handle);
+        cudaError_t restore_status = restore ? cudaSetDevice(current_device) : cudaSuccess;
+        if (destroy_status != CUDNN_STATUS_SUCCESS) {
+            set_cudnn_error(context, destroy_status);
+            return false;
+        }
+        handle = nullptr;
+        device = -1;
+        if (restore_status != cudaSuccess) {
+            set_cuda_error(context, restore_status);
+            return false;
+        }
+        return true;
     }
 };
+
+CudnnHandle& thread_cudnn_handle() {
+    thread_local CudnnHandle cached;
+    return cached;
+}
 
 struct CudnnTensorDescriptor {
     cudnnTensorDescriptor_t desc = nullptr;
@@ -155,13 +208,28 @@ struct CudnnConvolutionDescriptor {
 };
 #endif
 
+struct ReusableCudaWorkspace;
+
+std::vector<ReusableCudaWorkspace*>& thread_cuda_workspaces() {
+    // Keep the registry itself alive through TLS teardown. Workspace objects
+    // unregistering or freeing CUDA memory from TLS destructors is unsafe with
+    // CUDA's Windows hybrid runtime teardown order.
+    thread_local auto* workspaces = new std::vector<ReusableCudaWorkspace*>();
+    return *workspaces;
+}
+
 struct ReusableCudaWorkspace {
     void* ptr = nullptr;
     size_t capacity = 0;
     int device = -1;
 
+    ReusableCudaWorkspace() {
+        thread_cuda_workspaces().push_back(this);
+    }
+
     ~ReusableCudaWorkspace() {
-        release(nullptr);
+        // See CublasHandle. Runtime paths still release on resize/device switch;
+        // callers can explicitly release final allocations before TLS teardown.
     }
 
     bool release(const char* context) {
@@ -172,8 +240,14 @@ struct ReusableCudaWorkspace {
         }
 
         int current_device = -1;
-        const bool restore =
-            cudaGetDevice(&current_device) == cudaSuccess && device >= 0 && current_device != device;
+        cudaError_t device_status = cudaGetDevice(&current_device);
+        if (device_status != cudaSuccess) {
+            if (context != nullptr) {
+                set_cuda_error(context, device_status);
+            }
+            return false;
+        }
+        const bool restore = device >= 0 && current_device != device;
         if (restore) {
             cudaError_t status = cudaSetDevice(device);
             if (status != cudaSuccess) {
@@ -184,9 +258,7 @@ struct ReusableCudaWorkspace {
             }
         }
         cudaError_t free_status = cudaFree(ptr);
-        if (restore) {
-            cudaSetDevice(current_device);
-        }
+        cudaError_t restore_status = restore ? cudaSetDevice(current_device) : cudaSuccess;
         if (free_status != cudaSuccess) {
             if (context != nullptr) {
                 set_cuda_error(context, free_status);
@@ -196,6 +268,12 @@ struct ReusableCudaWorkspace {
         ptr = nullptr;
         capacity = 0;
         device = -1;
+        if (restore_status != cudaSuccess) {
+            if (context != nullptr) {
+                set_cuda_error(context, restore_status);
+            }
+            return false;
+        }
         return true;
     }
 
@@ -233,12 +311,25 @@ struct ReusableCudaWorkspace {
     }
 };
 
+bool release_thread_cuda_workspaces(const char* context) {
+    bool ok = true;
+    for (ReusableCudaWorkspace* workspace : thread_cuda_workspaces()) {
+        if (workspace != nullptr && !workspace->release(context)) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static unsigned int linear_grid_size(size_t total, unsigned int block_size) {
     constexpr size_t max_grid_x = 2147483647;
     const size_t blocks = total / block_size + (total % block_size != 0);
     return static_cast<unsigned int>(blocks < max_grid_x ? blocks : max_grid_x);
 }
 struct CudaBufferPool {
+    // NVCC is built with --default-stream legacy. Its cross-thread ordering
+    // keeps an asynchronously released pointer safe before shared-pool reuse.
+    // Per-thread streams require event-gated reuse instead.
     std::mutex mutex;
     std::unordered_map<int, std::unordered_map<size_t, std::vector<void*>>> free_lists_by_device;
     std::unordered_map<int, size_t> cached_bytes_by_device;
@@ -272,16 +363,40 @@ bool cuda_pointer_device(void* ptr, int& device) {
     return true;
 }
 
-void free_cuda_ptr_on_device(void* ptr, int device) {
+bool free_cuda_ptr_on_device(void* ptr, int device, const char* context) {
     int current = 0;
-    bool restore = current_cuda_device(current) && current != device;
-    if (restore) {
-        cudaSetDevice(device);
+    cudaError_t status = cudaGetDevice(&current);
+    if (status != cudaSuccess) {
+        if (context != nullptr) {
+            set_cuda_error(context, status);
+        }
+        return false;
     }
-    cudaFree(ptr);
+    bool restore = current != device;
     if (restore) {
-        cudaSetDevice(current);
+        status = cudaSetDevice(device);
+        if (status != cudaSuccess) {
+            if (context != nullptr) {
+                set_cuda_error(context, status);
+            }
+            return false;
+        }
     }
+    cudaError_t free_status = cudaFree(ptr);
+    cudaError_t restore_status = restore ? cudaSetDevice(current) : cudaSuccess;
+    if (free_status != cudaSuccess) {
+        if (context != nullptr) {
+            set_cuda_error(context, free_status);
+        }
+        return false;
+    }
+    if (restore_status != cudaSuccess) {
+        if (context != nullptr) {
+            set_cuda_error(context, restore_status);
+        }
+        return false;
+    }
+    return true;
 }
 
 bool try_take_pooled_cuda_buffer(size_t bytes, void** out) {
@@ -346,7 +461,7 @@ void release_cuda_buffer(uint64_t handle, size_t len) {
     cudaFree(handle_to_ptr(handle));
 }
 
-void clear_cuda_buffer_pool() {
+bool clear_cuda_buffer_pool(const char* context) {
     std::vector<std::pair<int, void*>> to_free;
     CudaBufferPool& pool = cuda_buffer_pool();
     {
@@ -363,9 +478,13 @@ void clear_cuda_buffer_pool() {
         pool.cached_bytes_by_device.clear();
     }
 
+    bool ok = true;
     for (auto& entry : to_free) {
-        free_cuda_ptr_on_device(entry.second, entry.first);
+        if (!free_cuda_ptr_on_device(entry.second, entry.first, context)) {
+            ok = false;
+        }
     }
+    return ok;
 }
 
 bool validate_dims(size_t m, size_t n, size_t k) {
@@ -388,6 +507,15 @@ bool validate_cublas_batch_count(size_t batch_count) {
     }
     if (batch_count > static_cast<size_t>(INT_MAX)) {
         set_error("CUDA batch_count exceeds cuBLAS int range");
+        return false;
+    }
+    return true;
+}
+
+bool validate_grid_yz_dimension(const char* context, size_t dimension) {
+    constexpr size_t max_grid_yz = 65535;
+    if (dimension > max_grid_yz) {
+        set_error(context);
         return false;
     }
     return true;
@@ -419,6 +547,25 @@ bool validate_positive_finite_value(float value, const char* context) {
     return true;
 }
 
+bool checked_scale_product(
+    const char* context,
+    float lhs_scale,
+    float rhs_scale,
+    float* out) {
+    if (!std::isfinite(lhs_scale) || lhs_scale <= 0.0f ||
+        !std::isfinite(rhs_scale) || rhs_scale <= 0.0f) {
+        set_error(std::string(context) + ": scales must be finite and > 0");
+        return false;
+    }
+    const float product = lhs_scale * rhs_scale;
+    if (!std::isfinite(product)) {
+        set_error(std::string(context) + ": combined scale overflow");
+        return false;
+    }
+    *out = product;
+    return true;
+}
+
 bool checked_product(
     const char* context,
     std::initializer_list<size_t> factors,
@@ -432,6 +579,28 @@ bool checked_product(
         product *= factor;
     }
     *out = product;
+    return true;
+}
+
+bool checked_add(const char* context, size_t lhs, size_t rhs, size_t* out) {
+    if (lhs > static_cast<size_t>(-1) - rhs) {
+        set_error(context);
+        return false;
+    }
+    *out = lhs + rhs;
+    return true;
+}
+
+bool checked_align_up(const char* context, size_t value, size_t alignment, size_t* out) {
+    if (alignment == 0) {
+        set_error(context);
+        return false;
+    }
+    size_t padded = 0;
+    if (!checked_add(context, value, alignment - 1, &padded)) {
+        return false;
+    }
+    *out = padded / alignment * alignment;
     return true;
 }
 
@@ -490,7 +659,7 @@ struct ScopedDeviceInput {
 };
 
 bool init_cublas(CublasHandle& handle) {
-    thread_local CublasHandle cached;
+    CublasHandle& cached = thread_cublas_handle();
     int current_device = -1;
     cudaError_t device_status = cudaGetDevice(&current_device);
     if (device_status != cudaSuccess) {
@@ -534,7 +703,7 @@ bool init_cublas(CublasHandle& handle) {
 
 #if LUMEN_HAS_CUDNN
 bool init_cudnn(CudnnHandle& handle) {
-    thread_local CudnnHandle cached;
+    CudnnHandle& cached = thread_cudnn_handle();
     int current_device = -1;
     cudaError_t device_status = cudaGetDevice(&current_device);
     if (device_status != cudaSuccess) {
@@ -917,10 +1086,27 @@ bool check_cuda_launch(const char* context) {
     return true;
 }
 
-size_t shape_numel(const size_t* shape, size_t ndim) {
+bool checked_shape_numel(
+    const char* context,
+    const size_t* shape,
+    size_t ndim,
+    size_t* out) {
+    if (shape == nullptr || out == nullptr || ndim == 0) {
+        set_error(std::string(context) + ": invalid shape metadata");
+        return false;
+    }
     size_t len = 1;
     for (size_t i = 0; i < ndim; ++i) {
+        if (shape[i] == 0) {
+            set_error(std::string(context) + ": shape dimensions must be greater than zero");
+            return false;
+        }
+        if (len > static_cast<size_t>(-1) / shape[i]) {
+            set_error(std::string(context) + ": shape element count overflow");
+            return false;
+        }
         len *= shape[i];
     }
-    return len;
+    *out = len;
+    return true;
 }

@@ -733,9 +733,10 @@ int launch_rms_norm_backward_typed(
     size_t rows,
     size_t dim,
     float eps) {
-    cudaError_t status = cudaMemset(grad_weight, 0, dim * sizeof(float));
-    if (status != cudaSuccess) {
-        set_cuda_error("CUDA typed RMSNorm backward weight grad initialization failed", status);
+    if (!zero_f32_buffer(
+            grad_weight,
+            dim,
+            "CUDA typed RMSNorm backward weight grad initialization failed")) {
         return 1;
     }
 

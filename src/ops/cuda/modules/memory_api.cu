@@ -29,7 +29,9 @@ extern "C" int lumen_cuda_alloc_f32(size_t len, uint64_t* out_handle) {
 
     cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ptr), bytes);
     if (status != cudaSuccess) {
-        clear_cuda_buffer_pool();
+        if (!clear_cuda_buffer_pool("failed to release CUDA buffer pool after allocation failure")) {
+            return 1;
+        }
         status = cudaMalloc(reinterpret_cast<void**>(&ptr), bytes);
     }
     if (status != cudaSuccess) {
@@ -428,4 +430,22 @@ extern "C" void lumen_cuda_free_f32(uint64_t handle, size_t len) {
 
 extern "C" int lumen_cuda_synchronize() {
     return sync_cuda("CUDA synchronize failed") ? 0 : 1;
+}
+
+extern "C" int lumen_cuda_release_cached_memory() {
+    if (!sync_cuda("CUDA cached memory release synchronization failed")) {
+        return 1;
+    }
+    if (!thread_cublas_handle().release("CUDA cuBLAS cache release failed")) {
+        return 1;
+    }
+#if LUMEN_HAS_CUDNN
+    if (!thread_cudnn_handle().release("CUDA cuDNN cache release failed")) {
+        return 1;
+    }
+#endif
+    if (!release_thread_cuda_workspaces("CUDA workspace cache release failed")) {
+        return 1;
+    }
+    return clear_cuda_buffer_pool("CUDA buffer pool release failed") ? 0 : 1;
 }

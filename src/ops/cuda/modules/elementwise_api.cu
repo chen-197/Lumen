@@ -3547,7 +3547,7 @@ extern "C" int lumen_cuda_mul_grad_typed_broadcast_device(
     if (dispatch_status != 0) {
         return 1;
     }
-    return sync_cuda("CUDA typed mixed broadcast mul grad kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA typed mixed broadcast mul grad kernel launch failed") ? 0 : 1;
 }
 
 extern "C" int lumen_cuda_binary_backward_f32_device(
@@ -3655,14 +3655,16 @@ extern "C" int lumen_cuda_add_sub_backward_lastdim_f32_device(
         set_error("CUDA add/sub row-broadcast backward received unsupported op");
         return 1;
     }
-    launch_add_sub_row_broadcast_backward_kernel(
-        handle_to_ptr(grad_handle),
-        handle_to_ptr(grad_lhs_handle),
-        handle_to_ptr(grad_rhs_handle),
-        len,
-        last_dim,
-        vector_on_rhs != 0,
-        op == kBinarySub);
+    if (!launch_add_sub_row_broadcast_backward_kernel(
+            handle_to_ptr(grad_handle),
+            handle_to_ptr(grad_lhs_handle),
+            handle_to_ptr(grad_rhs_handle),
+            len,
+            last_dim,
+            vector_on_rhs != 0,
+            op == kBinarySub)) {
+        return 1;
+    }
     return check_cuda_launch("CUDA add/sub row-broadcast backward kernel launch failed") ? 0 : 1;
 }
 
@@ -3882,7 +3884,7 @@ extern "C" int lumen_cuda_add_sub_broadcast_backward_f32_device(
         ndim,
         out_len,
         op == kBinarySub ? -1.0f : 1.0f);
-    return sync_cuda("CUDA add/sub broadcast backward kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA add/sub broadcast backward kernel launch failed") ? 0 : 1;
 }
 
 extern "C" int lumen_cuda_binary_broadcast_f32_device(
@@ -3908,8 +3910,12 @@ extern "C" int lumen_cuda_binary_broadcast_f32_device(
         set_error("CUDA binary broadcast received invalid metadata");
         return 1;
     }
-    size_t lhs_len = shape_numel(lhs_shape, ndim);
-    size_t rhs_len = shape_numel(rhs_shape, ndim);
+    size_t lhs_len = 0;
+    size_t rhs_len = 0;
+    if (!checked_shape_numel("CUDA binary broadcast lhs shape", lhs_shape, ndim, &lhs_len) ||
+        !checked_shape_numel("CUDA binary broadcast rhs shape", rhs_shape, ndim, &rhs_len)) {
+        return 1;
+    }
     constexpr unsigned int block_size = 256;
     if ((rhs_len == 1 && lhs_len == len) || (lhs_len == 1 && rhs_len == len)) {
         size_t vec_len = len / 4;
@@ -3998,7 +4004,7 @@ extern "C" int lumen_cuda_binary_broadcast_f32_device(
         d_rhs_strides,
         ndim,
         len);
-    return sync_cuda("CUDA binary broadcast kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA binary broadcast kernel launch failed") ? 0 : 1;
 }
 
 extern "C" int lumen_cuda_binary_broadcast_backward_f32_device(
@@ -4157,5 +4163,5 @@ extern "C" int lumen_cuda_binary_broadcast_backward_f32_device(
         d_rhs_strides,
         ndim,
         out_len);
-    return sync_cuda("CUDA binary broadcast backward kernel failed") ? 0 : 1;
+    return check_cuda_launch("CUDA binary broadcast backward kernel launch failed") ? 0 : 1;
 }

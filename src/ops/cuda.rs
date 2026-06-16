@@ -198,6 +198,122 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_release_cached_memory_allows_cublas_recreation() {
+        if !is_available() {
+            return;
+        }
+
+        let run_matmul = || {
+            let lhs = upload_f32(&[1.0, 2.0, 3.0, 4.0]).expect("upload matmul lhs");
+            let rhs = upload_f32(&[5.0, 6.0, 7.0, 8.0]).expect("upload matmul rhs");
+            let output = matmul_f32_no_host(&lhs, &rhs, 2, 2, 2).expect("run CUDA matmul");
+            download_f32(&output).expect("download CUDA matmul output")
+        };
+
+        assert_eq!(run_matmul(), vec![17.0, 23.0, 39.0, 53.0]);
+        release_cached_memory().expect("release CUDA cached memory");
+        assert_eq!(run_matmul(), vec![17.0, 23.0, 39.0, 53.0]);
+        release_cached_memory().expect("release recreated CUDA cached memory");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_sum_lastdim_rejects_dimension_overflow_before_ffi() {
+        if !is_available() {
+            return;
+        }
+
+        let input = upload_f32(&[1.0]).expect("upload sum_lastdim overflow input");
+        let error = sum_lastdim_f32_buffer(&input, usize::MAX, 2)
+            .err()
+            .expect("sum_lastdim dimension overflow must fail");
+        assert!(error.contains("overflow"), "unexpected error: {error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_wrappers_reject_dimension_overflow_before_ffi() {
+        if !is_available() {
+            return;
+        }
+
+        let input = upload_f32(&[1.0]).expect("upload matmul overflow input");
+        for error in [
+            matmul_f32_no_host(&input, &input, usize::MAX, 1, 2)
+                .err()
+                .expect("matmul dimension overflow must fail"),
+            batch_matmul_f32_no_host(&input, &input, usize::MAX, 2, 1, 1)
+                .err()
+                .expect("batch_matmul dimension overflow must fail"),
+            matmul_backward_f32_no_host(&input, &input, &input, usize::MAX, 2, 1)
+                .err()
+                .expect("matmul backward dimension overflow must fail"),
+            batch_matmul_backward_f32_no_host(&input, &input, &input, usize::MAX, 2, 1, 1)
+                .err()
+                .expect("batch_matmul backward dimension overflow must fail"),
+            softmax_lastdim_f32_no_host(&input, usize::MAX, 2)
+                .err()
+                .expect("softmax dimension overflow must fail"),
+        ] {
+            assert!(error.contains("overflow"), "unexpected error: {error}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_i8_matmul_paths_reject_combined_scale_overflow() {
+        if !is_available() {
+            return;
+        }
+
+        fn require_error<T>(result: Result<T, String>, message: &str) -> String {
+            match result {
+                Ok(_) => panic!("{message}"),
+                Err(error) => error,
+            }
+        }
+
+        let input = upload_i8_storage(&[1]).expect("upload i8 scale overflow input");
+        for error in [
+            require_error(
+                matvec_argmax_i8_i8(&input, f32::MAX, &input, 2.0, 1, 1, 1),
+                "I8xI8 argmax combined scale overflow must fail",
+            ),
+            require_error(
+                matmul_i8_buffer_no_host(&input, f32::MAX, &input, 2.0, 1, 1, 1),
+                "I8xI8 matmul combined scale overflow must fail",
+            ),
+            require_error(
+                matmul_i8_typed_output_buffer_no_host(&input, f32::MAX, &input, 2.0, 1, 1, 1),
+                "typed I8xI8 matmul combined scale overflow must fail",
+            ),
+            require_error(
+                batch_matmul_i8_buffer_no_host(&input, f32::MAX, &input, 2.0, 1, 1, 1, 1),
+                "I8xI8 batch_matmul combined scale overflow must fail",
+            ),
+            require_error(
+                batch_matmul_i8_typed_output_buffer_no_host(
+                    &input,
+                    f32::MAX,
+                    &input,
+                    2.0,
+                    1,
+                    1,
+                    1,
+                    1,
+                ),
+                "typed I8xI8 batch_matmul combined scale overflow must fail",
+            ),
+        ] {
+            assert!(
+                error.contains("combined scale overflow"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_dynamic_i8_quantize_matches_reference_and_handles_zero_absmax() {
         if !is_available() {
             return;
@@ -398,6 +514,7 @@ mod imp {
         ) -> c_int;
         fn lumen_cuda_free_f32(handle: u64, len: usize);
         fn lumen_cuda_synchronize() -> c_int;
+        fn lumen_cuda_release_cached_memory() -> c_int;
         fn lumen_cuda_matvec_argmax_f32_device(
             input_handle: u64,
             weight_handle: u64,
@@ -2404,6 +2521,55 @@ mod imp {
         })
     }
 
+    fn validate_matmul_forward_lengths(
+        lhs_len: usize,
+        rhs_len: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        label: &str,
+    ) -> Result<usize, String> {
+        let expected_lhs = checked_len(&format!("{label} lhs length"), &[m, k])?;
+        let expected_rhs = checked_len(&format!("{label} rhs length"), &[n, k])?;
+        let output_len = checked_len(&format!("{label} output length"), &[m, n])?;
+        if lhs_len != expected_lhs {
+            return Err(format!(
+                "{label} lhs length mismatch: expected {expected_lhs}, got {lhs_len}"
+            ));
+        }
+        if rhs_len != expected_rhs {
+            return Err(format!(
+                "{label} rhs length mismatch: expected {expected_rhs}, got {rhs_len}"
+            ));
+        }
+        Ok(output_len)
+    }
+
+    fn validate_batch_matmul_forward_lengths(
+        lhs_len: usize,
+        rhs_len: usize,
+        batch_count: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        label: &str,
+    ) -> Result<usize, String> {
+        let expected_lhs = checked_len(&format!("{label} lhs length"), &[batch_count, m, k])?;
+        let expected_rhs = checked_len(&format!("{label} rhs length"), &[batch_count, k, n])?;
+        let output_len = checked_len(&format!("{label} output length"), &[batch_count, m, n])?;
+        if lhs_len != expected_lhs {
+            return Err(format!(
+                "{label} lhs length mismatch: expected {expected_lhs}, got {lhs_len}"
+            ));
+        }
+        if rhs_len != expected_rhs {
+            return Err(format!(
+                "{label} rhs length mismatch: expected {expected_rhs}, got {rhs_len}"
+            ));
+        }
+        Ok(output_len)
+    }
+
     pub(super) fn range_fits(start: usize, len: usize, total: usize) -> bool {
         start <= total && len <= total - start
     }
@@ -2453,6 +2619,15 @@ mod imp {
 
     pub fn synchronize() -> Result<(), String> {
         let status = unsafe { lumen_cuda_synchronize() };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(last_error_message())
+        }
+    }
+
+    pub fn release_cached_memory() -> Result<(), String> {
+        let status = unsafe { lumen_cuda_release_cached_memory() };
         if status == 0 {
             Ok(())
         } else {
@@ -2653,6 +2828,23 @@ mod imp {
         Ok(())
     }
 
+    fn validate_i8_scale_product(
+        lhs_scale: f32,
+        rhs_scale: f32,
+        label: &str,
+    ) -> Result<(), String> {
+        if !lhs_scale.is_finite() || lhs_scale <= 0.0 {
+            return Err(format!("CUDA {label} lhs scale must be finite and > 0"));
+        }
+        if !rhs_scale.is_finite() || rhs_scale <= 0.0 {
+            return Err(format!("CUDA {label} rhs scale must be finite and > 0"));
+        }
+        if !(lhs_scale * rhs_scale).is_finite() {
+            return Err(format!("CUDA {label} combined scale overflow"));
+        }
+        Ok(())
+    }
+
     pub fn matvec_argmax_bf16_i8(
         input: &CudaBuffer,
         weight: &CudaBuffer,
@@ -2760,8 +2952,7 @@ mod imp {
         hidden_size: usize,
     ) -> Result<Vec<usize>, String> {
         validate_matvec_argmax_dims(input, weight, batch_size, vocab_size, hidden_size, "I8xI8")?;
-        validate_matvec_argmax_scale(input_scale, "I8xI8 input")?;
-        validate_matvec_argmax_scale(weight_scale, "I8xI8 weight")?;
+        validate_i8_scale_product(input_scale, weight_scale, "I8xI8 argmax")?;
 
         let mut out = vec![0usize; batch_size];
         let status = unsafe {
@@ -3201,21 +3392,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status =
             unsafe { lumen_cuda_matmul_f32_device(a.handle(), b.handle(), out.handle(), m, n, k) };
         if status != 0 {
@@ -3231,21 +3409,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA BF16 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA BF16 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_bf16_host_device(a.as_ptr(), b.as_ptr(), out.handle(), m, n, k)
         };
@@ -3262,21 +3427,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA BF16 resident matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA BF16 resident matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status =
             unsafe { lumen_cuda_matmul_bf16_device(a.handle(), b.handle(), out.handle(), m, n, k) };
         if status != 0 {
@@ -3292,21 +3444,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA BF16 typed-output matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA BF16 typed-output matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_storage(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_storage(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_bf16_typed_out_device(a.handle(), b.handle(), out.handle(), m, n, k)
         };
@@ -3323,21 +3462,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA F16 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA F16 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_f16_host_device(a.as_ptr(), b.as_ptr(), out.handle(), m, n, k)
         };
@@ -3354,21 +3480,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA F16 resident matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA F16 resident matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status =
             unsafe { lumen_cuda_matmul_f16_device(a.handle(), b.handle(), out.handle(), m, n, k) };
         if status != 0 {
@@ -3384,21 +3497,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA F16 typed-output matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA F16 typed-output matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_storage(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_storage(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_f16_typed_out_device(a.handle(), b.handle(), out.handle(), m, n, k)
         };
@@ -3417,21 +3517,9 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA I8 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA I8 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        validate_i8_scale_product(a_scale, b_scale, "I8xI8 matmul")?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_i8_host_device(
                 a.as_ptr(),
@@ -3459,21 +3547,9 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA I8 resident matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA I8 resident matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        validate_i8_scale_product(a_scale, b_scale, "I8xI8 matmul")?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_i8_device(
                 a.handle(),
@@ -3500,21 +3576,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA BF16xI8 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA BF16xI8 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_bf16_i8_device(a.handle(), b.handle(), b_scale, out.handle(), m, n, k)
         };
@@ -3532,21 +3595,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA F16xI8 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA F16xI8 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_f16_i8_device(a.handle(), b.handle(), b_scale, out.handle(), m, n, k)
         };
@@ -3564,10 +3614,9 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k || b.len() != n * k {
-            return Err("CUDA dynamic BF16xI8 matmul input length mismatch".to_string());
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len =
+            validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA dynamic matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_bf16_i8_dynamic_device(
                 a.handle(),
@@ -3593,10 +3642,9 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k || b.len() != n * k {
-            return Err("CUDA dynamic F16xI8 matmul input length mismatch".to_string());
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len =
+            validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA dynamic matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_f16_i8_dynamic_device(
                 a.handle(),
@@ -3622,21 +3670,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA F32xI8 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA F32xI8 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_f32_i8_device(a.handle(), b.handle(), b_scale, out.handle(), m, n, k)
         };
@@ -3654,21 +3689,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA I8xBF16 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA I8xBF16 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_i8_bf16_device(a.handle(), a_scale, b.handle(), out.handle(), m, n, k)
         };
@@ -3686,21 +3708,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA I8xF16 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA I8xF16 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_i8_f16_device(a.handle(), a_scale, b.handle(), out.handle(), m, n, k)
         };
@@ -3718,21 +3727,8 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA I8xF32 matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA I8xF32 matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_f32(m * n)?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_matmul_i8_f32_device(a.handle(), a_scale, b.handle(), out.handle(), m, n, k)
         };
@@ -3751,21 +3747,9 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<(CudaBuffer, f32), String> {
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA I8 typed-output matmul A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA I8 typed-output matmul B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let out = alloc_storage(m * n)?;
+        validate_i8_scale_product(a_scale, b_scale, "typed I8xI8 matmul")?;
+        let output_len = validate_matmul_forward_lengths(a.len(), b.len(), m, n, k, "CUDA matmul")?;
+        let out = alloc_storage(output_len)?;
         let mut out_scale = 1.0f32;
         let status = unsafe {
             lumen_cuda_matmul_i8_typed_out_device(
@@ -3807,21 +3791,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_f32_device(
                 lhs.handle(),
@@ -3847,21 +3826,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA BF16 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA BF16 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_bf16_device(
                 lhs.handle(),
@@ -3887,21 +3861,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA BF16 typed-output batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA BF16 typed-output batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_storage(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_storage(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_bf16_typed_out_device(
                 lhs.handle(),
@@ -3927,21 +3896,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA F16 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA F16 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_f16_device(
                 lhs.handle(),
@@ -3967,21 +3931,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA F16 typed-output batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA F16 typed-output batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_storage(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_storage(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_f16_typed_out_device(
                 lhs.handle(),
@@ -4008,21 +3967,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA BF16xI8 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA BF16xI8 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_bf16_i8_device(
                 lhs.handle(),
@@ -4050,21 +4004,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA F16xI8 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA F16xI8 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_f16_i8_device(
                 lhs.handle(),
@@ -4092,21 +4041,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA F32xI8 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA F32xI8 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_f32_i8_device(
                 lhs.handle(),
@@ -4134,21 +4078,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA I8xBF16 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA I8xBF16 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_i8_bf16_device(
                 lhs.handle(),
@@ -4176,21 +4115,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA I8xF16 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA I8xF16 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_i8_f16_device(
                 lhs.handle(),
@@ -4218,21 +4152,16 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA I8xF32 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA I8xF32 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_i8_f32_device(
                 lhs.handle(),
@@ -4262,21 +4191,17 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<CudaBuffer, String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA I8 batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA I8 batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_f32(batch_count * m * n)?;
+        validate_i8_scale_product(lhs_scale, rhs_scale, "I8xI8 batch_matmul")?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_f32(output_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_i8_device(
                 lhs.handle(),
@@ -4306,21 +4231,17 @@ mod imp {
         n: usize,
         k: usize,
     ) -> Result<(CudaBuffer, f32), String> {
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA I8 typed-output batch_matmul lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA I8 typed-output batch_matmul rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let out = alloc_storage(batch_count * m * n)?;
+        validate_i8_scale_product(lhs_scale, rhs_scale, "typed I8xI8 batch_matmul")?;
+        let output_len = validate_batch_matmul_forward_lengths(
+            lhs.len(),
+            rhs.len(),
+            batch_count,
+            m,
+            n,
+            k,
+            "CUDA batch_matmul",
+        )?;
+        let out = alloc_storage(output_len)?;
         let mut out_scale = 1.0f32;
         let status = unsafe {
             lumen_cuda_batch_matmul_i8_typed_out_device(
@@ -4350,29 +4271,9 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        if grad.len() != m * n {
-            return Err(format!(
-                "CUDA matmul backward grad length mismatch: expected {}, got {}",
-                m * n,
-                grad.len()
-            ));
-        }
-        if a.len() != m * k {
-            return Err(format!(
-                "CUDA matmul backward A length mismatch: expected {}, got {}",
-                m * k,
-                a.len()
-            ));
-        }
-        if b.len() != n * k {
-            return Err(format!(
-                "CUDA matmul backward B length mismatch: expected {}, got {}",
-                n * k,
-                b.len()
-            ));
-        }
-        let da = alloc_f32(m * k)?;
-        let db = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) = validate_matmul_backward_lengths(grad, a, b, m, k, n, "F32")?;
+        let da = alloc_f32(lhs_len)?;
+        let db = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_f32_device(
                 grad.handle(),
@@ -4400,9 +4301,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "BF16xI8")?;
-        let d_lhs = alloc_f32(m * k)?;
-        let d_rhs = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) =
+            validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "BF16xI8")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_bf16_i8_device(
                 grad.handle(),
@@ -4431,9 +4333,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "F16xI8")?;
-        let d_lhs = alloc_f32(m * k)?;
-        let d_rhs = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) =
+            validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "F16xI8")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_f16_i8_device(
                 grad.handle(),
@@ -4462,9 +4365,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "F32xI8")?;
-        let d_lhs = alloc_f32(m * k)?;
-        let d_rhs = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) =
+            validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "F32xI8")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_f32_i8_device(
                 grad.handle(),
@@ -4493,9 +4397,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "I8xBF16")?;
-        let d_lhs = alloc_f32(m * k)?;
-        let d_rhs = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) =
+            validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "I8xBF16")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_i8_bf16_device(
                 grad.handle(),
@@ -4524,9 +4429,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "I8xF16")?;
-        let d_lhs = alloc_f32(m * k)?;
-        let d_rhs = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) =
+            validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "I8xF16")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_i8_f16_device(
                 grad.handle(),
@@ -4555,9 +4461,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "I8xF32")?;
-        let d_lhs = alloc_f32(m * k)?;
-        let d_rhs = alloc_f32(n * k)?;
+        let (lhs_len, rhs_len) =
+            validate_matmul_backward_lengths(grad, lhs, rhs, m, k, n, "I8xF32")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_matmul_backward_i8_f32_device(
                 grad.handle(),
@@ -4585,29 +4492,37 @@ mod imp {
         k: usize,
         n: usize,
         dtype: &str,
-    ) -> Result<(), String> {
-        if grad.len() != m * n {
+    ) -> Result<(usize, usize), String> {
+        let expected_grad = checked_len(
+            &format!("CUDA {dtype} matmul backward grad length"),
+            &[m, n],
+        )?;
+        let expected_lhs =
+            checked_len(&format!("CUDA {dtype} matmul backward lhs length"), &[m, k])?;
+        let expected_rhs =
+            checked_len(&format!("CUDA {dtype} matmul backward rhs length"), &[n, k])?;
+        if grad.len() != expected_grad {
             return Err(format!(
                 "CUDA {dtype} matmul backward grad length mismatch: expected {}, got {}",
-                m * n,
+                expected_grad,
                 grad.len()
             ));
         }
-        if lhs.len() != m * k {
+        if lhs.len() != expected_lhs {
             return Err(format!(
                 "CUDA {dtype} matmul backward lhs length mismatch: expected {}, got {}",
-                m * k,
+                expected_lhs,
                 lhs.len()
             ));
         }
-        if rhs.len() != n * k {
+        if rhs.len() != expected_rhs {
             return Err(format!(
                 "CUDA {dtype} matmul backward rhs length mismatch: expected {}, got {}",
-                n * k,
+                expected_rhs,
                 rhs.len()
             ));
         }
-        Ok(())
+        Ok((expected_lhs, expected_rhs))
     }
 
     pub fn batch_matmul_backward_f32_no_host(
@@ -4619,29 +4534,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        if grad.len() != batch_count * m * n {
-            return Err(format!(
-                "CUDA batch_matmul backward grad length mismatch: expected {}, got {}",
-                batch_count * m * n,
-                grad.len()
-            ));
-        }
-        if lhs.len() != batch_count * m * k {
-            return Err(format!(
-                "CUDA batch_matmul backward lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
-                lhs.len()
-            ));
-        }
-        if rhs.len() != batch_count * k * n {
-            return Err(format!(
-                "CUDA batch_matmul backward rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
-                rhs.len()
-            ));
-        }
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F32")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_f32_device(
                 grad.handle(),
@@ -4670,9 +4566,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "BF16")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "BF16")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_bf16_device(
                 grad.handle(),
@@ -4701,9 +4598,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F16")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F16")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_f16_device(
                 grad.handle(),
@@ -4733,9 +4631,18 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "BF16xI8")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) = validate_batch_matmul_backward_lengths(
+            grad,
+            lhs,
+            rhs,
+            batch_count,
+            m,
+            k,
+            n,
+            "BF16xI8",
+        )?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_bf16_i8_device(
                 grad.handle(),
@@ -4766,9 +4673,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F16xI8")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F16xI8")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_f16_i8_device(
                 grad.handle(),
@@ -4799,9 +4707,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F32xI8")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "F32xI8")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_f32_i8_device(
                 grad.handle(),
@@ -4832,9 +4741,18 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8xBF16")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) = validate_batch_matmul_backward_lengths(
+            grad,
+            lhs,
+            rhs,
+            batch_count,
+            m,
+            k,
+            n,
+            "I8xBF16",
+        )?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_i8_bf16_device(
                 grad.handle(),
@@ -4865,9 +4783,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8xF16")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8xF16")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_i8_f16_device(
                 grad.handle(),
@@ -4898,9 +4817,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8xF32")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8xF32")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_i8_f32_device(
                 grad.handle(),
@@ -4933,9 +4853,10 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Result<(CudaBuffer, CudaBuffer), String> {
-        validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8")?;
-        let d_lhs = alloc_f32(batch_count * m * k)?;
-        let d_rhs = alloc_f32(batch_count * k * n)?;
+        let (lhs_len, rhs_len) =
+            validate_batch_matmul_backward_lengths(grad, lhs, rhs, batch_count, m, k, n, "I8")?;
+        let d_lhs = alloc_f32(lhs_len)?;
+        let d_rhs = alloc_f32(rhs_len)?;
         let status = unsafe {
             lumen_cuda_batch_matmul_backward_i8_device(
                 grad.handle(),
@@ -4966,29 +4887,41 @@ mod imp {
         k: usize,
         n: usize,
         dtype: &str,
-    ) -> Result<(), String> {
-        if grad.len() != batch_count * m * n {
+    ) -> Result<(usize, usize), String> {
+        let expected_grad = checked_len(
+            &format!("CUDA {dtype} batch_matmul backward grad length"),
+            &[batch_count, m, n],
+        )?;
+        let expected_lhs = checked_len(
+            &format!("CUDA {dtype} batch_matmul backward lhs length"),
+            &[batch_count, m, k],
+        )?;
+        let expected_rhs = checked_len(
+            &format!("CUDA {dtype} batch_matmul backward rhs length"),
+            &[batch_count, k, n],
+        )?;
+        if grad.len() != expected_grad {
             return Err(format!(
                 "CUDA {dtype} batch_matmul backward grad length mismatch: expected {}, got {}",
-                batch_count * m * n,
+                expected_grad,
                 grad.len()
             ));
         }
-        if lhs.len() != batch_count * m * k {
+        if lhs.len() != expected_lhs {
             return Err(format!(
                 "CUDA {dtype} batch_matmul backward lhs length mismatch: expected {}, got {}",
-                batch_count * m * k,
+                expected_lhs,
                 lhs.len()
             ));
         }
-        if rhs.len() != batch_count * k * n {
+        if rhs.len() != expected_rhs {
             return Err(format!(
                 "CUDA {dtype} batch_matmul backward rhs length mismatch: expected {}, got {}",
-                batch_count * k * n,
+                expected_rhs,
                 rhs.len()
             ));
         }
-        Ok(())
+        Ok((expected_lhs, expected_rhs))
     }
 
     pub fn unary_f32(input: &CudaBuffer, op: UnaryOp) -> Result<(CudaBuffer, Vec<f32>), String> {
@@ -7742,7 +7675,10 @@ mod imp {
         rows: usize,
         last_dim: usize,
     ) -> Result<CudaBuffer, String> {
-        if rows == 0 || last_dim == 0 || input.len() != rows * last_dim {
+        let expected_len = rows
+            .checked_mul(last_dim)
+            .ok_or_else(|| "CUDA sum_lastdim length overflow".to_string())?;
+        if rows == 0 || last_dim == 0 || input.len() != expected_len {
             return Err(format!(
                 "CUDA sum_lastdim length mismatch: input={}, rows={}, last_dim={}",
                 input.len(),
@@ -8443,10 +8379,11 @@ mod imp {
         outer: usize,
         last_dim: usize,
     ) -> Result<(CudaBuffer, Vec<f32>), String> {
-        if input.len() != outer * last_dim {
+        let expected_len = checked_len("CUDA softmax input length", &[outer, last_dim])?;
+        if input.len() != expected_len {
             return Err(format!(
                 "CUDA softmax input length mismatch: expected {}, got {}",
-                outer * last_dim,
+                expected_len,
                 input.len()
             ));
         }
@@ -8466,10 +8403,11 @@ mod imp {
         outer: usize,
         last_dim: usize,
     ) -> Result<CudaBuffer, String> {
-        if input.len() != outer * last_dim {
+        let expected_len = checked_len("CUDA softmax input length", &[outer, last_dim])?;
+        if input.len() != expected_len {
             return Err(format!(
                 "CUDA softmax input length mismatch: expected {}, got {}",
-                outer * last_dim,
+                expected_len,
                 input.len()
             ));
         }
@@ -14815,6 +14753,16 @@ pub fn is_available() -> bool {
 
 pub fn synchronize() -> Result<(), String> {
     imp::synchronize()
+}
+
+/// Releases CUDA caches owned by the calling thread and all currently idle
+/// buffers in the shared allocation pool.
+///
+/// Call this only at an application-controlled idle boundary. It does not
+/// release thread-local caches owned by other live threads, and concurrent CUDA
+/// work may repopulate the shared pool before this function returns.
+pub fn release_cached_memory() -> Result<(), String> {
+    imp::release_cached_memory()
 }
 
 pub fn alloc_f32(len: usize) -> Result<CudaBuffer, String> {

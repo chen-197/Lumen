@@ -232,7 +232,7 @@ cargo run --release --bin lumen -- \
   --tokenizer path/to/tokenizer.json \
   --parameter-dtype i8 \
   --runtime-dtype bf16 \
-  --activation-dtype i8 \
+  --activation-dtype bf16 \
   --kv-cache-dtype bf16 \
   --quantize i8 \
   --allow-parameter-copies
@@ -347,7 +347,7 @@ Path checks are not pure microbenchmarks. They are intended to catch algorithmic
 
 ## Current local performance snapshot
 
-The following numbers are a local development snapshot collected on 2026-06-15, not a universal benchmark claim. They were collected on a Windows machine with:
+The following numbers are a local development snapshot refreshed on 2026-06-16, not a universal benchmark claim. They were collected on a Windows machine with:
 
 - CPU: AMD Ryzen 9 8945HX with Radeon Graphics
 - GPU: NVIDIA GeForce RTX 5070 Laptop GPU, 8 GB VRAM
@@ -371,8 +371,11 @@ This is important because CPU fallback and CPU-side helper paths should not be m
 Commands:
 
 ```bash
-cargo test --release --features "cuda,dev-tools,x86-fp-kernels,x86-int8-kernels"
-cargo test --release --features "cuda,dev-tools,x86-fp-kernels,x86-int8-kernels" -- --ignored --nocapture --test-threads=1
+cargo test --release --all-targets --features "cuda x86-fp-kernels x86-int8-kernels"
+cargo test --release --lib --features "cuda x86-fp-kernels x86-int8-kernels" -- --ignored --nocapture
+cargo test --release --lib --no-default-features --features "x86-fp-kernels x86-int8-kernels"
+cargo clippy --release --all-targets --features "cuda x86-fp-kernels x86-int8-kernels" -- -D warnings
+cargo clippy --release --all-targets --no-default-features --features "x86-fp-kernels x86-int8-kernels" -- -D warnings
 
 # Run once for each of f32/f16/bf16/i8
 cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
@@ -381,11 +384,13 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 Results:
 
-- all-feature regression: `425 passed; 0 failed; 9 ignored`;
+- CUDA all-target regression: library `436 passed; 0 failed; 9 ignored`, quantization tool `4 passed; 0 failed`;
 - all 9 explicit performance smoke tests: `9 passed; 0 failed`;
-- CPU/CUDA forward, backward, F32-gradient, optimizer, and supported Llama training checks passed for F32, F16, BF16, and I8;
-- the built-in real-model path checker passed on CPU and CUDA with identical 32-token F32 output and `replacement=0`, `control=0`;
-- native I8 Adam state and a fully I8 Llama runtime are intentionally skipped; I8 parameters with F32 Adam state and the standalone training path passed.
+- CPU-only regression: `249 passed; 0 failed; 6 ignored`;
+- CUDA and CPU clippy with `-D warnings`: passed;
+- TinyLlama real-model inference passed for CPU and CUDA across F32, F16, BF16, and I8 weights + BF16 runtime, with `replacement=0` and `control=0` in every generated text sample;
+- CPU/CUDA forward, backward, F32-gradient, optimizer, compact Llama F32/F16/BF16 training checks, and standalone I8 parameter-training checks passed;
+- native I8 Adam state and a fully I8 Llama runtime are intentionally skipped; I8 parameters with F32 optimizer state and the standalone training path passed.
 
 Representative same-dtype CPU/CUDA differences:
 
@@ -407,6 +412,32 @@ Observed loss trend for the 24-step SGD + momentum path:
 | I8 | `9.0 -> 4e-4` | `9.0 -> 4e-4` | 3 |
 
 The traces are not monotonic, but all have a clear downward trend, which is the intended SGD-path criterion.
+
+Latest 2026-06-16 path timing for this tiny 24-step SGD + momentum check:
+
+| DType | CPU us/step | CUDA us/step | Notes |
+|---|---:|---:|---|
+| F32 | 125.76 | 2646.00 | CUDA gradients and momentum state remained F32 |
+| F16 | 134.58 | 2443.51 | low-precision parameters, F32 gradients |
+| BF16 | 47.66 | 2533.73 | low-precision parameters, F32 gradients |
+| I8 | 119.11 | 2287.18 | quantized parameters, F32 gradients |
+
+Compact Llama training checks also passed for F32/F16/BF16 on CPU and CUDA. The I8 compact Llama training case is skipped by design because the compact Llama bench constructor requires floating runtime and KV-cache dtypes; I8 parameter training is covered by `path.train`.
+
+Latest 2026-06-16 performance-smoke highlights:
+
+| Case | Result |
+|---|---:|
+| BF16 same-dtype dot/dot2/dot3 backend | `x86-avx512bf16` |
+| BF16 dot / dot2 / dot3 | 0.305 / 0.348 / 0.426 us |
+| F16 same-dtype dot/dot2/dot3 backend | `x86-avx2-f16c` |
+| F16 dot / dot2 / dot3 | 0.402 / 0.428 / 0.463 us |
+| I8 same-dtype dot2 / dot3 backend | `x86-avx512bw` |
+| I8 dot2 / dot3 | 0.237 / 0.340 us |
+| CUDA dynamic I8 quantize, 1M elements | 239.2 us |
+| CUDA I8xI8 matmul, F32 out | 24.6 us, `kernel_err=0.00002` |
+| CUDA I8xI8 matmul, typed I8 out | 120.3 us, `quant_err=1.00382` |
+| CUDA I8xI8 batch matmul, F32 / typed I8 out | 13.4 / 90.1 us |
 
 ### CPU kernel snapshot
 
@@ -532,20 +563,20 @@ All enabled correctness checks passed. CUDA is strongest on dense, fused, softma
 
 ### End-to-end Llama prefill/decode snapshot
 
-The TinyLlama rerun used `prompt_tokens=43`, `max_gen=64`, greedy decode, 3 measured runs, 1 warmup, and `--stop-on-eos --stop-on-chat-marker`.
+The TinyLlama rerun used the local `tokenizer.json` and `model.safetensors`, `prompt_tokens=48`, `max_gen=24`, greedy decode, 1 measured run, 0 warmup, and `--stop-on-eos --stop-on-chat-marker`.
 
 | Configuration | Device | Prefill forward | Decode forward | End-to-end decode | Total |
 |---|---|---:|---:|---:|---:|
-| F32 | CPU | 40.47 tok/s | 10.67 tok/s | 9.06 tok/s | 7065.28 ms |
-| F16 | CPU | 135.83 tok/s | 14.30 tok/s | 13.34 tok/s | 4796.53 ms |
-| BF16 | CPU | 146.23 tok/s | 15.48 tok/s | 14.44 tok/s | 4432.81 ms |
-| I8 weights + BF16 runtime | CPU | 143.73 tok/s | 24.28 tok/s | 21.79 tok/s | 2937.74 ms |
-| F32 | CUDA | 998.25 tok/s | 41.72 tok/s | 40.45 tok/s | 1582.36 ms |
-| F16 | CUDA | 944.64 tok/s | 48.16 tok/s | 46.38 tok/s | 1379.94 ms |
-| BF16 | CUDA | 990.78 tok/s | 48.59 tok/s | 46.88 tok/s | 1365.20 ms |
-| I8 weights + BF16 runtime | CUDA | 310.71 tok/s | 64.92 tok/s | 56.69 tok/s | 1129.04 ms |
+| F32 | CPU | 40.38 tok/s | 9.76 tok/s | 6.57 tok/s | 3650.59 ms |
+| F16 | CPU | 128.27 tok/s | 15.12 tok/s | 12.22 tok/s | 1963.40 ms |
+| BF16 | CPU | 127.66 tok/s | 15.20 tok/s | 12.27 tok/s | 1956.53 ms |
+| I8 weights + BF16 runtime | CPU | 178.60 tok/s | 22.69 tok/s | 18.07 tok/s | 1327.90 ms |
+| F32 | CUDA | 302.18 tok/s | 42.20 tok/s | 32.92 tok/s | 729.12 ms |
+| F16 | CUDA | 159.93 tok/s | 32.56 tok/s | 22.79 tok/s | 1052.92 ms |
+| BF16 | CUDA | 163.08 tok/s | 29.39 tok/s | 21.53 tok/s | 1114.71 ms |
+| I8 weights + BF16 runtime | CUDA | 222.98 tok/s | 67.49 tok/s | 41.93 tok/s | 572.42 ms |
 
-The separate real-model F32 path checker generated identical fluent CPU/CUDA text for 32 tokens, with `replacement=0` and `control=0`; measured inference throughput was 7.16 tok/s on CPU and 36.20 tok/s on CUDA. The performance rerun shows that real generation is still decode-bound: CUDA decode-forward accounts for roughly 85-97% of measured time. Device-only CUDA hot paths now rely on default-stream ordering and synchronize only at explicit host-observation boundaries. Same-dtype F16/BF16 decode QKV and GateUp use cuBLAS `GemmEx` while preserving low-precision storage. Aligned and sufficiently large batched I8×I8 use signed-I8 cuBLAS GEMM with exact I32 accumulation. Inference-only F16/BF16×I8 prefill uses device-resident row-wise activation quantization before INT8 GEMM, and fused QKV/GateUp reuse the quantized activation. Training keeps direct F16/BF16×I8 forward computation so its F32 backward differentiates the same function. This raised I8+BF16 prefill from 258.52 to 310.71 tok/s while preserving fluent output with `replacement=0` and `control=0`; mixed-I8 prefill is still materially slower than native F16/BF16 GEMM.
+All eight generated samples were fluent for the short prompt and reported `replacement=0`, `trailing_replacement=0`, and `control=0`. F32/F16/BF16 produced the same opening text about the Transformer architecture storing intermediate results; I8+BF16 produced a slightly different but still coherent sentence about storing intermediate results in Transformer-based models. The rerun shows that real generation is still decode-bound: decode-forward dominates measured CUDA time. Device-only CUDA hot paths now rely on default-stream ordering and synchronize only at explicit host-observation boundaries. Same-dtype F16/BF16 decode QKV and GateUp use cuBLAS `GemmEx` while preserving low-precision storage. Aligned and sufficiently large batched I8×I8 use signed-I8 cuBLAS GEMM with exact I32 accumulation. Inference-only F16/BF16×I8 prefill uses device-resident row-wise activation quantization before INT8 GEMM, and fused QKV/GateUp reuse the quantized activation. Training keeps direct F16/BF16×I8 forward computation so its F32 backward differentiates the same function. Mixed-I8 prefill remains materially slower than native F16/BF16 GEMM, but I8+BF16 has the best measured end-to-end decode throughput in this short real-model run.
 
 ---
 

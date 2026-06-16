@@ -72,6 +72,11 @@ pub fn synchronize() -> Result<(), String> {
     Err("CUDA feature is disabled".to_string())
 }
 
+/// No-op counterpart of the CUDA cache-release API for non-CUDA builds.
+pub fn release_cached_memory() -> Result<(), String> {
+    Ok(())
+}
+
 pub fn should_accelerate_matmul(_m: usize, _n: usize, _k: usize) -> bool {
     false
 }

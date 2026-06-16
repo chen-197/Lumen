@@ -232,7 +232,7 @@ cargo run --release --bin lumen -- \
   --tokenizer path/to/tokenizer.json \
   --parameter-dtype i8 \
   --runtime-dtype bf16 \
-  --activation-dtype i8 \
+  --activation-dtype bf16 \
   --kv-cache-dtype bf16 \
   --quantize i8 \
   --allow-parameter-copies
@@ -347,7 +347,7 @@ Path checks 不是纯 microbenchmark，它们主要用于发现算法路径问�
 
 ## 当前本地性能快照
 
-下面数字是 2026-06-15 的本地开发快照，不是通用 benchmark 结论。测试机器大致配置：
+下面数字是 2026-06-16 刷新的本地开发快照，不是通用 benchmark 结论。测试机器大致配置：
 
 - CPU：AMD Ryzen 9 8945HX with Radeon Graphics
 - GPU：NVIDIA GeForce RTX 5070 Laptop GPU，8 GB VRAM
@@ -371,8 +371,11 @@ backend: float=x86-avx512 bf16_bf16=x86-avx512bf16 f16_f16=x86-avx2-f16c
 执行命令：
 
 ```bash
-cargo test --release --features "cuda,dev-tools,x86-fp-kernels,x86-int8-kernels"
-cargo test --release --features "cuda,dev-tools,x86-fp-kernels,x86-int8-kernels" -- --ignored --nocapture --test-threads=1
+cargo test --release --all-targets --features "cuda x86-fp-kernels x86-int8-kernels"
+cargo test --release --lib --features "cuda x86-fp-kernels x86-int8-kernels" -- --ignored --nocapture
+cargo test --release --lib --no-default-features --features "x86-fp-kernels x86-int8-kernels"
+cargo clippy --release --all-targets --features "cuda x86-fp-kernels x86-int8-kernels" -- -D warnings
+cargo clippy --release --all-targets --no-default-features --features "x86-fp-kernels x86-int8-kernels" -- -D warnings
 
 # 对 f32/f16/bf16/i8 分别执行
 cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
@@ -381,11 +384,13 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 结果：
 
-- 全特性回归：`425 passed; 0 failed; 9 ignored`；
+- CUDA all-target 回归：库测试 `436 passed; 0 failed; 9 ignored`，量化工具 `4 passed; 0 failed`；
 - 9 个显式性能烟测单独执行：`9 passed; 0 failed`；
-- F32、F16、BF16、I8 的 CPU/CUDA 前向、反向、F32 梯度、优化器和支持的 Llama 训练检查均通过；
-- 内置真实模型 path checker 在 CPU/CUDA 均通过，32-token F32 输出一致，且 `replacement=0`、`control=0`；
-- I8 的原生 Adam 状态和完整 I8 Llama runtime 按设计跳过；I8 参数配 F32 Adam 状态及独立训练路径通过。
+- CPU-only 回归：`249 passed; 0 failed; 6 ignored`；
+- CUDA 与 CPU 两套 clippy `-D warnings` 均通过；
+- TinyLlama 真实模型推理在 CPU/CUDA 的 F32、F16、BF16、I8 weights + BF16 runtime 全部通过，每组生成文本均为 `replacement=0`、`control=0`；
+- F32、F16、BF16、I8 的 CPU/CUDA 前向、反向、F32 梯度、优化器、紧凑 Llama F32/F16/BF16 训练检查，以及独立 I8 参数训练检查均通过；
+- I8 的原生 Adam 状态和完整 I8 Llama runtime 按设计跳过；I8 参数配 F32 optimizer state 及独立训练路径通过。
 
 代表性 CPU/CUDA 同 dtype 数值差异：
 
@@ -407,6 +412,32 @@ BF16 前向误差明显高于 F16，这是 BF16 尾数精度与不同归约顺�
 | I8 | `9.0 -> 4e-4` | `9.0 -> 4e-4` | 3 |
 
 这些轨迹不是单调下降，但都有清晰下降趋势，符合随机梯度下降类训练的检查目标。
+
+2026-06-16 本轮 24 步 SGD + momentum 小训练路径计时：
+
+| DType | CPU us/step | CUDA us/step | 说明 |
+|---|---:|---:|---|
+| F32 | 125.76 | 2646.00 | CUDA 梯度与 momentum state 保持 F32 |
+| F16 | 134.58 | 2443.51 | 低精度参数，F32 梯度 |
+| BF16 | 47.66 | 2533.73 | 低精度参数，F32 梯度 |
+| I8 | 119.11 | 2287.18 | 量化参数，F32 梯度 |
+
+紧凑 Llama 训练检查在 F32/F16/BF16 的 CPU 与 CUDA 上也通过。I8 紧凑 Llama 训练 case 按设计跳过，因为该 bench 构造器要求浮点 runtime 与 KV-cache dtype；I8 参数训练由 `path.train` 覆盖。
+
+2026-06-16 本轮性能烟测要点：
+
+| Case | Result |
+|---|---:|
+| BF16 same-dtype dot/dot2/dot3 backend | `x86-avx512bf16` |
+| BF16 dot / dot2 / dot3 | 0.305 / 0.348 / 0.426 us |
+| F16 same-dtype dot/dot2/dot3 backend | `x86-avx2-f16c` |
+| F16 dot / dot2 / dot3 | 0.402 / 0.428 / 0.463 us |
+| I8 same-dtype dot2 / dot3 backend | `x86-avx512bw` |
+| I8 dot2 / dot3 | 0.237 / 0.340 us |
+| CUDA dynamic I8 quantize，1M elements | 239.2 us |
+| CUDA I8xI8 matmul，F32 out | 24.6 us，`kernel_err=0.00002` |
+| CUDA I8xI8 matmul，typed I8 out | 120.3 us，`quant_err=1.00382` |
+| CUDA I8xI8 batch matmul，F32 / typed I8 out | 13.4 / 90.1 us |
 
 ### CPU kernel 快照
 
@@ -532,20 +563,20 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 ### 端到端 Llama prefill/decode 快照
 
-本轮 TinyLlama 使用 `prompt_tokens=43`、`max_gen=64`、greedy decode、3 次测量、1 次预热，并开启 `--stop-on-eos --stop-on-chat-marker`。
+本轮 TinyLlama 使用本地 `tokenizer.json` 与 `model.safetensors`，`prompt_tokens=48`、`max_gen=24`、greedy decode、1 次测量、0 次预热，并开启 `--stop-on-eos --stop-on-chat-marker`。
 
 | Configuration | Device | Prefill forward | Decode forward | End-to-end decode | Total |
 |---|---|---:|---:|---:|---:|
-| F32 | CPU | 40.47 tok/s | 10.67 tok/s | 9.06 tok/s | 7065.28 ms |
-| F16 | CPU | 135.83 tok/s | 14.30 tok/s | 13.34 tok/s | 4796.53 ms |
-| BF16 | CPU | 146.23 tok/s | 15.48 tok/s | 14.44 tok/s | 4432.81 ms |
-| I8 weights + BF16 runtime | CPU | 143.73 tok/s | 24.28 tok/s | 21.79 tok/s | 2937.74 ms |
-| F32 | CUDA | 998.25 tok/s | 41.72 tok/s | 40.45 tok/s | 1582.36 ms |
-| F16 | CUDA | 944.64 tok/s | 48.16 tok/s | 46.38 tok/s | 1379.94 ms |
-| BF16 | CUDA | 990.78 tok/s | 48.59 tok/s | 46.88 tok/s | 1365.20 ms |
-| I8 weights + BF16 runtime | CUDA | 310.71 tok/s | 64.92 tok/s | 56.69 tok/s | 1129.04 ms |
+| F32 | CPU | 40.38 tok/s | 9.76 tok/s | 6.57 tok/s | 3650.59 ms |
+| F16 | CPU | 128.27 tok/s | 15.12 tok/s | 12.22 tok/s | 1963.40 ms |
+| BF16 | CPU | 127.66 tok/s | 15.20 tok/s | 12.27 tok/s | 1956.53 ms |
+| I8 weights + BF16 runtime | CPU | 178.60 tok/s | 22.69 tok/s | 18.07 tok/s | 1327.90 ms |
+| F32 | CUDA | 302.18 tok/s | 42.20 tok/s | 32.92 tok/s | 729.12 ms |
+| F16 | CUDA | 159.93 tok/s | 32.56 tok/s | 22.79 tok/s | 1052.92 ms |
+| BF16 | CUDA | 163.08 tok/s | 29.39 tok/s | 21.53 tok/s | 1114.71 ms |
+| I8 weights + BF16 runtime | CUDA | 222.98 tok/s | 67.49 tok/s | 41.93 tok/s | 572.42 ms |
 
-单独运行的真实模型 F32 path checker 在 CPU/CUDA 上生成了完全一致且流畅的 32-token 文本，`replacement=0`、`control=0`；测得 CPU 推理吞吐为 7.16 tok/s，CUDA 为 36.20 tok/s。本轮性能结果表明真实生成仍明显 decode-bound：CUDA decode-forward 占测量时间约 85-97%。Device-only CUDA 热路径现在依靠默认 stream 保序，只在显式 Host 观察边界同步；同 dtype F16/BF16 decode QKV 和 GateUp 使用 cuBLAS `GemmEx` 计算并保持低精度存储。对齐且计算量足够大的 batched I8×I8 使用 signed-I8 cuBLAS GEMM 并精确累加到 I32；仅推理使用的 F16/BF16×I8 prefill 在设备端逐行动态量化激活后执行 INT8 GEMM，fused QKV/GateUp 会复用量化后的激活。训练路径保留直接 F16/BF16×I8 前向，使 F32 backward 对应同一个前向函数。该路径将 I8+BF16 prefill 从 258.52 提升到 310.71 tok/s，同时保持流畅输出，且 `replacement=0`、`control=0`；但 mixed-I8 prefill 仍明显慢于原生 F16/BF16 GEMM。
+8 组生成样本在这个短 prompt 上都流畅，均报告 `replacement=0`、`trailing_replacement=0`、`control=0`。F32/F16/BF16 生成了相同的开头，说明 Transformer 架构会存储中间结果；I8+BF16 生成了略有差异但仍连贯的句子，说明 Transformer-based 模型通过存储中间结果提升性能。本轮结果表明真实生成仍明显 decode-bound：decode-forward 主导 CUDA 测量时间。Device-only CUDA 热路径现在依靠默认 stream 保序，只在显式 Host 观察边界同步；同 dtype F16/BF16 decode QKV 和 GateUp 使用 cuBLAS `GemmEx` 计算并保持低精度存储。对齐且计算量足够大的 batched I8×I8 使用 signed-I8 cuBLAS GEMM 并精确累加到 I32；仅推理使用的 F16/BF16×I8 prefill 在设备端逐行动态量化激活后执行 INT8 GEMM，fused QKV/GateUp 会复用量化后的激活。训练路径保留直接 F16/BF16×I8 前向，使 F32 backward 对应同一个前向函数。Mixed-I8 prefill 仍明显慢于原生 F16/BF16 GEMM，但 I8+BF16 在本轮短真实模型推理中拥有最高 end-to-end decode throughput。
 
 ---
 

@@ -652,7 +652,7 @@ extern "C" int lumen_cuda_embedding_backward_f32_device(
         vocab_size,
         embed_dim,
         d_status);
-    if (!sync_cuda("CUDA embedding backward kernel failed")) {
+    if (!check_cuda_launch("CUDA embedding backward kernel launch failed")) {
         return 1;
     }
     if (!read_embedding_status(
