@@ -8048,6 +8048,49 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_2d_row_broadcast_i8_mul_backward_matches_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+
+        let matrix = make_training_tensor_with_dtype(
+            &[2, 3],
+            vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0],
+            DType::I8,
+        )
+        .to_cuda();
+        let row =
+            make_training_tensor_with_dtype(&[1, 3], vec![0.5, 3.0, -1.5], DType::I8).to_cuda();
+
+        let loss = sum(&(matrix.clone() * row.clone()));
+        loss.backward();
+
+        assert!(matrix.cloned_cuda_f32_grad().is_some());
+        assert!(row.cloned_cuda_f32_grad().is_some());
+        assert!(!matrix.has_host_f32_data());
+        assert!(!row.has_host_f32_data());
+
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let matrix_grad = matrix.grad().expect("CUDA 2D row-broadcast matrix grad");
+        let row_grad = row.grad().expect("CUDA 2D row-broadcast row grad");
+        for (got, expected) in matrix_grad.iter().zip([0.5f32, 3.0, -1.5, 0.5, 3.0, -1.5]) {
+            assert!((got - expected).abs() <= 0.05);
+        }
+        for (got, expected) in row_grad.iter().zip([4.0f32, -6.0, 2.5]) {
+            assert!(
+                (got - expected).abs() <= 0.08,
+                "I8 2D row grad got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     #[ignore]
     fn cuda_lowp_binary_forward_perf_smoke() {
         if !crate::ops::cuda::is_available() {

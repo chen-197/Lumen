@@ -347,12 +347,12 @@ Path checks 不是纯 microbenchmark，它们主要用于发现算法路径问�
 
 ## 当前本地性能快照
 
-下面数字是 2026-06-16 刷新的本地开发快照，不是通用 benchmark 结论。测试机器大致配置：
+下面数字是 2026-06-17 刷新的本地开发快照，不是通用 benchmark 结论。测试机器大致配置：
 
 - CPU：AMD Ryzen 9 8945HX with Radeon Graphics
-- GPU：NVIDIA GeForce RTX 5070 Laptop GPU，8 GB VRAM
+- GPU：NVIDIA GeForce RTX 5070 Laptop GPU，8151 MiB VRAM
 - RAM：32 GB
-- NVIDIA driver / runtime CUDA：`610.47` / CUDA `13.3`
+- NVIDIA driver / runtime CUDA：`610.62` / CUDA `13.3`
 - CUDA toolkit：13.0
 - cuDNN：9.21.1
 - Rust：stable MSVC toolchain，`rustc 1.95.0`
@@ -384,7 +384,7 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 # 对 f32/f16/bf16/i8 分别执行
 cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin cuda_cpu_bench -- \
-  --suite path --check --case path.train --dtype DTYPE --runs 1 --warmup 0
+  --suite path --dtype DTYPE --check
 
 # 对 f32/f16/bf16/i8+bf16 分别在 CPU/CUDA 执行
 cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" --bin prefill_decode_bench -- \
@@ -399,7 +399,7 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 结果：
 
-- CUDA all-target 回归：库测试 `440 passed; 0 failed; 9 ignored`，空 main binary 测试目标通过，量化工具 `4 passed; 0 failed`；
+- CUDA all-target 回归：库测试 `441 passed; 0 failed; 9 ignored`，空 main binary 测试目标通过，量化工具 `4 passed; 0 failed`；
 - 9 个显式性能烟测单独执行：`9 passed; 0 failed`；
 - CPU-only 回归：`251 passed; 0 failed; 6 ignored`；
 - CUDA 与 CPU 两套 clippy `-D warnings` 均通过；
@@ -417,7 +417,7 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 BF16 前向误差明显高于 F16，这是 BF16 尾数精度与不同归约顺序的预期结果；梯度保持 F32。I8 前向数字是量化路径检查，不表示与浮点计算逐值等价。
 
-训练路径现在对每种 dtype 覆盖 21 条 CPU/CUDA 路径：scalar SGD、MLP、GELU MLP、Dropout MLP、BatchMatMul、gated MLP、Embedding classifier、shape/view chain、shared/tied parameter reuse、gradient accumulation、SGD 批量 optimizer 更新、RMSNorm、RNN、GRU、LSTM、Adam、Adam 批量 optimizer 更新、Conv2D、Conv2D+MaxPool、SelfAttention、紧凑 Transformer block。I8 attention 和 Transformer block 检查使用 I8 参数与 BF16 runtime/KV-cache 数据。
+训练路径现在对每种 dtype 覆盖 23 条 CPU/CUDA 路径：scalar SGD、MLP、GELU MLP、Dropout MLP、BatchMatMul、gated MLP、residual/gated branch mixing、row-broadcast affine parameters、Embedding classifier、shape/view chain、shared/tied parameter reuse、gradient accumulation、SGD 批量 optimizer 更新、RMSNorm、RNN、GRU、LSTM、Adam、Adam 批量 optimizer 更新、Conv2D、Conv2D+MaxPool、SelfAttention、紧凑 Transformer block。I8 attention 和 Transformer block 检查使用 I8 参数与 BF16 runtime/KV-cache 数据。
 
 24 步 SGD + momentum 训练路径观察到的 loss 趋势：
 
@@ -430,46 +430,46 @@ BF16 前向误差明显高于 F16，这是 BF16 尾数精度与不同归约顺�
 
 这些轨迹不是单调下降，但都有清晰下降趋势，符合随机梯度下降类训练的检查目标。
 
-2026-06-16 本轮 24 步 SGD + momentum 小训练路径计时：
+2026-06-17 本轮 24 步 SGD + momentum 小训练路径计时：
 
 | DType | CPU us/step | CUDA us/step | 说明 |
 |---|---:|---:|---|
-| F32 | 51.72 | 2197.00 | CUDA 梯度与 momentum state 保持 F32 |
-| F16 | 79.85 | 2778.32 | 低精度参数，F32 梯度 |
-| BF16 | 51.07 | 2282.88 | 低精度参数，F32 梯度 |
-| I8 | 134.49 | 2433.09 | 量化参数，F32 梯度 |
+| F32 | 93.35 | 2405.87 | CUDA 梯度与 momentum state 保持 F32 |
+| F16 | 114.42 | 2399.96 | 低精度参数，F32 梯度 |
+| BF16 | 136.10 | 2577.54 | 低精度参数，F32 梯度 |
+| I8 | 86.48 | 2515.04 | 量化参数，F32 梯度 |
 
 批量 optimizer 路径计时快照。两个 CUDA 路径都会断言实际使用 pointer-batched optimizer kernel，同时梯度和 optimizer state 保持 F32：
 
 | 路径 | DType | CPU us/step | CUDA us/step | Loss first -> last |
 |---|---:|---:|---:|---:|
-| SGD momentum 批量更新 | F32 | 576.59 | 2992.01 | `0.042612 -> 0.035707` |
-| SGD momentum 批量更新 | F16 | 3133.51 | 4016.52 | `0.042624 -> 0.035717` |
-| SGD momentum 批量更新 | BF16 | 2022.76 | 1878.86 | `0.042695 -> 0.035773` |
-| SGD momentum 批量更新 | I8 | 1940.68 | 4371.20 | `0.042661 -> 0.037453` |
-| Adam 批量更新 | F32 | 807.70 | 1610.01 | `0.032873 -> 0.000897` |
-| Adam 批量更新 | F16 | 2955.92 | 1607.95 | `0.032875 -> 0.000898` |
-| Adam 批量更新 | BF16 | 2394.90 | 1625.08 | `0.032754 -> 0.000915` |
-| Adam 批量更新 | I8 | 2052.58 | 3984.49 | `0.032910 -> 0.017634` |
+| SGD momentum 批量更新 | F32 | 719.18 | 2081.82 | `0.042612 -> 0.035707` |
+| SGD momentum 批量更新 | F16 | 3292.39 | 1805.36 | `0.042624 -> 0.035717` |
+| SGD momentum 批量更新 | BF16 | 2774.70 | 2048.36 | `0.042695 -> 0.035773` |
+| SGD momentum 批量更新 | I8 | 2388.58 | 2838.08 | `0.042661 -> 0.037453` |
+| Adam 批量更新 | F32 | 980.41 | 1301.71 | `0.032873 -> 0.000897` |
+| Adam 批量更新 | F16 | 3457.87 | 1466.73 | `0.032875 -> 0.000898` |
+| Adam 批量更新 | BF16 | 2910.04 | 1728.02 | `0.032754 -> 0.000915` |
+| Adam 批量更新 | I8 | 2559.43 | 3499.50 | `0.032910 -> 0.017634` |
 
 这些是 8 个 Linear shard 组成的小型端到端训练图，因此 CUDA 在 optimizer 更新之外仍常受 kernel launch 和 dispatch 开销主导。
 
-2026-06-16 本轮性能烟测要点：
+2026-06-17 本轮性能烟测要点：
 
 | Case | Result |
 |---|---:|
 | BF16 same-dtype dot/dot2/dot3 backend | `x86-avx512bf16` |
-| BF16 dot / dot2 / dot3 | 0.411 / 0.549 / 0.620 us |
+| BF16 dot / dot2 / dot3 | 0.308 / 0.450 / 0.630 us |
 | F16 same-dtype dot/dot2/dot3 backend | `x86-avx2-f16c` |
-| F16 dot / dot2 / dot3 | 0.382 / 0.405 / 0.448 us |
+| F16 dot / dot2 / dot3 | 0.393 / 0.441 / 0.460 us |
 | I8 same-dtype dot2 / dot3 backend | `x86-avx512bw` |
-| I8 dot2 / dot3 | 0.260 / 0.332 us |
-| CPU batch matmul backward，BF16xBF16 / I8xI8 / BF16xI8 / F32xI8 | 2019.7 / 391.0 / 325.7 / 274.4 us |
-| CUDA dynamic I8 quantize，1M elements | 99.0 us |
-| CUDA lowp sum，1M elements F32 / F16 / BF16 / I8 | 1374.4 / 319.9 / 303.6 / 394.3 us |
-| CUDA I8xI8 matmul，F32 out | 18.5 us，`kernel_err=0.00002` |
-| CUDA I8xI8 matmul，typed I8 out | 82.0 us，`quant_err=1.00382` |
-| CUDA I8xI8 batch matmul，F32 / typed I8 out | 13.5 / 69.9 us |
+| I8 dot2 / dot3 | 0.347 / 0.351 us |
+| CPU batch matmul backward，BF16xBF16 / I8xI8 / BF16xI8 / F32xI8 | 2335.0 / 400.9 / 476.1 / 808.2 us |
+| CUDA dynamic I8 quantize，1M elements | 87.1 us |
+| CUDA lowp sum，1M elements F32 / F16 / BF16 / I8 | 240.3 / 162.0 / 134.2 / 140.4 us |
+| CUDA I8xI8 matmul，F32 out | 22.4 us，`kernel_err=0.00002` |
+| CUDA I8xI8 matmul，typed I8 out | 117.9 us，`quant_err=1.00382` |
+| CUDA I8xI8 batch matmul，F32 / typed I8 out | 14.3 / 86.4 us |
 
 ### CPU kernel 快照
 
@@ -489,20 +489,20 @@ int8=x86-avx512bw  i8_i8=x86-avx512bw  avx512fp16=unavailable-or-stable-build
 
 | Case | Reference | Fast path | Speedup / ratio | Max abs diff |
 |---|---:|---:|---:|---:|
-| `dot_bf16_bf16` | 1.67 us | 0.06 us | 29.84x | `7.02e-4` |
-| `dot2_bf16_bf16` | 2.92 us | 0.07 us | 38.87x | `7.02e-4` |
-| `dot3_bf16_bf16` | 3.73 us | 0.08 us | 45.50x | `7.02e-4` |
-| `dot_f16_f16` | 4.15 us | 0.09 us | 44.11x | `1.114e-3` |
-| `dot2_f16_f16` | 5.79 us | 0.10 us | 55.15x | `1.114e-3` |
-| `dot3_f16_f16` | 7.49 us | 0.11 us | 65.17x | `1.114e-3` |
-| `dot2_i8_i8` | 0.52 us | 0.07 us | 7.72x | exact I32 accumulation |
-| `dot3_i8_i8` | 0.69 us | 0.10 us | 6.69x | exact I32 accumulation |
-| `tensor_matmul_i8` | 480.66 us | 74.89 us | 6.42x | quantized reference |
-| `fused_qkv_i8` | 557.47 us | 74.89 us | 0.13x time | `0` |
-| `fused_gate_i8` | 1499.38 us | 132.29 us | 0.09x time | `0` |
-| `sgd_bf16` | 2.48 us | 2.18 us | 0.88x time | `0` |
-| `adam_bf16` | 14.59 us | 11.51 us | 0.79x time | `0` |
-| `adam_i8` | 14.59 us | 15.45 us | 1.06x time | `0` |
+| `dot_bf16_bf16` | 1.81 us | 0.06 us | 29.69x | `7.02e-4` |
+| `dot2_bf16_bf16` | 3.18 us | 0.08 us | 39.80x | `7.02e-4` |
+| `dot3_bf16_bf16` | 4.41 us | 0.09 us | 47.98x | `7.02e-4` |
+| `dot_f16_f16` | 4.79 us | 0.10 us | 47.94x | `1.114e-3` |
+| `dot2_f16_f16` | 7.40 us | 0.11 us | 65.45x | `1.114e-3` |
+| `dot3_f16_f16` | 9.50 us | 0.12 us | 77.22x | `1.114e-3` |
+| `dot2_i8_i8` | 0.56 us | 0.07 us | 7.70x | exact I32 accumulation |
+| `dot3_i8_i8` | 1.17 us | 0.12 us | 9.45x | exact I32 accumulation |
+| `tensor_matmul_i8` | 481.46 us | 73.68 us | 6.53x | quantized reference |
+| `fused_qkv_i8` | 589.79 us | 80.27 us | 0.14x time | `0` |
+| `fused_gate_i8` | 1521.28 us | 132.94 us | 0.09x time | `0` |
+| `sgd_bf16` | 2.53 us | 2.29 us | 0.90x time | `0` |
+| `adam_bf16` | 15.18 us | 11.65 us | 0.77x time | `0` |
+| `adam_i8` | 15.18 us | 15.75 us | 1.04x time | `0` |
 
 真 AVX-512 FP16 路径仍需 nightly Rust 与 `x86-fp-kernels-nightly`。Cached copy 是否有利取决于具体路径：本轮 cached BF16/F16 tensor matmul 更快，而 cached fused F16 QKV/GateUp 明显慢于 no-copy。
 
@@ -520,28 +520,28 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 | Operator | F32 | F16 | BF16 | I8 |
 |---|---:|---:|---:|---:|
-| `matmul.forward` | 2.094 / 0.053 / 39.66x | 1.184 / 0.032 / 36.99x | 0.644 / 0.025 / 25.96x | 1.946 / 0.097 / 20.12x |
-| `batch_matmul.forward` | 0.009 / 0.014 / 0.64x | 0.041 / 0.023 / 1.74x | 0.016 / 0.012 / 1.27x | 0.133 / 0.078 / 1.71x |
-| `matmul.backward` | 6.839 / 0.578 / 11.83x | 19.856 / 0.785 / 25.30x | 4.765 / 0.758 / 6.29x | 4.307 / 0.665 / 6.47x |
-| `elementwise.mul_add.forward` | 0.232 / 0.160 / 1.45x | 0.166 / 0.156 / 1.06x | 0.304 / 0.148 / 2.05x | 0.392 / 0.335 / 1.17x |
-| `elementwise.mul_add.backward` | 2.978 / 1.117 / 2.67x | 2.926 / 1.284 / 2.28x | 2.773 / 0.994 / 2.79x | 3.096 / 1.167 / 2.65x |
-| `binary.row_broadcast.forward` | 1.259 / 0.079 / 15.95x | 0.091 / 0.076 / 1.19x | 0.150 / 0.078 / 1.93x | 0.195 / 0.153 / 1.27x |
-| `elementwise.mixed_mul.backward` | 2.361 / 0.989 / 2.39x | 2.084 / 3.625 / 0.57x | 1.925 / 0.647 / 2.98x | 3.091 / 0.700 / 4.42x |
-| `unary.silu.forward` | 0.285 / 0.078 / 3.68x | 2.717 / 0.075 / 36.37x | 1.077 / 0.080 / 13.46x | 10.602 / 0.202 / 52.49x |
-| `unary.silu.backward` | 4.066 / 1.518 / 2.68x | 4.304 / 1.111 / 3.87x | 4.769 / 1.105 / 4.31x | 4.833 / 1.302 / 3.71x |
-| `fused_gateup.forward` | 2.454 / 0.039 / 62.60x | 1.421 / 0.130 / 10.95x | 2.253 / 0.112 / 20.06x | 3.429 / 0.111 / 31.03x |
-| `fused_qkv.prefill` | 0.897 / 0.078 / 11.55x | 0.918 / 0.181 / 5.07x | 0.955 / 0.085 / 11.18x | 1.043 / 0.130 / 8.00x |
-| `softmax.forward` | 0.456 / 0.078 / 5.87x | 3.228 / 0.172 / 18.79x | 1.023 / 0.152 / 6.71x | 5.240 / 0.154 / 33.98x |
-| `fused_softmax.forward` | 2.122 / 0.072 / 29.43x | 4.901 / 0.091 / 53.56x | 2.820 / 0.090 / 31.36x | 4.655 / 0.088 / 53.14x |
-| `cross_entropy.forward` | 0.542 / 0.075 / 7.19x | 1.131 / 0.197 / 5.76x | 0.992 / 0.221 / 4.49x | 9.869 / 0.200 / 49.44x |
-| `mse_loss.forward` | 0.425 / 0.115 / 3.68x | 0.827 / 0.095 / 8.75x | 0.891 / 0.071 / 12.57x | 6.447 / 0.102 / 63.02x |
-| `optimizer.sgd.step` | 0.128 / 0.109 / 1.17x | 0.108 / 0.107 / 1.01x | 0.122 / 0.144 / 0.85x | 0.119 / 0.144 / 0.82x |
-| `optimizer.adam_f32_state.step` | 0.781 / 0.266 / 2.94x | 0.300 / 0.257 / 1.16x | 0.287 / 0.284 / 1.01x | 0.285 / 0.224 / 1.27x |
-| `conv2d.forward` | 0.750 / 0.369 / 2.03x | 0.866 / 0.218 / 3.97x | 0.835 / 0.225 / 3.71x | 0.705 / 0.223 / 3.16x |
-| `conv2d.backward` | 2.440 / 1.671 / 1.46x | 3.090 / 1.319 / 2.34x | 2.515 / 1.331 / 1.89x | 2.777 / 1.623 / 1.71x |
-| `self_attention.forward` | 0.371 / 0.220 / 1.69x | 0.722 / 0.807 / 0.89x | 0.554 / 0.400 / 1.38x | skipped |
-| `llama.prefill_decode` | 1.719 / 1.677 / 1.02x | 2.013 / 2.109 / 0.95x | 1.562 / 1.049 / 1.49x | skipped |
-| `llama.train.step` | 3.966 / 2.143 / 1.85x | 3.565 / 4.265 / 0.84x | 3.344 / 4.403 / 0.76x | skipped |
+| `matmul.forward` | 2.327 / 0.098 / 23.67x | 1.113 / 0.034 / 32.56x | 0.642 / 0.068 / 9.45x | 2.947 / 0.124 / 23.67x |
+| `batch_matmul.forward` | 0.009 / 0.021 / 0.43x | 0.054 / 0.013 / 4.20x | 0.017 / 0.016 / 1.10x | 0.155 / 0.075 / 2.08x |
+| `matmul.backward` | 8.131 / 0.647 / 12.56x | 26.064 / 0.787 / 33.13x | 5.270 / 0.614 / 8.59x | 4.551 / 0.769 / 5.92x |
+| `elementwise.mul_add.forward` | 0.431 / 0.160 / 2.69x | 0.220 / 0.189 / 1.16x | 0.347 / 0.158 / 2.20x | 0.455 / 0.324 / 1.40x |
+| `elementwise.mul_add.backward` | 3.260 / 1.188 / 2.74x | 3.399 / 1.308 / 2.60x | 3.596 / 1.170 / 3.07x | 3.092 / 1.394 / 2.22x |
+| `binary.row_broadcast.forward` | 1.342 / 0.077 / 17.38x | 0.110 / 0.110 / 1.00x | 0.165 / 0.087 / 1.90x | 0.215 / 0.168 / 1.28x |
+| `elementwise.mixed_mul.backward` | 2.461 / 0.684 / 3.60x | 3.432 / 0.683 / 5.02x | 2.438 / 0.917 / 2.66x | 2.026 / 0.833 / 2.43x |
+| `unary.silu.forward` | 0.310 / 0.097 / 3.20x | 3.074 / 0.081 / 38.00x | 1.107 / 0.088 / 12.51x | 12.138 / 0.181 / 66.98x |
+| `unary.silu.backward` | 4.674 / 1.262 / 3.71x | 6.126 / 1.385 / 4.42x | 5.582 / 1.534 / 3.64x | 4.882 / 1.197 / 4.08x |
+| `fused_gateup.forward` | 2.716 / 0.062 / 43.74x | 1.818 / 0.115 / 15.77x | 3.168 / 0.134 / 23.67x | 3.588 / 0.137 / 26.23x |
+| `fused_qkv.prefill` | 1.031 / 0.090 / 11.45x | 1.148 / 0.098 / 11.68x | 1.041 / 0.083 / 12.51x | 1.058 / 0.318 / 3.33x |
+| `softmax.forward` | 0.526 / 0.088 / 5.99x | 3.706 / 0.163 / 22.67x | 1.236 / 0.165 / 7.49x | 6.165 / 0.160 / 38.43x |
+| `fused_softmax.forward` | 2.215 / 0.081 / 27.51x | 6.282 / 0.121 / 51.70x | 3.091 / 0.085 / 36.28x | 4.754 / 0.083 / 57.00x |
+| `cross_entropy.forward` | 0.503 / 0.076 / 6.61x | 1.735 / 0.239 / 7.26x | 1.346 / 0.195 / 6.90x | 9.043 / 0.252 / 35.83x |
+| `mse_loss.forward` | 0.498 / 0.073 / 6.86x | 1.025 / 0.072 / 14.20x | 1.149 / 0.077 / 14.87x | 8.404 / 0.083 / 101.01x |
+| `optimizer.sgd.step` | 0.167 / 0.090 / 1.85x | 0.141 / 0.119 / 1.19x | 0.186 / 0.139 / 1.34x | 0.138 / 0.140 / 0.98x |
+| `optimizer.adam_f32_state.step` | 0.849 / 0.249 / 3.41x | 0.370 / 0.273 / 1.35x | 0.541 / 0.252 / 2.15x | 0.319 / 0.261 / 1.22x |
+| `conv2d.forward` | 1.033 / 0.664 / 1.56x | 0.831 / 0.246 / 3.37x | 1.020 / 0.232 / 4.39x | 0.810 / 0.255 / 3.18x |
+| `conv2d.backward` | 3.073 / 1.745 / 1.76x | 3.099 / 1.238 / 2.50x | 3.203 / 1.760 / 1.82x | 2.581 / 1.638 / 1.58x |
+| `self_attention.forward` | 0.337 / 0.280 / 1.20x | 0.853 / 0.528 / 1.61x | 0.771 / 0.482 / 1.60x | skipped |
+| `llama.prefill_decode` | 2.346 / 0.926 / 2.53x | 2.234 / 1.213 / 1.84x | 2.055 / 1.050 / 1.96x | skipped |
+| `llama.train.step` | 3.592 / 2.555 / 1.41x | 3.887 / 2.983 / 1.30x | 4.477 / 3.042 / 1.47x | skipped |
 
 所有已启用 correctness checks 均通过。CUDA 在 dense、fused、softmax、loss 和较大 broadcast 工作上优势最明显；单 token QKV decode、极小 broadcast reduction、batched optimizer，以及部分紧凑 attention/训练 case 仍受 launch 或 dispatch 开销主导。
 
@@ -551,14 +551,14 @@ cargo run --release --features "dev-tools cuda x86-fp-kernels x86-int8-kernels" 
 
 | Configuration | Device | Prefill forward | Decode forward | End-to-end decode | Total |
 |---|---|---:|---:|---:|---:|
-| F32 | CPU | 40.30 tok/s | 11.23 tok/s | 6.31 tok/s | 2379.06 ms |
-| F16 | CPU | 136.67 tok/s | 18.05 tok/s | 13.11 tok/s | 1143.85 ms |
-| BF16 | CPU | 163.92 tok/s | 18.00 tok/s | 13.61 tok/s | 1101.90 ms |
-| I8 weights + BF16 runtime | CPU | 198.42 tok/s | 26.33 tok/s | 19.17 tok/s | 782.40 ms |
-| F32 | CUDA | 272.01 tok/s | 45.27 tok/s | 30.82 tok/s | 486.69 ms |
-| F16 | CUDA | 155.84 tok/s | 29.12 tok/s | 19.10 tok/s | 785.49 ms |
-| BF16 | CUDA | 165.50 tok/s | 29.24 tok/s | 19.54 tok/s | 767.56 ms |
-| I8 weights + BF16 runtime | CUDA | 220.54 tok/s | 73.38 tok/s | 37.90 tok/s | 395.82 ms |
+| F32 | CPU | 38.70 tok/s | 10.41 tok/s | 5.94 tok/s | 2526.79 ms |
+| F16 | CPU | 126.20 tok/s | 16.54 tok/s | 11.96 tok/s | 1253.83 ms |
+| BF16 | CPU | 134.25 tok/s | 16.75 tok/s | 12.40 tok/s | 1209.48 ms |
+| I8 weights + BF16 runtime | CPU | 198.61 tok/s | 25.83 tok/s | 18.91 tok/s | 793.35 ms |
+| F32 | CUDA | 259.89 tok/s | 42.01 tok/s | 28.87 tok/s | 519.61 ms |
+| F16 | CUDA | 140.60 tok/s | 27.88 tok/s | 17.91 tok/s | 837.63 ms |
+| BF16 | CUDA | 159.69 tok/s | 27.53 tok/s | 18.55 tok/s | 808.65 ms |
+| I8 weights + BF16 runtime | CUDA | 207.70 tok/s | 67.52 tok/s | 35.28 tok/s | 425.18 ms |
 
 8 组生成样本在这个短 prompt 上都流畅，均报告 `replacement=0`、`trailing_replacement=0`、`control=0`。所有配置生成了同一句：“Neural networks are a powerful tool for analyzing and understanding complex data.” 本轮结果表明真实生成仍明显 decode-bound：decode-forward 主导测量时间，而 I8 weights + BF16 runtime/activation/KV cache 在这次短真实模型运行中拥有最高 end-to-end decode throughput。
 

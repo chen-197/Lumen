@@ -205,6 +205,24 @@ fn tensor_no_grad_with_dtype(
     .to_device(device)
 }
 
+fn parameter_with_dtype(
+    shape: &[usize],
+    values: Vec<f32>,
+    dtype: DType,
+    device: Device,
+    i8_scale: f32,
+) -> Tensor {
+    let data = Array::from_shape_vec(IxDyn(shape), values)
+        .expect("path parameter shape mismatch")
+        .into_dyn();
+    if dtype == DType::I8 {
+        Tensor::parameter_with_quantization(data, ParameterQuantization::Int8.with_scale(i8_scale))
+    } else {
+        Tensor::parameter_with_dtype(data, dtype)
+    }
+    .to_device(device)
+}
+
 fn init_linear(linear: &Linear, weight: Vec<f32>, bias: Vec<f32>, dtype: DType) {
     linear.weight.set_array_f32_with_dtype(
         Array::from_shape_vec(IxDyn(&[linear.out_features, linear.in_features]), weight)
@@ -781,6 +799,156 @@ fn gated_mlp_training_path_stats(dtype: DType, device: Device) -> TrainingPathSt
     }
     if device == Device::Cuda {
         lumen::ops::cuda::synchronize().expect("CUDA sync after gated-MLP path training failed");
+    }
+
+    TrainingPathStats {
+        losses,
+        elapsed: start.elapsed(),
+    }
+}
+
+fn residual_mix_training_path_stats(dtype: DType, device: Device) -> TrainingPathStats {
+    let _cuda_enabled_guard =
+        (device == Device::Cuda).then(|| lumen::ops::cuda::set_enabled_scoped(true));
+    let _strict_guard = (device == Device::Cuda).then(|| set_strict_device_execution_scoped(true));
+
+    let x = tensor_no_grad_with_dtype(
+        &[4, 4],
+        vec![
+            0.70, -0.42, 0.54, 0.18, -0.50, 0.64, 0.22, 0.46, 0.58, 0.14, -0.38, 0.34, -0.24, 0.48,
+            0.40, -0.18,
+        ],
+        dtype,
+        device,
+    );
+    let y = tensor_no_grad_with_dtype(
+        &[4, 4],
+        vec![
+            0.34, -0.18, 0.26, 0.10, -0.08, 0.30, 0.18, 0.22, 0.38, -0.04, 0.24, 0.16, 0.12, 0.28,
+            0.06, 0.32,
+        ],
+        dtype,
+        device,
+    );
+
+    let trunk = Linear::new_no_bias_with_dtype(4, 4, dtype);
+    let skip = Linear::new_no_bias_with_dtype(4, 4, dtype);
+    let gate = Linear::new_no_bias_with_dtype(4, 4, dtype);
+    init_linear_weight(&trunk, patterned_values(16, 0.120, 11), dtype, 0.005);
+    init_linear_weight(&skip, patterned_values(16, 0.080, 13), dtype, 0.004);
+    init_linear_weight(&gate, patterned_values(16, 0.140, 17), dtype, 0.005);
+    if device == Device::Cuda {
+        trunk.to_cuda();
+        skip.to_cuda();
+        gate.to_cuda();
+    }
+
+    let mut params = trunk.parameters();
+    params.extend(skip.parameters());
+    params.extend(gate.parameters());
+    let lr = match dtype {
+        DType::F32 | DType::F16 => 1.0,
+        DType::BF16 => 1.1,
+        DType::I8 => 8.0,
+    };
+    let mut opt = SGD::new_with_dtype(params.clone(), lr, DType::F32).with_momentum(0.20);
+    let silu = SiLU::new();
+    let mut losses = Vec::new();
+
+    if device == Device::Cuda {
+        lumen::ops::cuda::synchronize()
+            .expect("CUDA sync before residual-mix path training failed");
+    }
+    let start = Instant::now();
+    for _ in 0..72 {
+        let trunk_out = trunk.forward(x.clone());
+        let skip_out = skip.forward(x.clone());
+        let gate_act = silu.forward(gate.forward(x.clone()));
+        let pred = (trunk_out + skip_out) * gate_act;
+        let loss = MSELoss::apply(&pred, &y);
+        losses.push(scalar_value(&loss));
+        loss.backward();
+        if device == Device::Cuda {
+            assert_cuda_f32_grads_without_host(&params, "path.train.residual_mix");
+        }
+        opt.step();
+        if device == Device::Cuda {
+            assert_cuda_f32_momentum_state(&opt, params.len(), "path.train.residual_mix");
+        }
+        opt.zero_grad();
+    }
+    if device == Device::Cuda {
+        lumen::ops::cuda::synchronize().expect("CUDA sync after residual-mix path training failed");
+    }
+
+    TrainingPathStats {
+        losses,
+        elapsed: start.elapsed(),
+    }
+}
+
+fn broadcast_affine_training_path_stats(dtype: DType, device: Device) -> TrainingPathStats {
+    let _cuda_enabled_guard =
+        (device == Device::Cuda).then(|| lumen::ops::cuda::set_enabled_scoped(true));
+    let _strict_guard = (device == Device::Cuda).then(|| set_strict_device_execution_scoped(true));
+    let runtime_dtype = if dtype == DType::I8 {
+        DType::BF16
+    } else {
+        dtype
+    };
+
+    let x = tensor_no_grad_with_dtype(
+        &[4, 4],
+        vec![
+            0.42, -0.26, 0.36, 0.18, -0.32, 0.48, 0.22, 0.30, 0.54, 0.12, -0.40, 0.28, -0.18, 0.34,
+            0.46, -0.12,
+        ],
+        runtime_dtype,
+        device,
+    );
+    let y = tensor_no_grad_with_dtype(
+        &[4, 4],
+        vec![
+            0.24, -0.08, 0.22, 0.12, -0.04, 0.26, 0.16, 0.18, 0.30, 0.02, 0.20, 0.14, 0.08, 0.22,
+            0.10, 0.24,
+        ],
+        runtime_dtype,
+        device,
+    );
+
+    let scale = parameter_with_dtype(&[1, 4], vec![0.55, 0.35, 0.45, 0.60], dtype, device, 0.005);
+    let bias = parameter_with_dtype(&[1, 4], vec![0.02, -0.04, 0.03, 0.01], dtype, device, 0.001);
+    let params = vec![scale.clone(), bias.clone()];
+    let lr = match dtype {
+        DType::F32 | DType::F16 => 0.35,
+        DType::BF16 => 0.38,
+        DType::I8 => 1.8,
+    };
+    let mut opt = SGD::new_with_dtype(params.clone(), lr, DType::F32).with_momentum(0.20);
+    let mut losses = Vec::new();
+
+    if device == Device::Cuda {
+        lumen::ops::cuda::synchronize()
+            .expect("CUDA sync before broadcast-affine path training failed");
+    }
+    let start = Instant::now();
+    for _ in 0..64 {
+        let pred = &(&x * &scale) + &bias;
+        let loss = MSELoss::apply(&pred, &y);
+        losses.push(scalar_value(&loss));
+        loss.backward();
+        if device == Device::Cuda {
+            assert_cuda_f32_grads_without_host(&params, "path.train.broadcast_affine");
+        }
+        opt.step();
+        if device == Device::Cuda {
+            assert_cuda_f32_momentum_state(&opt, params.len(), "path.train.broadcast_affine");
+        }
+        opt.zero_grad();
+    }
+    if device == Device::Cuda {
+        lumen::ops::cuda::synchronize()
+            .expect("CUDA sync after broadcast-affine path training failed");
     }
 
     TrainingPathStats {
@@ -2459,6 +2627,96 @@ fn run_gated_mlp_training_path_check(args: &Args) {
     }
 }
 
+fn run_residual_mix_training_path_check(args: &Args) {
+    let cpu_stats = residual_mix_training_path_stats(args.dtype, Device::Cpu);
+    let required_fraction = match args.dtype {
+        DType::F32 | DType::F16 => 0.88,
+        DType::BF16 => 0.92,
+        DType::I8 => 0.99,
+    };
+    assert_loss_trace_improves_below(
+        "path.train.residual_mix.cpu",
+        &cpu_stats.losses,
+        required_fraction,
+    );
+    println!(
+        "path.train.residual_mix.cpu ok first={:.6} last={:.6} best={:.6} increases={} steps={} total_ms={:.3} us_per_step={:.2} note=residual Linear branch plus SiLU-gated multiplicative branch with f32 optimizer state",
+        cpu_stats.first(),
+        cpu_stats.last(),
+        cpu_stats.best(),
+        count_loss_increases(&cpu_stats.losses),
+        cpu_stats.steps(),
+        cpu_stats.elapsed.as_secs_f64() * 1e3,
+        cpu_stats.us_per_step()
+    );
+
+    if lumen::ops::cuda::is_available() {
+        let cuda_stats = residual_mix_training_path_stats(args.dtype, Device::Cuda);
+        assert_loss_trace_improves_below(
+            "path.train.residual_mix.cuda",
+            &cuda_stats.losses,
+            required_fraction,
+        );
+        println!(
+            "path.train.residual_mix.cuda ok first={:.6} last={:.6} best={:.6} increases={} steps={} total_ms={:.3} us_per_step={:.2} note=resident lowp residual/gated branches with f32 gradients and f32 momentum state",
+            cuda_stats.first(),
+            cuda_stats.last(),
+            cuda_stats.best(),
+            count_loss_increases(&cuda_stats.losses),
+            cuda_stats.steps(),
+            cuda_stats.elapsed.as_secs_f64() * 1e3,
+            cuda_stats.us_per_step()
+        );
+    } else {
+        println!("path.train.residual_mix.cuda skipped cuda_available=false");
+    }
+}
+
+fn run_broadcast_affine_training_path_check(args: &Args) {
+    let cpu_stats = broadcast_affine_training_path_stats(args.dtype, Device::Cpu);
+    let required_fraction = match args.dtype {
+        DType::F32 | DType::F16 => 0.35,
+        DType::BF16 => 0.40,
+        DType::I8 => 0.45,
+    };
+    assert_loss_trace_improves_below(
+        "path.train.broadcast_affine.cpu",
+        &cpu_stats.losses,
+        required_fraction,
+    );
+    println!(
+        "path.train.broadcast_affine.cpu ok first={:.6} last={:.6} best={:.6} increases={} steps={} total_ms={:.3} us_per_step={:.2} note=row-broadcast scale/bias params with f32 optimizer state",
+        cpu_stats.first(),
+        cpu_stats.last(),
+        cpu_stats.best(),
+        count_loss_increases(&cpu_stats.losses),
+        cpu_stats.steps(),
+        cpu_stats.elapsed.as_secs_f64() * 1e3,
+        cpu_stats.us_per_step()
+    );
+
+    if lumen::ops::cuda::is_available() {
+        let cuda_stats = broadcast_affine_training_path_stats(args.dtype, Device::Cuda);
+        assert_loss_trace_improves_below(
+            "path.train.broadcast_affine.cuda",
+            &cuda_stats.losses,
+            required_fraction,
+        );
+        println!(
+            "path.train.broadcast_affine.cuda ok first={:.6} last={:.6} best={:.6} increases={} steps={} total_ms={:.3} us_per_step={:.2} note=resident lowp row-broadcast scale/bias params with f32 gradients and f32 momentum state",
+            cuda_stats.first(),
+            cuda_stats.last(),
+            cuda_stats.best(),
+            count_loss_increases(&cuda_stats.losses),
+            cuda_stats.steps(),
+            cuda_stats.elapsed.as_secs_f64() * 1e3,
+            cuda_stats.us_per_step()
+        );
+    } else {
+        println!("path.train.broadcast_affine.cuda skipped cuda_available=false");
+    }
+}
+
 fn run_classifier_training_path_check(args: &Args) {
     let cpu_stats = classifier_training_path_stats(args.dtype, Device::Cpu);
     let required_fraction = if args.dtype == DType::I8 { 0.98 } else { 0.95 };
@@ -3327,6 +3585,16 @@ pub(super) fn run_path_checks(args: &Args) {
         && should_run_path("path.train.gated_mlp")
     {
         run_gated_mlp_training_path_check(args);
+    }
+    if matches!(args.suite, Suite::All | Suite::Backward | Suite::Path)
+        && should_run_path("path.train.residual_mix")
+    {
+        run_residual_mix_training_path_check(args);
+    }
+    if matches!(args.suite, Suite::All | Suite::Backward | Suite::Path)
+        && should_run_path("path.train.broadcast_affine")
+    {
+        run_broadcast_affine_training_path_check(args);
     }
     if matches!(args.suite, Suite::All | Suite::Backward | Suite::Path)
         && should_run_path("path.train.classifier")

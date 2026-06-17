@@ -2640,8 +2640,8 @@ extern "C" int lumen_cuda_mul_grad_i8_lastdim_device(
 
     launch_mul_grad_i8_row_broadcast_kernel(
         handle_to_ptr(grad_handle),
-        reinterpret_cast<const int8_t*>(lhs_handle),
-        reinterpret_cast<const int8_t*>(rhs_handle),
+        reinterpret_cast<const int8_t*>(handle_to_ptr(lhs_handle)),
+        reinterpret_cast<const int8_t*>(handle_to_ptr(rhs_handle)),
         lhs_scale,
         rhs_scale,
         handle_to_ptr(grad_lhs_handle),
