@@ -13,3 +13,4 @@
 #include "modules/shape_cache_attention_api.cu"
 #include "modules/fused_rope_api.cu"
 #include "modules/cnn_pool_api.cu"
+#include "modules/generic_nn.cu"

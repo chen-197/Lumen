@@ -483,6 +483,56 @@ __global__ void rms_norm_backward_kernel(
 }
 
 template <typename InputT, typename WeightT>
+__global__ void rms_norm_typed_row_kernel(
+    const InputT* input,
+    float input_scale,
+    const WeightT* weight,
+    float weight_scale,
+    float* out,
+    size_t rows,
+    size_t dim,
+    float eps) {
+    // A block cooperates on each row, including batch-one decode. All lanes
+    // participate in the reduction, with zero contributions for tail columns.
+    __shared__ float warp_sums[8];
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int warp = threadIdx.x >> 5;
+    for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const size_t row_offset = row * dim;
+        float sum_sq = 0.0f;
+        for (size_t j = threadIdx.x; j < dim; j += blockDim.x) {
+            float x = typed_value_to_float(input, input_scale, row_offset + j);
+            sum_sq += x * x;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, offset);
+        }
+        if (lane == 0) {
+            warp_sums[warp] = sum_sq;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            sum_sq = lane < (blockDim.x >> 5) ? warp_sums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, offset);
+            }
+            if (lane == 0) {
+                warp_sums[0] = rsqrtf(sum_sq / static_cast<float>(dim) + eps);
+            }
+        }
+        __syncthreads();
+        const float inv_rms = warp_sums[0];
+        for (size_t j = threadIdx.x; j < dim; j += blockDim.x) {
+            float x = typed_value_to_float(input, input_scale, row_offset + j);
+            float w = typed_value_to_float(weight, weight_scale, j);
+            out[row_offset + j] = x * inv_rms * w;
+        }
+        // Grid-stride rows must not overwrite the shared reciprocal early.
+        __syncthreads();
+    }
+}
+
+template <typename InputT, typename WeightT>
 __global__ void rms_norm_typed_kernel(
     const InputT* input,
     float input_scale,
@@ -640,6 +690,14 @@ int launch_rms_norm_typed(
     size_t rows,
     size_t dim,
     float eps) {
+    if (dim >= 32) {
+        const unsigned int block_size = dim <= 128 ? 128 : 256;
+        const unsigned int grid_size = static_cast<unsigned int>(
+            rows < 65535 ? rows : 65535);
+        rms_norm_typed_row_kernel<InputT, WeightT><<<grid_size, block_size>>>(
+            input, input_scale, weight, weight_scale, out, rows, dim, eps);
+        return check_cuda_launch("CUDA cooperative typed RMSNorm kernel launch failed") ? 0 : 1;
+    }
     constexpr int block_size = 128;
     const unsigned int grid_size = linear_grid_size(rows, block_size);
     rms_norm_typed_kernel<InputT, WeightT><<<grid_size, block_size>>>(
@@ -1543,6 +1601,248 @@ __global__ void repeat_kv_backward_kernel(
     }
 }
 
+template <int Chunks>
+__device__ __forceinline__ void attention_warp_accumulate(
+    const float* q_values, float* context, const float* k_base, const float* v_base,
+    size_t dim, size_t first, size_t visible, size_t step, float scale,
+    float& maximum, float& denominator) {
+    const unsigned int lane = threadIdx.x & 31;
+    for (size_t pos = first; pos < visible; pos += step) {
+        float score = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            const size_t column = lane + c * 32;
+            if (column < dim) {
+                score += q_values[c] * k_base[pos * dim + column];
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score += __shfl_down_sync(0xffffffffu, score, offset);
+        }
+        float previous_scale = 0.0f;
+        float weight = 0.0f;
+        if (lane == 0) {
+            score *= scale;
+            if (score > maximum) {
+                previous_scale = denominator > 0.0f ? expf(maximum - score) : 0.0f;
+                weight = 1.0f;
+                denominator = denominator * previous_scale + 1.0f;
+                maximum = score;
+            } else {
+                previous_scale = 1.0f;
+                weight = expf(score - maximum);
+                denominator += weight;
+            }
+        }
+        previous_scale = __shfl_sync(0xffffffffu, previous_scale, 0);
+        weight = __shfl_sync(0xffffffffu, weight, 0);
+        #pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            const size_t column = lane + c * 32;
+            if (column < dim) {
+                context[c] = context[c] * previous_scale + weight * v_base[pos * dim + column];
+            }
+        }
+    }
+}
+
+template <int Chunks, int WarpsPerBlock, bool Prefill>
+__global__ void warp_attention_online_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t q_seq_len,
+    size_t active_seq_len,
+    size_t cache_seq_len,
+    size_t dim,
+    size_t n_rep,
+    size_t past_len,
+    size_t rows,
+    float scale,
+    int is_causal) {
+    const unsigned int lane = threadIdx.x & 31;
+    const size_t warp = threadIdx.x >> 5;
+    const size_t begin = static_cast<size_t>(blockIdx.x) * WarpsPerBlock + warp;
+    const size_t stride = static_cast<size_t>(gridDim.x) * WarpsPerBlock;
+    for (size_t row = begin; row < rows; row += stride) {
+        const size_t sq = Prefill ? row % q_seq_len : 0;
+        const size_t head_row = Prefill ? row / q_seq_len : row;
+        const size_t hh = head_row % num_heads;
+        const size_t batch = head_row / num_heads;
+        const size_t hk = hh / n_rep;
+        const float* q_row = q + row * dim;
+        const float* k_base = k + (batch * num_kv_heads + hk) * cache_seq_len * dim;
+        const float* v_base = v + (batch * num_kv_heads + hk) * cache_seq_len * dim;
+        float q_values[Chunks];
+        float context[Chunks];
+        #pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            const size_t column = lane + c * 32;
+            q_values[c] = column < dim ? q_row[column] : 0.0f;
+            context[c] = 0.0f;
+        }
+        float maximum = -FLT_MAX;
+        float denominator = 0.0f;
+        size_t visible = active_seq_len;
+        if (Prefill && is_causal != 0) {
+            const size_t causal_limit = past_len + sq + 1;
+            visible = visible < causal_limit ? visible : causal_limit;
+        }
+        attention_warp_accumulate<Chunks>(q_values, context, k_base, v_base,
+            dim, 0, visible, 1, scale, maximum, denominator);
+        denominator = __shfl_sync(0xffffffffu, denominator, 0);
+        const float inverse = 1.0f / (denominator + 1e-9f);
+        const size_t output_row = Prefill
+            ? (batch * q_seq_len + sq) * num_heads + hh : row;
+        #pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            const size_t column = lane + c * 32;
+            if (column < dim) {
+                out[output_row * dim + column] = context[c] * inverse;
+            }
+        }
+    }
+}
+
+template <int Chunks, int Warps>
+__global__ void split_kv_attention_kernel(
+    const float* q, const float* k, const float* v, float* out,
+    size_t num_heads, size_t num_kv_heads, size_t active_seq_len,
+    size_t cache_seq_len, size_t dim, size_t n_rep, size_t rows, float scale) {
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int warp = threadIdx.x >> 5;
+    extern __shared__ float shared[];
+    float* partial_context = shared;
+    float* maxima = partial_context + Warps * dim;
+    float* denominators = maxima + Warps;
+    for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const size_t batch = row / num_heads;
+        const size_t hk = (row % num_heads) / n_rep;
+        const float* k_base = k + (batch * num_kv_heads + hk) * cache_seq_len * dim;
+        const float* v_base = v + (batch * num_kv_heads + hk) * cache_seq_len * dim;
+        float q_values[Chunks];
+        float context[Chunks];
+        #pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            const size_t column = lane + c * 32;
+            q_values[c] = column < dim ? q[row * dim + column] : 0.0f;
+            context[c] = 0.0f;
+        }
+        float maximum = -FLT_MAX;
+        float denominator = 0.0f;
+        attention_warp_accumulate<Chunks>(q_values, context, k_base, v_base,
+            dim, warp, active_seq_len, Warps, scale, maximum, denominator);
+        #pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            const size_t column = lane + c * 32;
+            if (column < dim) {
+                partial_context[warp * dim + column] = context[c];
+            }
+        }
+        if (lane == 0) {
+            maxima[warp] = maximum;
+            denominators[warp] = denominator;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float local_max = lane < Warps ? maxima[lane] : -FLT_MAX;
+            maximum = local_max;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset));
+            }
+            maximum = __shfl_sync(0xffffffffu, maximum, 0);
+            // Equal maxima also handle a single positive-infinite score without
+            // introducing an extra inf-inf. Multiple +inf scores retain NaN.
+            const float alpha = lane < Warps
+                ? (local_max == maximum ? 1.0f : expf(local_max - maximum)) : 0.0f;
+            denominator = lane < Warps ? denominators[lane] * alpha : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                denominator += __shfl_down_sync(0xffffffffu, denominator, offset);
+            }
+            denominator = __shfl_sync(0xffffffffu, denominator, 0);
+            if (isinf(maximum) && maximum > 0.0f) {
+                float count = lane < Warps && local_max == maximum ? 1.0f : 0.0f;
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    count += __shfl_down_sync(0xffffffffu, count, offset);
+                }
+                if (__shfl_sync(0xffffffffu, count, 0) > 1.0f) {
+                    denominator = nanf("");
+                }
+            }
+            float merged[Chunks] = {};
+            #pragma unroll
+            for (int part = 0; part < Warps; ++part) {
+                const float factor = __shfl_sync(0xffffffffu, alpha, part);
+                #pragma unroll
+                for (int c = 0; c < Chunks; ++c) {
+                    const size_t column = lane + c * 32;
+                    if (column < dim) {
+                        merged[c] += partial_context[part * dim + column] * factor;
+                    }
+                }
+            }
+            const float inverse = 1.0f / (denominator + 1e-9f);
+            #pragma unroll
+            for (int c = 0; c < Chunks; ++c) {
+                const size_t column = lane + c * 32;
+                if (column < dim) {
+                    out[row * dim + column] = merged[c] * inverse;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <int Warps>
+static bool launch_split_kv_attention(
+    const float* q, const float* k, const float* v, float* out,
+    size_t num_heads, size_t num_kv_heads, size_t active_seq_len,
+    size_t cache_seq_len, size_t dim, size_t n_rep, size_t rows, float scale) {
+    const unsigned int grid = linear_grid_size(rows, 1);
+    const size_t shared_bytes = Warps * (dim + 2) * sizeof(float);
+    if (dim <= 32) {
+        split_kv_attention_kernel<1, Warps><<<grid, Warps * 32, shared_bytes>>>(
+            q, k, v, out, num_heads, num_kv_heads, active_seq_len,
+            cache_seq_len, dim, n_rep, rows, scale);
+    } else if (dim <= 64) {
+        split_kv_attention_kernel<2, Warps><<<grid, Warps * 32, shared_bytes>>>(
+            q, k, v, out, num_heads, num_kv_heads, active_seq_len,
+            cache_seq_len, dim, n_rep, rows, scale);
+    } else {
+        split_kv_attention_kernel<4, Warps><<<grid, Warps * 32, shared_bytes>>>(
+            q, k, v, out, num_heads, num_kv_heads, active_seq_len,
+            cache_seq_len, dim, n_rep, rows, scale);
+    }
+    return check_cuda_launch("CUDA split-KV attention kernel launch failed");
+}
+
+template <int WarpsPerBlock, bool Prefill>
+static bool launch_warp_attention_online(
+    const float* q, const float* k, const float* v, float* out,
+    size_t num_heads, size_t num_kv_heads, size_t q_seq_len,
+    size_t active_seq_len, size_t cache_seq_len, size_t dim,
+    size_t n_rep, size_t past_len, size_t rows, float scale, int is_causal) {
+    const unsigned int grid = linear_grid_size(rows, WarpsPerBlock);
+    if (dim <= 32) {
+        warp_attention_online_kernel<1, WarpsPerBlock, Prefill><<<grid, WarpsPerBlock * 32>>>(
+            q, k, v, out, num_heads, num_kv_heads, q_seq_len, active_seq_len,
+            cache_seq_len, dim, n_rep, past_len, rows, scale, is_causal);
+    } else if (dim <= 64) {
+        warp_attention_online_kernel<2, WarpsPerBlock, Prefill><<<grid, WarpsPerBlock * 32>>>(
+            q, k, v, out, num_heads, num_kv_heads, q_seq_len, active_seq_len,
+            cache_seq_len, dim, n_rep, past_len, rows, scale, is_causal);
+    } else {
+        warp_attention_online_kernel<4, WarpsPerBlock, Prefill><<<grid, WarpsPerBlock * 32>>>(
+            q, k, v, out, num_heads, num_kv_heads, q_seq_len, active_seq_len,
+            cache_seq_len, dim, n_rep, past_len, rows, scale, is_causal);
+    }
+    return check_cuda_launch("CUDA warp online attention kernel launch failed");
+}
+
 __global__ void decode_attention_kernel(
     const float* q,
     const float* k,
@@ -1841,6 +2141,104 @@ __global__ void fused_gate_up_silu_matvec_typed_kernel(
     }
 }
 
+template <bool Vectorized>
+__global__ void fused_gate_up_f32_i8_matvec_kernel(
+    const float* input,
+    const int8_t* gate,
+    float gate_scale,
+    const int8_t* up,
+    float up_scale,
+    float* out,
+    size_t n_dim,
+    size_t k_dim) {
+    __shared__ float gate_partials[4];
+    __shared__ float up_partials[4];
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int warp = threadIdx.x >> 5;
+    for (size_t col = blockIdx.x; col < n_dim; col += gridDim.x) {
+        float ga[4] = {};
+        float ua[4] = {};
+        const size_t weight_offset = col * k_dim;
+        for (size_t k = static_cast<size_t>(threadIdx.x) * 4; k < k_dim; k += 128 * 4) {
+            if (Vectorized) {
+                const float4 x = reinterpret_cast<const float4*>(input)[k / 4];
+                const char4 g = reinterpret_cast<const char4*>(gate + weight_offset)[k / 4];
+                const char4 u = reinterpret_cast<const char4*>(up + weight_offset)[k / 4];
+                ga[0] += x.x * (static_cast<float>(g.x) * gate_scale);
+                ua[0] += x.x * (static_cast<float>(u.x) * up_scale);
+                ga[1] += x.y * (static_cast<float>(g.y) * gate_scale);
+                ua[1] += x.y * (static_cast<float>(u.y) * up_scale);
+                ga[2] += x.z * (static_cast<float>(g.z) * gate_scale);
+                ua[2] += x.z * (static_cast<float>(u.z) * up_scale);
+                ga[3] += x.w * (static_cast<float>(g.w) * gate_scale);
+                ua[3] += x.w * (static_cast<float>(u.w) * up_scale);
+            } else {
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    if (k + c < k_dim) {
+                        const float x = input[k + c];
+                        ga[c] += x * (static_cast<float>(gate[weight_offset + k + c]) * gate_scale);
+                        ua[c] += x * (static_cast<float>(up[weight_offset + k + c]) * up_scale);
+                    }
+                }
+            }
+        }
+        float g = (ga[0] + ga[1]) + (ga[2] + ga[3]);
+        float u = (ua[0] + ua[1]) + (ua[2] + ua[3]);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            g += __shfl_down_sync(0xffffffffu, g, offset);
+            u += __shfl_down_sync(0xffffffffu, u, offset);
+        }
+        if (lane == 0) {
+            gate_partials[warp] = g;
+            up_partials[warp] = u;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            g = lane < 4 ? gate_partials[lane] : 0.0f;
+            u = lane < 4 ? up_partials[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                g += __shfl_down_sync(0xffffffffu, g, offset);
+                u += __shfl_down_sync(0xffffffffu, u, offset);
+            }
+            if (lane == 0) {
+                const float sig = 1.0f / (1.0f + expf(-g));
+                out[col] = (g * sig) * u;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <typename InputT, typename WeightT>
+static bool try_launch_fused_gate_up_f32_i8_matvec(
+    const InputT*, const WeightT*, float, const WeightT*, float,
+    float*, size_t, size_t) {
+    return false;
+}
+
+static bool try_launch_fused_gate_up_f32_i8_matvec(
+    const float* input, const int8_t* gate, float gate_scale,
+    const int8_t* up, float up_scale, float* out, size_t n_dim, size_t k_dim) {
+    if (n_dim < 128 || k_dim < 128) {
+        return false;
+    }
+    const unsigned int grid = linear_grid_size(n_dim, 1);
+    // Vector loads require every weight row and the activation base aligned.
+    // Odd K and unaligned handles keep scalar loads with the same reduction.
+    if (k_dim % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(gate) % alignof(char4) == 0 &&
+        reinterpret_cast<uintptr_t>(up) % alignof(char4) == 0) {
+        fused_gate_up_f32_i8_matvec_kernel<true><<<grid, 128>>>(
+            input, gate, gate_scale, up, up_scale, out, n_dim, k_dim);
+    } else {
+        fused_gate_up_f32_i8_matvec_kernel<false><<<grid, 128>>>(
+            input, gate, gate_scale, up, up_scale, out, n_dim, k_dim);
+    }
+    return true;
+}
+
 template <typename InputT, typename WeightT>
 __global__ void fused_qkv_matvec_typed_kernel(
     const InputT* input,
@@ -1972,6 +2370,10 @@ int launch_fused_gate_up_silu_typed(
     constexpr int block_size = 256;
     size_t len = rows * n_dim;
     if (rows == 1) {
+        if (try_launch_fused_gate_up_f32_i8_matvec(
+                input, gate, gate_scale, up, up_scale, out, n_dim, k_dim)) {
+            return check_cuda_launch("CUDA F32xI8 fused gate/up matvec kernel launch failed") ? 0 : 1;
+        }
         fused_gate_up_silu_matvec_typed_kernel<InputT, WeightT>
             <<<linear_grid_size(n_dim, 1), block_size>>>(
                 input,

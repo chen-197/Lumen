@@ -18,6 +18,9 @@
 !.env.example
 *.log
 *.tmp
+__pycache__/
+*.py[cod]
+.venv/
 
 # Operating system metadata
 .DS_Store

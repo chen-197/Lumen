@@ -974,6 +974,10 @@ extern "C" int lumen_cuda_decode_attention_f32_device(
     if (!validate_finite_value(scale, "CUDA decode attention scale must be finite")) {
         return 1;
     }
+    if (num_heads % n_rep != 0 || num_heads / n_rep != num_kv_heads) {
+        set_error("CUDA decode attention requires num_heads == num_kv_heads * n_rep");
+        return 1;
+    }
 
     constexpr int block_size = 256;
     size_t rows = 0;
@@ -981,6 +985,18 @@ extern "C" int lumen_cuda_decode_attention_f32_device(
     if (!checked_product(
             "CUDA decode attention row count overflow", {batch_size, num_heads}, &rows)) {
         return 1;
+    }
+    if (dim <= 128) {
+        if (active_seq_len >= 32) {
+            return launch_split_kv_attention<8>(
+                handle_to_ptr(q_handle), handle_to_ptr(k_handle), handle_to_ptr(v_handle),
+                handle_to_ptr(out_handle), num_heads, num_kv_heads, active_seq_len,
+                cache_seq_len, dim, n_rep, rows, scale) ? 0 : 1;
+        }
+        return launch_warp_attention_online<1, false>(
+            handle_to_ptr(q_handle), handle_to_ptr(k_handle), handle_to_ptr(v_handle),
+            handle_to_ptr(out_handle), num_heads, num_kv_heads, 1,
+            active_seq_len, cache_seq_len, dim, n_rep, 0, rows, scale, 0) ? 0 : 1;
     }
     if (dim > (static_cast<size_t>(-1) - block_size - 4) / 2) {
         set_error("CUDA decode attention shared memory length overflow");
@@ -1048,6 +1064,10 @@ extern "C" int lumen_cuda_prefill_attention_f32_device(
     if (!validate_finite_value(scale, "CUDA prefill attention scale must be finite")) {
         return 1;
     }
+    if (num_heads % n_rep != 0 || num_heads / n_rep != num_kv_heads) {
+        set_error("CUDA prefill attention requires num_heads == num_kv_heads * n_rep");
+        return 1;
+    }
 
     constexpr int block_size = 256;
     size_t rows = 0;
@@ -1057,6 +1077,12 @@ extern "C" int lumen_cuda_prefill_attention_f32_device(
             {batch_size, num_heads, q_seq_len},
             &rows)) {
         return 1;
+    }
+    if (dim <= 128) {
+        return launch_warp_attention_online<4, true>(
+            handle_to_ptr(q_handle), handle_to_ptr(k_handle), handle_to_ptr(v_handle),
+            handle_to_ptr(out_handle), num_heads, num_kv_heads, q_seq_len,
+            active_seq_len, cache_seq_len, dim, n_rep, past_len, rows, scale, is_causal) ? 0 : 1;
     }
     if (dim > (static_cast<size_t>(-1) - block_size - 4) / 2) {
         set_error("CUDA prefill attention shared memory length overflow");

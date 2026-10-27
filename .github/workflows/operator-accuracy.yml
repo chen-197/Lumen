@@ -1,0 +1,66 @@
+name: Operator accuracy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  portable-cpu:
+    runs-on: ubuntu-latest
+    env:
+      LUMEN_CUDA: '0'
+      LUMEN_OPERATOR_AUDIT: '1'
+      RAYON_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install independent CPU reference
+        run: python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Rust accuracy and regression tests
+        shell: bash
+        run: |
+          mkdir -p target/operator-accuracy-ci
+          set -o pipefail
+          cargo test --release --locked --all-targets --no-default-features --features dev-tools -- --nocapture --test-threads=1 2>&1 | tee target/operator-accuracy-ci/tests.log
+      - name: Independent FP64 and gradient reference
+        run: python3 dev-tools/check_operator_accuracy.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/torch-comparison.json
+      - name: Public API compile-fail examples
+        run: cargo test --release --locked --doc --no-default-features --features dev-tools
+      - name: Independent dense-target loss reference
+        run: python3 dev-tools/check_dense_cross_entropy.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/dense-ce-comparison.json
+      - name: Independent retained-graph backward reference
+        run: python3 dev-tools/check_autograd_reuse.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/autograd-reuse-comparison.json
+      - name: Independent frozen-input and QKV gradient reference
+        run: python3 dev-tools/check_gradient_flags.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/gradient-flags-comparison.json
+      - name: Independent mixed-residency accumulation reference
+        run: python3 dev-tools/check_gradient_accumulation.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/gradient-accumulation-comparison.json
+      - name: Independent general attention and LayerNorm reference
+        run: python3 dev-tools/check_generic_nn.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/generic-nn-comparison.json
+      - name: Independent general CPU prefill reference
+        run: python3 dev-tools/check_generic_prefill.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/generic-prefill-comparison.json
+      - name: Independent mixed-precision row matmul reference
+        run: python3 dev-tools/check_row_matmul.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/row-matmul-comparison.json
+      - name: Static checks
+        run: |
+          cargo fmt --all --check
+          cargo clippy --release --locked --all-targets --no-default-features --features dev-tools -- -D warnings -A clippy::chunks_exact_to_as_chunks
+      - name: Public API checkpoint and training checks
+        run: |
+          cargo run --release --locked --no-default-features --features dev-tools --bin manual_state_check -- --device cpu --output-directory target/operator-accuracy-ci/manual-cpu
+          python3 dev-tools/check_manual_state.py target/operator-accuracy-ci/manual-cpu/results.json --output target/operator-accuracy-ci/manual-cpu-reference.json
+      - name: Verify distributable source package
+        run: cargo package --locked
+      - name: Explicit long CPU checks
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: ./dev-tools/check_endurance.ps1 -Python python3 -OutputDirectory target/operator-accuracy-ci/endurance
+      - name: Preserve accuracy evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-accuracy-cpu
+          path: target/operator-accuracy-ci
+          if-no-files-found: ignore

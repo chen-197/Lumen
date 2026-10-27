@@ -4,6 +4,8 @@ use ndarray::{Array, ArrayD, IxDyn};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::{Normal, Uniform};
 use std::cell::Cell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 pub enum InitType {
     XavierUniform, // For Tanh/Sigmoid (Glorot)
@@ -22,8 +24,16 @@ thread_local! {
     static PARAMETER_INIT_MODE: Cell<ParameterInitMode> = const { Cell::new(ParameterInitMode::Full) };
 }
 
+/// Restores this thread's parameter initialization mode on drop.
+///
+/// ```compile_fail
+/// use lumen::init::{parameter_init_guard, ParameterInitMode};
+/// let guard = parameter_init_guard(ParameterInitMode::Placeholder);
+/// std::thread::spawn(move || drop(guard));
+/// ```
 pub struct ParameterInitModeGuard {
     previous: ParameterInitMode,
+    _caller_thread: PhantomData<Rc<()>>,
 }
 
 #[inline]
@@ -40,7 +50,10 @@ pub fn set_parameter_init_mode(mode: ParameterInitMode) {
 pub fn parameter_init_guard(mode: ParameterInitMode) -> ParameterInitModeGuard {
     let previous = parameter_init_mode();
     set_parameter_init_mode(mode);
-    ParameterInitModeGuard { previous }
+    ParameterInitModeGuard {
+        previous,
+        _caller_thread: PhantomData,
+    }
 }
 
 #[inline]
@@ -108,32 +121,5 @@ pub fn tensor_init_with_dtype(shape: Vec<usize>, init_type: InitType, dtype: DTy
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{InitType, ParameterInitMode, tensor_init, with_parameter_init_mode};
-    use crate::precision::{DType, PrecisionConfig, with_precision_config};
-
-    #[test]
-    fn placeholder_parameter_init_overrides_random_initializers() {
-        let tensor = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
-            tensor_init(vec![2, 3], InitType::KaimingNormal)
-        });
-        assert!(tensor.data_ref().iter().all(|&v| v == 0.0));
-    }
-
-    #[test]
-    fn placeholder_parameter_init_follows_global_parameter_dtype() {
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::I8,
-                runtime_dtype: DType::F32,
-                allow_parameter_dtype_copies: false,
-            },
-            || {
-                let tensor = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
-                    tensor_init(vec![2, 3], InitType::KaimingNormal)
-                });
-                assert_eq!(tensor.dtype(), DType::I8);
-            },
-        );
-    }
-}
+#[path = "../tests/unit/init/tests.rs"]
+mod tests;

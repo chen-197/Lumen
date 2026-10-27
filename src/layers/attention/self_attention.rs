@@ -8,7 +8,7 @@ use crate::module::Module;
 use crate::ops::cuda;
 use crate::ops::fused::{
     fused_qkv_decode_infer_into, fused_qkv_decode_infer_tensors, fused_qkv_prefill_infer_tensors,
-    fused_qkv_train_tensors, fused_softmax, fused_softmax_with_past_infer,
+    fused_qkv_train_tensors, fused_softmax_with_past_infer,
 };
 use crate::ops::matmul::{batch_matmul, dot_unrolled};
 use crate::ops::shape::{permute, reshape, slice_last_dim};
@@ -16,11 +16,39 @@ use crate::precision::{
     DType, default_activation_dtype, default_kv_cache_dtype, default_parameter_dtype,
 };
 
+use half::slice::HalfFloatSliceExt;
 use ndarray::linalg::general_mat_mul;
 use ndarray::{Array, Array4, IxDyn};
-use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+#[cfg(not(all(test, feature = "dev-tools")))]
+fn schedule_decode_attention(
+    output: &mut [f32],
+    chunk: usize,
+    work: usize,
+    f: impl Fn((usize, &mut [f32])) + Send + Sync,
+) {
+    crate::cpu_profile!(
+        "attention",
+        crate::cpu::for_each_chunk_mut(output, chunk, work, f)
+    );
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+fn schedule_decode_attention(
+    output: &mut [f32],
+    chunk: usize,
+    work: usize,
+    f: impl Fn((usize, &mut [f32])) + Send + Sync,
+) {
+    if cpu_profile::legacy_enabled() {
+        use rayon::prelude::*;
+        output.par_chunks_mut(chunk).enumerate().for_each(f);
+    } else {
+        crate::cpu::for_each_chunk_mut(output, chunk, work, f);
+    }
+}
 
 thread_local! {
     // attention scores buffer: S * L
@@ -35,6 +63,8 @@ thread_local! {
     static ATT_QPROJ_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static ATT_KPROJ_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static ATT_VPROJ_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static ATT_KCACHE_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static ATT_VCACHE_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_attention_work_buffers<R>(
@@ -62,32 +92,74 @@ fn with_attention_work_buffers<R>(
     })
 }
 
+fn with_cache_prefix_f32<R>(
+    cache: &Tensor,
+    active_len: usize,
+    scratch: &RefCell<Vec<f32>>,
+    f: impl FnOnce(ndarray::ArrayView4<'_, f32>) -> R,
+) -> R {
+    cache.with_storage_view_preferring(StoragePreference::Native, |view| {
+        macro_rules! lowp_prefix {
+            ($view:expr) => {{
+                let view = $view.into_dimensionality::<ndarray::Ix4>().unwrap();
+                assert!(
+                    active_len <= view.shape()[2],
+                    "KV cache prefix out of bounds"
+                );
+                #[cfg(feature = "cpu-profiling")]
+                let profile = crate::cpu::profiling::region("kv_conversion");
+                let prefix = view.slice(ndarray::s![.., .., ..active_len, ..]);
+                let shape = prefix.dim();
+                let mut fallback = Vec::new();
+                let mut borrowed = scratch.try_borrow_mut().ok();
+                let buffer = borrowed.as_deref_mut().unwrap_or(&mut fallback);
+                buffer.resize(prefix.len(), 0.0);
+                let head_len = active_len * shape.3;
+                for bb in 0..shape.0 {
+                    for hh in 0..shape.1 {
+                        let head = prefix.slice(ndarray::s![bb, hh, .., ..]);
+                        let start = (bb * shape.1 + hh) * head_len;
+                        let output = &mut buffer[start..start + head_len];
+                        if let Some(input) = head.as_slice() {
+                            input.convert_to_f32_slice(output);
+                        } else {
+                            for (dst, src) in output.iter_mut().zip(head.iter()) {
+                                *dst = src.to_f32();
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "cpu-profiling")]
+                drop(profile);
+                f(ndarray::ArrayView4::from_shape(shape, buffer).unwrap())
+            }};
+        }
+        match view {
+            TensorStorageView::F32(view) => {
+                let view = view.into_dimensionality::<ndarray::Ix4>().unwrap();
+                assert!(
+                    active_len <= view.shape()[2],
+                    "KV cache prefix out of bounds"
+                );
+                f(view.slice_move(ndarray::s![.., .., ..active_len, ..]))
+            }
+            TensorStorageView::F16(view) => lowp_prefix!(view),
+            TensorStorageView::BF16(view) => lowp_prefix!(view),
+        }
+    })
+}
+
 fn with_cache_f32_views<R>(
     k: &Tensor,
     v: &Tensor,
+    active_len: usize,
     f: impl FnOnce(ndarray::ArrayView4<'_, f32>, ndarray::ArrayView4<'_, f32>) -> R,
 ) -> R {
-    k.with_storage_view_preferring(StoragePreference::F32Compute, |k_view| {
-        v.with_storage_view_preferring(StoragePreference::F32Compute, |v_view| {
-            let k4 = match k_view {
-                TensorStorageView::F32(view) => view.into_dimensionality::<ndarray::Ix4>().unwrap(),
-                TensorStorageView::F16(_) => {
-                    unreachable!("f32 compute preference should expose f32 view")
-                }
-                TensorStorageView::BF16(_) => {
-                    unreachable!("f32 compute preference should expose f32 view")
-                }
-            };
-            let v4 = match v_view {
-                TensorStorageView::F32(view) => view.into_dimensionality::<ndarray::Ix4>().unwrap(),
-                TensorStorageView::F16(_) => {
-                    unreachable!("f32 compute preference should expose f32 view")
-                }
-                TensorStorageView::BF16(_) => {
-                    unreachable!("f32 compute preference should expose f32 view")
-                }
-            };
-            f(k4, v4)
+    ATT_KCACHE_BUF.with(|k_scratch| {
+        ATT_VCACHE_BUF.with(|v_scratch| {
+            with_cache_prefix_f32(k, active_len, k_scratch, |k4| {
+                with_cache_prefix_f32(v, active_len, v_scratch, |v4| f(k4, v4))
+            })
         })
     })
 }
@@ -172,7 +244,7 @@ fn eval_attention_context_bshd(
     v_cache: &Tensor,
     params: AttentionEvalParams,
 ) -> Array4<f32> {
-    with_cache_f32_views(k_cache, v_cache, |k4_full, v4_full| {
+    with_cache_f32_views(k_cache, v_cache, params.total_len, |k4_full, v4_full| {
         let k4 = k4_full.slice(ndarray::s![.., .., 0..params.total_len, ..]);
         let v4 = v4_full.slice(ndarray::s![.., .., 0..params.total_len, ..]);
         q_rot.with_storage_view_preferring(StoragePreference::F32Compute, |q_view| {
@@ -908,7 +980,7 @@ impl SelfAttention {
                                         }
                                         ATT_OUT_BUF.with(|ob| {
                                             let c = cache_handle.borrow();
-                                            with_cache_f32_views(&c.k, &c.v, |k4, v4| {
+                                            with_cache_f32_views(&c.k, &c.v, total_len, |k4, v4| {
                                                 let mut ob = ob.borrow_mut();
                                                 let out_len = b * h * d;
                                                 if ob.len() < out_len {
@@ -921,7 +993,7 @@ impl SelfAttention {
                                                     self.rope.cos_sin_row_vec(past_len);
                                                 let half_d = d / 2;
 
-                                                out_vec.par_chunks_mut(d).enumerate().for_each(
+                                                schedule_decode_attention(out_vec, d, total_len.saturating_mul(d).saturating_mul(3),
                                                     |(row, out_row)| {
                                                         let bb = row / h;
                                                         let hh = row % h;
@@ -997,8 +1069,7 @@ impl SelfAttention {
                                                     },
                                                 );
 
-                                                self.w_o
-                                                    .forward_decode_rows_no_bias(&ob[..out_len], b)
+                                                crate::cpu_profile!("output_projection", self.w_o.forward_decode_rows_no_bias(&ob[..out_len], b))
                                             })
                                         })
                                     }
@@ -1006,7 +1077,7 @@ impl SelfAttention {
                             } else {
                                 ATT_OUT_BUF.with(|ob| {
                                     let c = cache_handle.borrow();
-                                    with_cache_f32_views(&c.k, &c.v, |k4, v4| {
+                                    with_cache_f32_views(&c.k, &c.v, total_len, |k4, v4| {
                                     let mut ob = ob.borrow_mut();
                                     let out_len = b * h * d;
                                     if ob.len() < out_len {
@@ -1020,7 +1091,7 @@ impl SelfAttention {
                                         self.rope.cos_sin_row_vec(past_len);
                                     let half_d = d / 2;
 
-                                    out_vec.par_chunks_mut(d).enumerate().for_each(
+                                    schedule_decode_attention(out_vec, d, total_len.saturating_mul(d).saturating_mul(3),
                                         |(row, out_row)| {
                                             let bb = row / h;
                                             let hh = row % h;
@@ -1096,7 +1167,7 @@ impl SelfAttention {
                                         },
                                     );
 
-                                    self.w_o.forward_decode_rows_no_bias(&ob[..out_len], b)
+                                    crate::cpu_profile!("output_projection", self.w_o.forward_decode_rows_no_bias(&ob[..out_len], b))
                                 })
                                 })
                             };
@@ -1537,24 +1608,15 @@ impl SelfAttention {
         let q_rot = self.rope.forward(&q, 0);
         let k_rot = self.rope.forward(&k, 0);
 
-        // 4) Repeat KV heads
-        let k_up = if n_rep > 1 {
-            repeat_kv(k_rot.clone(), n_rep)
-        } else {
-            k_rot.clone()
-        };
-
-        let v_up = if n_rep > 1 {
-            repeat_kv(v.clone(), n_rep)
-        } else {
-            v.clone()
-        };
-
-        // 5) Attention
-        let k_t = permute(&k_up, vec![0, 1, 3, 2]);
-        let scores = batch_matmul(&q_rot, &k_t);
-        let attn_probs = fused_softmax(&scores, self.scale, self.causal);
-        let context = batch_matmul(&attn_probs, &v_up);
+        // Projection and RoPE belong to this layer; the attention core also
+        // serves non-rotary encoders and independent cross-attention Q/K/V.
+        let context = super::scaled_dot_product::unmasked_attention(
+            &q_rot,
+            &k_rot,
+            &v,
+            self.scale,
+            self.causal,
+        );
 
         // 6) Output
         let context = permute(&context, vec![0, 2, 1, 3]);
@@ -1673,6 +1735,11 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
 
         return match x.native_storage_owned() {
             TensorStorageOwned::F32(data) => {
+                let data = if data.is_standard_layout() {
+                    data
+                } else {
+                    data.as_standard_layout().into_owned().into_shared()
+                };
                 let expanded = data
                     .into_shape((b, n_kv, 1, s, d))
                     .expect("Failed to expand KV shape");
@@ -1688,6 +1755,11 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                 Tensor::from_shared_f32_no_grad_with_device(res, output_device)
             }
             TensorStorageOwned::F16(data) => {
+                let data = if data.is_standard_layout() {
+                    data
+                } else {
+                    data.as_standard_layout().into_owned().into_shared()
+                };
                 let expanded = data
                     .into_shape((b, n_kv, 1, s, d))
                     .expect("Failed to expand KV shape");
@@ -1703,6 +1775,11 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                 Tensor::from_shared_f16_no_grad_with_device(res, output_device)
             }
             TensorStorageOwned::BF16(data) => {
+                let data = if data.is_standard_layout() {
+                    data
+                } else {
+                    data.as_standard_layout().into_owned().into_shared()
+                };
                 let expanded = data
                     .into_shape((b, n_kv, 1, s, d))
                     .expect("Failed to expand KV shape");
@@ -1718,6 +1795,11 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                 Tensor::from_shared_bf16_no_grad_with_device(res, output_device)
             }
             TensorStorageOwned::I8(data, scale) => {
+                let data = if data.is_standard_layout() {
+                    data
+                } else {
+                    data.as_standard_layout().into_owned().into_shared()
+                };
                 let expanded = data
                     .into_shape((b, n_kv, 1, s, d))
                     .expect("Failed to expand KV shape");
@@ -1742,7 +1824,8 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
         match cuda_out {
             Ok(buffer) => {
                 let x_clone = x.clone();
-                let output_self = Rc::new(RefCell::new(None::<Tensor>));
+                let output_self =
+                    Rc::new(RefCell::new(std::rc::Weak::<RefCell<TensorData>>::new()));
                 let output_self_for_backward = output_self.clone();
                 let tensor = Tensor(Rc::new(RefCell::new(TensorData {
                     data: Array::zeros(IxDyn(&out_shape)).into_shared(),
@@ -1764,7 +1847,8 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                     backward_op: Some(std::rc::Rc::new(move |grad| {
                         let cuda_grad = if let Some(grad_buffer) = output_self_for_backward
                             .borrow()
-                            .as_ref()
+                            .upgrade()
+                            .map(Tensor)
                             .and_then(|output| output.cloned_cuda_f32_grad())
                             .filter(|grad_buffer| grad_buffer.len() == grad.len())
                         {
@@ -1778,7 +1862,7 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                                     n_rep,
                                 ) {
                                     Ok(grad_buffer) => {
-                                        x_clone.add_cuda_grad_buffer_only(grad_buffer);
+                                        x_clone.add_backward_cuda_grad_buffer_only(grad_buffer);
                                         return;
                                     }
                                     Err(err) => {
@@ -1796,7 +1880,7 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                                     )
                                 }) {
                                     Ok(grad_buffer) => {
-                                        x_clone.add_cuda_grad_buffer_only(grad_buffer);
+                                        x_clone.add_backward_cuda_grad_buffer_only(grad_buffer);
                                         return;
                                     }
                                     Err(err) => {
@@ -1813,7 +1897,7 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                                 let d_x = Array::from_shape_vec(IxDyn(&shape), grad_host)
                                     .expect("CUDA repeat_kv grad shape build failed")
                                     .into_dyn();
-                                x_clone.add_grad_with_cuda_buffer(d_x, Some(grad_buffer));
+                                x_clone.add_backward_grad_with_cuda_buffer(d_x, Some(grad_buffer));
                             }
                             Err(err) => {
                                 panic!("CUDA repeat_kv backward failed: {err}");
@@ -1823,7 +1907,7 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                     requires_grad: true,
                     device: output_device,
                 })));
-                *output_self.borrow_mut() = Some(tensor.clone());
+                *output_self.borrow_mut() = Rc::downgrade(&tensor.0);
                 return tensor;
             }
             Err(err) => {
@@ -1887,7 +1971,7 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
                     }
                 }
             }
-            x_clone.add_grad(d_x.into_dyn());
+            x_clone.add_backward_grad(d_x.into_dyn());
         })),
         requires_grad: true,
         device: output_device,
@@ -1900,6 +1984,96 @@ pub fn repeat_kv(x: Tensor, n_rep: usize) -> Tensor {
 // 返回 context: [B, S, H, D]（BSHD，便于后续 reshape 到 [B,S,H*D] 视为 view）
 // past_len: cache 写入前的长度（用于 causal mask 的 absolute index）
 
+fn attention_block(
+    q: ndarray::ArrayView2<'_, f32>,
+    k: ndarray::ArrayView2<'_, f32>,
+    v: ndarray::ArrayView2<'_, f32>,
+    scale: f32,
+    causal: bool,
+    past_len: usize,
+    decode: bool,
+    mut output: ndarray::ArrayViewMut2<'_, f32>,
+) {
+    let d = q.ncols();
+    let l = k.nrows();
+    // decode(S=1) 热路径：online softmax + 直接累加 ctx，完全不需要 scores/ctx buffer
+    if decode {
+        let q_vec = q.row(0);
+        let k_mat = k;
+        let v_mat = v;
+
+        let q_abs = past_len; // i == 0
+
+        // 1) max
+        let mut maxv = f32::NEG_INFINITY;
+        for j in 0..l {
+            // causal mask
+            if causal && j > q_abs {
+                continue;
+            }
+            let kj = k_mat.slice(ndarray::s![j, ..]);
+            let mut dot = 0.0f32;
+            for i in 0..d {
+                dot += q_vec[i] * kj[i];
+            }
+            let score = dot * scale;
+            if score > maxv {
+                maxv = score;
+            }
+        }
+
+        // 2) sum + ctx
+        let mut sum = 0.0f32;
+        let mut out_row = output.row_mut(0);
+        out_row.fill(0.0);
+
+        for j in 0..l {
+            if causal && j > q_abs {
+                continue;
+            }
+            let kj = k_mat.slice(ndarray::s![j, ..]);
+            let mut dot = 0.0f32;
+            for i in 0..d {
+                dot += q_vec[i] * kj[i];
+            }
+            let w = (dot * scale - maxv).exp();
+            sum += w;
+
+            for i in 0..d {
+                out_row[i] += w * v_mat[[j, i]];
+            }
+        }
+
+        let inv = 1.0f32 / (sum + 1e-9);
+        for i in 0..d {
+            out_row[i] *= inv;
+        }
+        return;
+    }
+
+    // per-thread buffer reuse
+    let rows = output.nrows();
+    with_attention_work_buffers(rows * l, rows * d, |scores_buf, ctx_buf| {
+        let mut scores = ndarray::ArrayViewMut2::from_shape((rows, l), scores_buf)
+            .expect("scores buffer shape mismatch");
+        let mut ctx = ndarray::ArrayViewMut2::from_shape((rows, d), ctx_buf)
+            .expect("ctx buffer shape mismatch");
+
+        let q_mat = q;
+        let k_mat = k;
+        let v_mat = v;
+
+        scores.fill(0.0);
+        general_mat_mul(1.0, &q_mat, &k_mat.t(), 0.0, &mut scores);
+        softmax_inplace_view(&mut scores, scale, causal, past_len);
+
+        ctx.fill(0.0);
+        general_mat_mul(1.0, &scores, &v_mat, 0.0, &mut ctx);
+
+        output.assign(&ctx);
+    });
+}
+
 fn gqa_attention_no_repeat_bshd_view(
     q: &ndarray::ArrayView4<f32>,
     k: &ndarray::ArrayView4<f32>,
@@ -1909,106 +2083,91 @@ fn gqa_attention_no_repeat_bshd_view(
     n_rep: usize,
     past_len: usize,
 ) -> Array4<f32> {
+    #[cfg(feature = "cpu-profiling")]
+    let _profile = crate::cpu::profiling::region("attention");
+
     let (b, h, s, d) = q.dim();
     let (b2, h_kv, l, d2) = k.dim();
     assert_eq!(b, b2);
     assert_eq!(d, d2);
     assert_eq!(h, h_kv * n_rep);
 
+    #[cfg(all(test, feature = "dev-tools"))]
+    if cpu_profile::legacy_enabled() {
+        return cpu_profile::head_only(q.view(), k.view(), v.view(), scale, causal, past_len);
+    }
+
     let mut out = Array4::<f32>::zeros((b, s, h, d));
 
-    // 将 out 变换为 [H,B,S,D]，对 head 维并行写入（线程间互不重叠）
-    let mut out_hbsd = out.view_mut().permuted_axes([2, 0, 1, 3]);
-    out_hbsd
-        .outer_iter_mut()
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(hq, mut out_for_head)| {
-            let hk = hq / n_rep;
-
-            // decode(S=1) 热路径：online softmax + 直接累加 ctx，完全不需要 scores/ctx buffer
-            if s == 1 {
-                for bb in 0..b {
-                    let q_vec = q.slice(ndarray::s![bb, hq, 0, ..]); // [D]
-                    let k_mat = k.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
-                    let v_mat = v.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
-
-                    let q_abs = past_len; // i == 0
-
-                    // 1) max
-                    let mut maxv = f32::NEG_INFINITY;
-                    for j in 0..l {
-                        // causal mask
-                        if causal && j > q_abs {
-                            continue;
-                        }
-                        let kj = k_mat.slice(ndarray::s![j, ..]);
-                        let mut dot = 0.0f32;
-                        for i in 0..d {
-                            dot += q_vec[i] * kj[i];
-                        }
-                        let score = dot * scale;
-                        if score > maxv {
-                            maxv = score;
-                        }
-                    }
-
-                    // 2) sum + ctx
-                    let mut sum = 0.0f32;
-                    // out_for_head: [B,S,D] and S==1
-                    let mut out_row = out_for_head.slice_mut(ndarray::s![bb, 0, ..]);
-                    out_row.fill(0.0);
-
-                    for j in 0..l {
-                        if causal && j > q_abs {
-                            continue;
-                        }
-                        let kj = k_mat.slice(ndarray::s![j, ..]);
-                        let mut dot = 0.0f32;
-                        for i in 0..d {
-                            dot += q_vec[i] * kj[i];
-                        }
-                        let w = (dot * scale - maxv).exp();
-                        sum += w;
-
-                        for i in 0..d {
-                            out_row[i] += w * v_mat[[j, i]];
-                        }
-                    }
-
-                    let inv = 1.0f32 / (sum + 1e-9);
-                    for i in 0..d {
-                        out_row[i] *= inv;
-                    }
-                }
-                return;
-            }
-
-            // per-thread buffer reuse
-            with_attention_work_buffers(s * l, s * d, |scores_buf, ctx_buf| {
-                let mut scores = ndarray::ArrayViewMut2::from_shape((s, l), scores_buf)
-                    .expect("scores buffer shape mismatch");
-                let mut ctx = ndarray::ArrayViewMut2::from_shape((s, d), ctx_buf)
-                    .expect("ctx buffer shape mismatch");
-
-                for bb in 0..b {
-                    let q_mat = q.slice(ndarray::s![bb, hq, .., ..]); // [S,D]
-                    let k_mat = k.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
-                    let v_mat = v.slice(ndarray::s![bb, hk, .., ..]); // [L,D]
-
-                    scores.fill(0.0);
-                    general_mat_mul(1.0, &q_mat, &k_mat.t(), 0.0, &mut scores);
-                    softmax_inplace_view(&mut scores, scale, causal, past_len);
-
-                    ctx.fill(0.0);
-                    general_mat_mul(1.0, &scores, &v_mat, 0.0, &mut ctx);
-
-                    // out_for_head: [B,S,D]
-                    out_for_head.slice_mut(ndarray::s![bb, .., ..]).assign(&ctx);
-                }
-            });
+    // Split long queries only when batch/head jobs cannot fill the caller's
+    // budget. Keep at least 64 query rows together to amortize matrix packing.
+    let head_jobs = b.saturating_mul(h).max(1);
+    let blocks = if s >= 128 {
+        crate::cpu::parallelism()
+            .div_ceil(head_jobs)
+            .min(s / 64)
+            .max(1)
+    } else {
+        1
+    };
+    let rows_per_job = s.div_ceil(blocks).max(1);
+    let work = rows_per_job
+        .saturating_mul(l)
+        .saturating_mul(d)
+        .saturating_mul(3);
+    if b == 1 && blocks == 1 {
+        // Preserve the original head iterator when no extra query jobs are
+        // needed. No caller-side view list is allocated for this common case.
+        let mut heads = out.view_mut().permuted_axes([2, 0, 1, 3]);
+        crate::cpu::for_each_indexed(heads.outer_iter_mut(), work, |(hq, output)| {
+            attention_block(
+                q.slice(ndarray::s![0, hq, .., ..]),
+                k.slice(ndarray::s![0, hq / n_rep, .., ..]),
+                v.slice(ndarray::s![0, hq / n_rep, .., ..]),
+                scale,
+                causal,
+                past_len,
+                s == 1,
+                output.index_axis_move(ndarray::Axis(0), 0),
+            );
         });
-
+        return out;
+    }
+    // split_at consumes each mutable view, preserving disjoint output ownership
+    // without raw pointers, output locks, or an additional context-sized buffer.
+    let mut jobs = Vec::with_capacity(head_jobs.saturating_mul(s.div_ceil(rows_per_job)));
+    let mut batches = out.view_mut();
+    for bb in 0..b {
+        let (batch, tail) = batches.split_at(ndarray::Axis(0), 1);
+        batches = tail;
+        let mut queries = batch.index_axis_move(ndarray::Axis(0), 0);
+        for first in (0..s).step_by(rows_per_job) {
+            let rows = (s - first).min(rows_per_job);
+            let (query, tail) = queries.split_at(ndarray::Axis(0), rows);
+            queries = tail;
+            let mut heads = query.permuted_axes([1, 0, 2]);
+            for hq in 0..h {
+                let (head, tail) = heads.split_at(ndarray::Axis(0), 1);
+                heads = tail;
+                jobs.push((bb, hq, first, head.index_axis_move(ndarray::Axis(0), 0)));
+            }
+        }
+    }
+    crate::cpu::for_each_chunk_mut(&mut jobs, 1, work, |(_, job)| {
+        let (bb, hq, first, output) = &mut job[0];
+        let (bb, hq, first) = (*bb, *hq, *first);
+        let rows = output.nrows();
+        attention_block(
+            q.slice(ndarray::s![bb, hq, first..first + rows, ..]),
+            k.slice(ndarray::s![bb, hq / n_rep, .., ..]),
+            v.slice(ndarray::s![bb, hq / n_rep, .., ..]),
+            scale,
+            causal,
+            past_len + first,
+            s == 1,
+            output.view_mut(),
+        );
+    });
     out
 }
 
@@ -2054,934 +2213,10 @@ fn softmax_inplace_view(
     }
 }
 
+#[cfg(all(test, feature = "dev-tools"))]
+#[path = "../../../tests/profiling/attention.rs"]
+mod cpu_profile;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::autograd::no_grad;
-    #[cfg(feature = "cuda")]
-    use crate::autograd::set_strict_device_execution;
-    use crate::precision::{
-        DType, PrecisionConfig, set_default_runtime_dtype, with_precision_config,
-    };
-    use ndarray::{Array, IxDyn};
-
-    fn make_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
-        let t = Tensor::from_array_no_grad(
-            Array::from_shape_vec(IxDyn(shape), data)
-                .expect("test tensor shape mismatch")
-                .into_dyn(),
-        );
-        t.cast_inplace(dtype);
-        t
-    }
-
-    #[cfg(feature = "cuda")]
-    fn make_grad_tensor(shape: &[usize], data: Vec<f32>) -> Tensor {
-        Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(shape), data)
-                .expect("test tensor shape mismatch")
-                .into_dyn(),
-            true,
-        )
-    }
-
-    #[test]
-    #[should_panic(expected = "n_head must be > 0")]
-    fn self_attention_rejects_zero_query_heads() {
-        let _ = SelfAttention::new(16, 0, 1, 8, 10000.0, true);
-    }
-
-    #[test]
-    #[should_panic(expected = "n_kv_head must be > 0")]
-    fn self_attention_rejects_zero_kv_heads() {
-        let _ = SelfAttention::new(16, 4, 0, 8, 10000.0, true);
-    }
-
-    #[test]
-    #[should_panic(expected = "n_head must be divisible by n_kv_head")]
-    fn self_attention_rejects_non_divisible_gqa_ratio() {
-        let _ = SelfAttention::new(12, 6, 4, 8, 10000.0, true);
-    }
-
-    #[test]
-    #[should_panic(expected = "attention input must be [B,S,H]")]
-    fn self_attention_rejects_non_3d_input() {
-        let attn = SelfAttention::new(8, 2, 1, 8, 10000.0, true);
-        let input = make_tensor(&[1, 8], vec![0.0; 8], DType::F32);
-        no_grad(|| {
-            let _ = attn.forward(input, None);
-        });
-    }
-
-    #[test]
-    fn no_grad_forward_keeps_bf16_input_storage() {
-        let attn = SelfAttention::new(8, 2, 1, 8, 10000.0, true);
-        let input = make_tensor(
-            &[1, 2, 8],
-            (0..16).map(|i| i as f32 * 0.1 - 0.5).collect(),
-            DType::BF16,
-        );
-
-        no_grad(|| {
-            let _ = attn.forward(input.clone(), None);
-        });
-
-        assert_eq!(input.dtype(), DType::BF16);
-        input.with_storage_view(|view| match view {
-            crate::autograd::TensorStorageView::BF16(_) => {}
-            crate::autograd::TensorStorageView::F16(_) => {
-                panic!("shape inspection should not materialize bf16 attention input")
-            }
-            crate::autograd::TensorStorageView::F32(_) => {
-                panic!("shape inspection should not materialize bf16 attention input")
-            }
-        });
-    }
-
-    #[test]
-    fn kv_cache_creation_follows_runtime_dtype() {
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::F32,
-                runtime_dtype: DType::BF16,
-                allow_parameter_dtype_copies: false,
-            },
-            || {
-                let cache = KVCacheInner::new(1, 1, 4, 4);
-                assert_eq!(cache.dtype, DType::BF16);
-                assert!(cache.follows_global_dtype);
-                cache.k.with_storage_view_preferring(
-                    StoragePreference::Native,
-                    |view| match view {
-                        TensorStorageView::BF16(view) => assert_eq!(view.shape(), &[1, 1, 4, 4]),
-                        TensorStorageView::F16(_) => {
-                            panic!("kv cache should follow bf16 runtime dtype")
-                        }
-                        TensorStorageView::F32(_) => {
-                            panic!("kv cache should follow bf16 runtime dtype")
-                        }
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn kv_cache_manual_cast_disables_global_following() {
-        let mut cache = KVCacheInner::new(1, 1, 4, 4);
-        assert!(cache.follows_global_dtype);
-        cache.cast_inplace(DType::BF16);
-        assert_eq!(cache.dtype, DType::BF16);
-        assert!(!cache.follows_global_dtype);
-        cache
-            .v
-            .with_storage_view_preferring(StoragePreference::Native, |view| match view {
-                TensorStorageView::BF16(view) => assert_eq!(view.shape(), &[1, 1, 4, 4]),
-                TensorStorageView::F16(_) => {
-                    panic!("manual cast should switch cache to explicit bf16 storage")
-                }
-                TensorStorageView::F32(_) => {
-                    panic!("manual cast should switch cache to explicit bf16 storage")
-                }
-            });
-    }
-
-    #[test]
-    fn kv_cache_explicit_dtype_overrides_global_default() {
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::F32,
-                runtime_dtype: DType::BF16,
-                allow_parameter_dtype_copies: false,
-            },
-            || {
-                let cache = KVCacheInner::new_with_dtype(1, 1, 4, 4, DType::F32);
-                assert_eq!(cache.dtype, DType::F32);
-                assert!(!cache.follows_global_dtype);
-                cache.k.with_storage_view_preferring(
-                    StoragePreference::Native,
-                    |view| match view {
-                        TensorStorageView::F32(view) => assert_eq!(view.shape(), &[1, 1, 4, 4]),
-                        TensorStorageView::F16(_) => {
-                            panic!(
-                                "explicit kv cache dtype should override global bf16 runtime dtype"
-                            )
-                        }
-                        TensorStorageView::BF16(_) => {
-                            panic!(
-                                "explicit kv cache dtype should override global bf16 runtime dtype"
-                            )
-                        }
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn self_attention_allows_i8_activation_dtype_with_float_kv_cache() {
-        let attn = SelfAttention::new_with_runtime_dtypes(
-            8,
-            2,
-            1,
-            8,
-            10000.0,
-            true,
-            DType::I8,
-            DType::I8,
-            DType::BF16,
-        );
-        assert_eq!(attn.activation_dtype(), DType::I8);
-        assert_eq!(attn.kv_cache_dtype(), DType::BF16);
-    }
-
-    #[test]
-    #[should_panic(expected = "KV cache batch size must be > 0")]
-    fn kv_cache_rejects_zero_batch() {
-        let _ = KVCacheInner::new(0, 1, 4, 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "SelfAttention KV cache shape mismatch")]
-    fn self_attention_rejects_cache_shape_mismatch() {
-        let attn = SelfAttention::new(8, 2, 1, 8, 10000.0, true);
-        let input = make_tensor(&[1, 1, 8], vec![0.0; 8], DType::F32);
-        let cache: KVCache = Rc::new(RefCell::new(KVCacheInner::new(2, 1, 8, 4)));
-        no_grad(|| {
-            let _ = attn.forward(input, Some(cache));
-        });
-    }
-
-    #[test]
-    #[should_panic(expected = "SelfAttention KV cache current length out of bounds")]
-    fn self_attention_rejects_cache_len_overflow() {
-        let attn = SelfAttention::new(8, 2, 1, 8, 10000.0, true);
-        let input = make_tensor(&[1, 1, 8], vec![0.0; 8], DType::F32);
-        let mut cache = KVCacheInner::new(1, 1, 8, 4);
-        cache.len = 9;
-        let cache: KVCache = Rc::new(RefCell::new(cache));
-        no_grad(|| {
-            let _ = attn.forward(input, Some(cache));
-        });
-    }
-
-    #[test]
-    fn self_attention_explicit_dtype_overrides_global_default() {
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::BF16,
-                runtime_dtype: DType::F32,
-                allow_parameter_dtype_copies: false,
-            },
-            || {
-                let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::F32);
-                for weight in [
-                    &attn.w_q.weight,
-                    &attn.w_k.weight,
-                    &attn.w_v.weight,
-                    &attn.w_o.weight,
-                ] {
-                    assert_eq!(weight.dtype(), DType::F32);
-                }
-                assert_eq!(attn.rope.cache_dtype(), DType::F32);
-            },
-        );
-    }
-
-    #[test]
-    fn self_attention_default_construction_splits_parameter_and_runtime_defaults() {
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::F32,
-                runtime_dtype: DType::BF16,
-                allow_parameter_dtype_copies: false,
-            },
-            || {
-                let attn = SelfAttention::new(8, 2, 1, 8, 10000.0, true);
-                for weight in [
-                    &attn.w_q.weight,
-                    &attn.w_k.weight,
-                    &attn.w_v.weight,
-                    &attn.w_o.weight,
-                ] {
-                    assert_eq!(weight.dtype(), DType::F32);
-                }
-                assert_eq!(attn.rope.cache_dtype(), DType::BF16);
-            },
-        );
-    }
-
-    #[test]
-    fn self_attention_default_construction_captures_runtime_dtype_for_future_cache_creation() {
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::F32,
-                runtime_dtype: DType::BF16,
-                allow_parameter_dtype_copies: false,
-            },
-            || {
-                let attn = SelfAttention::new(8, 2, 1, 8, 10000.0, true);
-                set_default_runtime_dtype(DType::F32);
-                let input = make_tensor(&[1, 1, 8], vec![0.0; 8], DType::F32);
-                let (_out, cache) = no_grad(|| attn.forward(input, None));
-                let cache = cache.expect("no_grad attention should create cache");
-                assert_eq!(cache.borrow().dtype, DType::BF16);
-            },
-        );
-    }
-
-    #[test]
-    fn repeat_kv_no_grad_preserves_bf16_input_dtype() {
-        let input = make_tensor(
-            &[1, 2, 2, 2],
-            vec![1.0, 2.0, -1.0, -2.0, 3.0, 4.0, -3.0, -4.0],
-            DType::BF16,
-        );
-        let out = no_grad(|| repeat_kv(input, 2));
-        assert_eq!(out.shape_vec(), vec![1, 4, 2, 2]);
-        assert_eq!(out.dtype(), DType::BF16);
-    }
-
-    #[test]
-    fn repeat_kv_no_grad_preserves_i8_input_dtype() {
-        let input = make_tensor(&[1, 2, 1, 2], vec![1.0, -2.0, 3.0, -4.0], DType::I8);
-        let out = no_grad(|| repeat_kv(input, 3));
-        assert_eq!(out.shape_vec(), vec![1, 6, 1, 2]);
-        assert_eq!(out.dtype(), DType::I8);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_repeat_kv_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let input = make_tensor(
-            &[1, 2, 2, 3],
-            vec![
-                1.0, 2.0, 3.0, -1.0, -2.0, -3.0, 4.0, 5.0, 6.0, -4.0, -5.0, -6.0,
-            ],
-            DType::BF16,
-        )
-        .to_cuda();
-
-        assert!(input.0.borrow().cuda_f32_data.is_none());
-        assert!(input.0.borrow().cuda_bf16_data.is_some());
-
-        set_strict_device_execution(true);
-        let cuda_out = no_grad(|| repeat_kv(input.clone(), 2));
-        set_strict_device_execution(false);
-
-        let cpu_out = no_grad(|| repeat_kv(input.to_cpu(), 2));
-        assert!(cuda_out.is_cuda());
-        assert_eq!(cuda_out.dtype(), DType::BF16);
-        assert!(cuda_out.0.borrow().cuda_f32_data.is_none());
-        assert!(cuda_out.0.borrow().cuda_bf16_data.is_some());
-        assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
-        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_empty_repeat_kv_no_grad_stays_on_cuda_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let input = make_tensor(&[1, 2, 0, 3], vec![], DType::BF16).to_cuda();
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let out = no_grad(|| repeat_kv(input, 2));
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        assert!(out.is_cuda());
-        assert_eq!(out.dtype(), DType::BF16);
-        assert_eq!(out.shape_vec(), vec![1, 4, 0, 3]);
-        assert_eq!(out.len(), 0);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_kv_cache_prefix_preserves_bf16_native_storage_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let cache = make_tensor(
-            &[1, 2, 4, 2],
-            vec![
-                1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, -1.0, -1.5, -2.0, -2.5, -3.0, -3.5, -4.0,
-                -4.5,
-            ],
-            DType::BF16,
-        )
-        .to_cuda();
-        assert!(cache.0.borrow().cuda_f32_data.is_none());
-        assert!(cache.0.borrow().cuda_bf16_data.is_some());
-
-        set_strict_device_execution(true);
-        let cuda_prefix = cache_prefix_tensor(&cache, 2);
-        set_strict_device_execution(false);
-
-        let cpu_prefix = cache_prefix_tensor(&cache.to_cpu(), 2);
-        assert!(cuda_prefix.is_cuda());
-        assert_eq!(cuda_prefix.dtype(), DType::BF16);
-        assert_eq!(cuda_prefix.shape_vec(), vec![1, 2, 2, 2]);
-        assert!(cuda_prefix.0.borrow().cuda_f32_data.is_none());
-        assert!(cuda_prefix.0.borrow().cuda_bf16_data.is_some());
-        for (got, expect) in cuda_prefix
-            .data_ref()
-            .iter()
-            .zip(cpu_prefix.data_ref().iter())
-        {
-            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
-        }
-    }
-
-    #[test]
-    fn repeat_kv_backward_accumulates_repeated_heads_on_cpu() {
-        let input = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(
-                IxDyn(&[1, 2, 2, 2]),
-                vec![1.0, -1.0, 2.0, -2.0, 0.5, 1.5, -0.5, -1.5],
-            )
-            .expect("input shape mismatch")
-            .into_dyn(),
-            true,
-        );
-        let coeff = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(
-                IxDyn(&[1, 4, 2, 2]),
-                (0..16).map(|v| v as f32 * 0.25 - 1.0).collect(),
-            )
-            .expect("coeff shape mismatch")
-            .into_dyn(),
-            false,
-        );
-
-        let out = repeat_kv(input.clone(), 2);
-        let loss = crate::ops::arithmetic::sum(&(&out * &coeff));
-        loss.backward();
-
-        let grad = input.grad().expect("repeat_kv input grad");
-        let vals = grad.iter().copied().collect::<Vec<_>>();
-        let coeff_vals = coeff.data_ref().iter().copied().collect::<Vec<_>>();
-        let mut expected = vec![0.0f32; 8];
-        for hk in 0..2 {
-            for rep in 0..2 {
-                for ss in 0..2 {
-                    for dd in 0..2 {
-                        let src = ((hk * 2 + rep) * 2 + ss) * 2 + dd;
-                        let dst = (hk * 2 + ss) * 2 + dd;
-                        expected[dst] += coeff_vals[src];
-                    }
-                }
-            }
-        }
-        assert_eq!(vals, expected);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_repeat_kv_backward_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let input_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(
-                IxDyn(&[1, 2, 2, 2]),
-                vec![1.0, -1.0, 2.0, -2.0, 0.5, 1.5, -0.5, -1.5],
-            )
-            .expect("input shape mismatch")
-            .into_dyn(),
-            true,
-        );
-        let coeff_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(
-                IxDyn(&[1, 4, 2, 2]),
-                (0..16).map(|v| v as f32 * 0.25 - 1.0).collect(),
-            )
-            .expect("coeff shape mismatch")
-            .into_dyn(),
-            false,
-        );
-        let input_cuda = input_cpu.to_cuda();
-        let coeff_cuda = coeff_cpu.to_cuda();
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let cuda_out = repeat_kv(input_cuda.clone(), 2);
-        let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
-        cuda_loss.backward();
-        assert!(input_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!input_cuda.has_host_grad());
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let cpu_out = repeat_kv(input_cpu.clone(), 2);
-        let cpu_loss = crate::ops::arithmetic::sum(&(&cpu_out * &coeff_cpu));
-        cpu_loss.backward();
-
-        let cuda_grad = input_cuda.grad().expect("cuda repeat_kv grad");
-        let cpu_grad = input_cpu.grad().expect("cpu repeat_kv grad");
-        for (got, expect) in cuda_grad.iter().zip(cpu_grad.iter()) {
-            assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_repeat_kv_preserves_i8_dtype_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let input = make_tensor(&[1, 2, 1, 2], vec![1.0, -2.0, 3.0, -4.0], DType::I8).to_cuda();
-
-        assert!(input.0.borrow().cuda_f32_data.is_none());
-        assert!(input.0.borrow().cuda_i8_data.is_some());
-
-        set_strict_device_execution(true);
-        let out = no_grad(|| repeat_kv(input, 2));
-        set_strict_device_execution(false);
-
-        assert!(out.is_cuda());
-        assert_eq!(out.dtype(), DType::I8);
-        assert!(out.0.borrow().cuda_f32_data.is_none());
-        assert!(out.0.borrow().cuda_i8_data.is_some());
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_self_attention_training_backward_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::F32);
-        let attn_ref = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::F32);
-
-        for ((dst, src), shape, scale) in [
-            (
-                (&attn.w_q.weight, &attn_ref.w_q.weight),
-                vec![8, 8],
-                0.03125f32,
-            ),
-            (
-                (&attn.w_k.weight, &attn_ref.w_k.weight),
-                vec![4, 8],
-                0.0275f32,
-            ),
-            (
-                (&attn.w_v.weight, &attn_ref.w_v.weight),
-                vec![4, 8],
-                -0.021f32,
-            ),
-            (
-                (&attn.w_o.weight, &attn_ref.w_o.weight),
-                vec![8, 8],
-                0.01875f32,
-            ),
-        ] {
-            let data = (0..shape.iter().product::<usize>())
-                .map(|i| (i as f32 * scale) - 0.25)
-                .collect::<Vec<_>>();
-            let arr = Array::from_shape_vec(IxDyn(&shape), data).expect("weight shape");
-            dst.set_array_f32_with_dtype(arr.clone(), DType::F32);
-            src.set_array_f32_with_dtype(arr, DType::F32);
-        }
-
-        attn.to_cuda();
-        let input_cpu = make_grad_tensor(
-            &[1, 3, 8],
-            (0..24).map(|i| (i as f32 * 0.0625) - 0.4).collect(),
-        );
-        let coeff_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(
-                IxDyn(&[1, 3, 8]),
-                (0..24).map(|i| (i as f32 * 0.0375) - 0.2).collect(),
-            )
-            .expect("coeff shape mismatch")
-            .into_dyn(),
-            false,
-        );
-        let input_cuda = input_cpu.to_cuda();
-        let coeff_cuda = coeff_cpu.to_cuda();
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let (cuda_out, cuda_cache) = attn.forward(input_cuda.clone(), None);
-        assert!(cuda_out.is_cuda());
-        assert!(cuda_cache.is_none());
-        let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
-        cuda_loss.backward();
-        assert!(input_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!input_cuda.has_host_grad());
-        for param in attn.parameters() {
-            assert!(param.cloned_cuda_f32_grad().is_some());
-            assert!(!param.has_host_grad());
-        }
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let (cpu_out, cpu_cache) = attn_ref.forward(input_cpu.clone(), None);
-        assert!(cpu_cache.is_none());
-        let cpu_loss = crate::ops::arithmetic::sum(&(&cpu_out * &coeff_cpu));
-        cpu_loss.backward();
-
-        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 1e-4, "got {got}, expect {expect}");
-        }
-        let cuda_input_grad = input_cuda.grad().expect("cuda attention input grad");
-        let cpu_input_grad = input_cpu.grad().expect("cpu attention input grad");
-        for (got, expect) in cuda_input_grad.iter().zip(cpu_input_grad.iter()) {
-            assert!((got - expect).abs() < 1e-3, "got {got}, expect {expect}");
-        }
-        for (cuda_param, cpu_param) in attn.parameters().iter().zip(attn_ref.parameters().iter()) {
-            let cuda_grad = cuda_param.grad().expect("cuda attention parameter grad");
-            let cpu_grad = cpu_param.grad().expect("cpu attention parameter grad");
-            for (got, expect) in cuda_grad.iter().zip(cpu_grad.iter()) {
-                assert!((got - expect).abs() < 1e-3, "got {got}, expect {expect}");
-            }
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_self_attention_decode_output_projection_stays_on_cuda_and_matches_cpu() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-        let attn_ref = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-
-        for ((dst, src), shape, scale) in [
-            (
-                (&attn.w_q.weight, &attn_ref.w_q.weight),
-                vec![8, 8],
-                0.03125f32,
-            ),
-            (
-                (&attn.w_k.weight, &attn_ref.w_k.weight),
-                vec![4, 8],
-                0.0275f32,
-            ),
-            (
-                (&attn.w_v.weight, &attn_ref.w_v.weight),
-                vec![4, 8],
-                -0.021f32,
-            ),
-            (
-                (&attn.w_o.weight, &attn_ref.w_o.weight),
-                vec![8, 8],
-                0.01875f32,
-            ),
-        ] {
-            let data = (0..shape.iter().product::<usize>())
-                .map(|i| (i as f32 * scale) - 0.25)
-                .collect::<Vec<_>>();
-            let arr = Array::from_shape_vec(IxDyn(&shape), data).expect("weight shape");
-            dst.set_array_f32_with_dtype(arr.clone(), DType::BF16);
-            src.set_array_f32_with_dtype(arr, DType::BF16);
-        }
-
-        attn.to_cuda();
-        let input = make_tensor(
-            &[1, 1, 8],
-            (0..8).map(|i| (i as f32 * 0.125) - 0.25).collect(),
-            DType::BF16,
-        )
-        .to_cuda();
-
-        set_strict_device_execution(true);
-        let (cuda_out, _) = no_grad(|| attn.forward(input.clone(), None));
-        set_strict_device_execution(false);
-
-        let (cpu_out, _) = no_grad(|| attn_ref.forward(input.to_cpu(), None));
-        assert!(cuda_out.is_cuda());
-        assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
-        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 3e-2, "got {got}, expect {expect}");
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_self_attention_decode_second_step_matches_cpu_reference() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-        let attn_ref = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-
-        for ((dst, src), shape, scale) in [
-            (
-                (&attn.w_q.weight, &attn_ref.w_q.weight),
-                vec![8, 8],
-                0.03125f32,
-            ),
-            (
-                (&attn.w_k.weight, &attn_ref.w_k.weight),
-                vec![4, 8],
-                0.0275f32,
-            ),
-            (
-                (&attn.w_v.weight, &attn_ref.w_v.weight),
-                vec![4, 8],
-                -0.021f32,
-            ),
-            (
-                (&attn.w_o.weight, &attn_ref.w_o.weight),
-                vec![8, 8],
-                0.01875f32,
-            ),
-        ] {
-            let data = (0..shape.iter().product::<usize>())
-                .map(|i| (i as f32 * scale) - 0.25)
-                .collect::<Vec<_>>();
-            let arr = Array::from_shape_vec(IxDyn(&shape), data).expect("weight shape");
-            dst.set_array_f32_with_dtype(arr.clone(), DType::BF16);
-            src.set_array_f32_with_dtype(arr, DType::BF16);
-        }
-
-        attn.to_cuda();
-        let cuda_cache: KVCache = Rc::new(RefCell::new(KVCacheInner::new_with_dtype(
-            1,
-            1,
-            8,
-            4,
-            DType::BF16,
-        )));
-        cuda_cache.borrow_mut().to_device_inplace(Device::Cuda);
-        let cpu_cache: KVCache = Rc::new(RefCell::new(KVCacheInner::new_with_dtype(
-            1,
-            1,
-            8,
-            4,
-            DType::BF16,
-        )));
-
-        let step1 = make_tensor(
-            &[1, 1, 8],
-            (0..8).map(|i| (i as f32 * 0.125) - 0.25).collect(),
-            DType::BF16,
-        );
-        let step2 = make_tensor(
-            &[1, 1, 8],
-            (0..8).map(|i| (i as f32 * 0.09375) + 0.1).collect(),
-            DType::BF16,
-        );
-
-        set_strict_device_execution(true);
-        let (_cuda_out1, cuda_cache) = no_grad(|| attn.forward(step1.to_cuda(), Some(cuda_cache)));
-        let cuda_cache = cuda_cache.expect("cuda cache after step1");
-        let (cuda_out2, cuda_cache) = no_grad(|| attn.forward(step2.to_cuda(), Some(cuda_cache)));
-        let cuda_cache = cuda_cache.expect("cuda cache after step2");
-        set_strict_device_execution(false);
-
-        let (_cpu_out1, cpu_cache) = no_grad(|| attn_ref.forward(step1, Some(cpu_cache)));
-        let cpu_cache = cpu_cache.expect("cpu cache after step1");
-        let (cpu_out2, cpu_cache) = no_grad(|| attn_ref.forward(step2, Some(cpu_cache)));
-        let cpu_cache = cpu_cache.expect("cpu cache after step2");
-
-        assert!(cuda_out2.is_cuda());
-        assert_eq!(cuda_cache.borrow().len, 2);
-        assert_eq!(cpu_cache.borrow().len, 2);
-        assert_eq!(cuda_out2.shape_vec(), cpu_out2.shape_vec());
-        for (got, expect) in cuda_out2.data_ref().iter().zip(cpu_out2.data_ref().iter()) {
-            assert!((got - expect).abs() < 5e-2, "got {got}, expect {expect}");
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_self_attention_prefill_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-        let attn_ref = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-
-        for ((dst, src), shape, scale) in [
-            (
-                (&attn.w_q.weight, &attn_ref.w_q.weight),
-                vec![8, 8],
-                0.03125f32,
-            ),
-            (
-                (&attn.w_k.weight, &attn_ref.w_k.weight),
-                vec![4, 8],
-                0.0275f32,
-            ),
-            (
-                (&attn.w_v.weight, &attn_ref.w_v.weight),
-                vec![4, 8],
-                -0.021f32,
-            ),
-            (
-                (&attn.w_o.weight, &attn_ref.w_o.weight),
-                vec![8, 8],
-                0.01875f32,
-            ),
-        ] {
-            let data = (0..shape.iter().product::<usize>())
-                .map(|i| (i as f32 * scale) - 0.25)
-                .collect::<Vec<_>>();
-            let arr = Array::from_shape_vec(IxDyn(&shape), data).expect("weight shape");
-            dst.set_array_f32_with_dtype(arr.clone(), DType::BF16);
-            src.set_array_f32_with_dtype(arr, DType::BF16);
-        }
-
-        attn.to_cuda();
-        let input = make_tensor(
-            &[1, 3, 8],
-            (0..24).map(|i| (i as f32 * 0.0625) - 0.4).collect(),
-            DType::BF16,
-        );
-
-        set_strict_device_execution(true);
-        let (cuda_out, cuda_cache) = no_grad(|| attn.forward(input.to_cuda(), None));
-        set_strict_device_execution(false);
-
-        let (cpu_out, cpu_cache) = no_grad(|| attn_ref.forward(input, None));
-        let cuda_cache = cuda_cache.expect("cuda cache after prefill");
-        let cpu_cache = cpu_cache.expect("cpu cache after prefill");
-
-        assert!(cuda_out.is_cuda());
-        assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
-        assert_eq!(cuda_cache.borrow().len, 3);
-        assert_eq!(cpu_cache.borrow().len, 3);
-        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 6e-2, "got {got}, expect {expect}");
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_self_attention_multi_token_continuation_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-        let attn_ref = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-
-        for ((dst, src), shape, scale) in [
-            (
-                (&attn.w_q.weight, &attn_ref.w_q.weight),
-                vec![8, 8],
-                0.03125f32,
-            ),
-            (
-                (&attn.w_k.weight, &attn_ref.w_k.weight),
-                vec![4, 8],
-                0.0275f32,
-            ),
-            (
-                (&attn.w_v.weight, &attn_ref.w_v.weight),
-                vec![4, 8],
-                -0.021f32,
-            ),
-            (
-                (&attn.w_o.weight, &attn_ref.w_o.weight),
-                vec![8, 8],
-                0.01875f32,
-            ),
-        ] {
-            let data = (0..shape.iter().product::<usize>())
-                .map(|i| (i as f32 * scale) - 0.25)
-                .collect::<Vec<_>>();
-            let arr = Array::from_shape_vec(IxDyn(&shape), data).expect("weight shape");
-            dst.set_array_f32_with_dtype(arr.clone(), DType::BF16);
-            src.set_array_f32_with_dtype(arr, DType::BF16);
-        }
-
-        attn.to_cuda();
-        let prefill = make_tensor(
-            &[1, 2, 8],
-            (0..16).map(|i| (i as f32 * 0.0625) - 0.4).collect(),
-            DType::BF16,
-        );
-        let continuation = make_tensor(
-            &[1, 2, 8],
-            (0..16).map(|i| (i as f32 * 0.0575) + 0.15).collect(),
-            DType::BF16,
-        );
-
-        set_strict_device_execution(true);
-        let (_cuda_prefill_out, cuda_cache) = no_grad(|| attn.forward(prefill.to_cuda(), None));
-        let cuda_cache = cuda_cache.expect("cuda cache after prefill");
-        let (cuda_out, cuda_cache) =
-            no_grad(|| attn.forward(continuation.to_cuda(), Some(cuda_cache)));
-        let cuda_cache = cuda_cache.expect("cuda cache after continuation");
-        set_strict_device_execution(false);
-
-        let (_cpu_prefill_out, cpu_cache) = no_grad(|| attn_ref.forward(prefill, None));
-        let cpu_cache = cpu_cache.expect("cpu cache after prefill");
-        let (cpu_out, cpu_cache) = no_grad(|| attn_ref.forward(continuation, Some(cpu_cache)));
-        let cpu_cache = cpu_cache.expect("cpu cache after continuation");
-
-        assert!(cuda_out.is_cuda());
-        assert_eq!(cuda_cache.borrow().len, 4);
-        assert_eq!(cpu_cache.borrow().len, 4);
-        assert_eq!(cuda_out.shape_vec(), cpu_out.shape_vec());
-        for (got, expect) in cuda_out.data_ref().iter().zip(cpu_out.data_ref().iter()) {
-            assert!((got - expect).abs() < 7e-2, "got {got}, expect {expect}");
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_kv_cache_writes_preserve_resident_buffers_across_decode_steps() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let attn = SelfAttention::new_with_dtype(8, 2, 1, 8, 10000.0, true, DType::BF16);
-        attn.to_cuda();
-        let cache: KVCache = Rc::new(RefCell::new(KVCacheInner::new_with_dtype(
-            1,
-            1,
-            8,
-            4,
-            DType::BF16,
-        )));
-        cache.borrow().k.to_cuda_inplace();
-        cache.borrow().v.to_cuda_inplace();
-
-        let step1 = make_tensor(
-            &[1, 1, 8],
-            (0..8).map(|i| (i as f32 * 0.125) - 0.25).collect(),
-            DType::BF16,
-        )
-        .to_cuda();
-        let step2 = make_tensor(
-            &[1, 1, 8],
-            (0..8).map(|i| (i as f32 * 0.09375) + 0.1).collect(),
-            DType::BF16,
-        )
-        .to_cuda();
-
-        set_strict_device_execution(true);
-        let (_out1, cache) = no_grad(|| attn.forward(step1, Some(cache)));
-        let cache = cache.expect("decode step 1 should return KV cache");
-        assert!(cache.borrow().k.cloned_cuda_f32_buffer().is_some());
-        assert!(cache.borrow().v.cloned_cuda_f32_buffer().is_some());
-        let (_out2, cache) = no_grad(|| attn.forward(step2, Some(cache)));
-        let cache = cache.expect("decode step 2 should return KV cache");
-        set_strict_device_execution(false);
-
-        assert_eq!(cache.borrow().len, 2);
-        assert!(cache.borrow().k.cloned_cuda_f32_buffer().is_some());
-        assert!(cache.borrow().v.cloned_cuda_f32_buffer().is_some());
-    }
-}
+#[path = "../../../tests/unit/layers/attention/self_attention/tests.rs"]
+mod tests;

@@ -1,3 +1,75 @@
+template <typename StateT, bool Adam>
+static bool launch_lowp_state_optimizer(
+    const LowpOptimizerItem* items, size_t count, size_t max_len,
+    float lr, float beta1, float beta2, float correction1, float correction2, float eps) {
+    constexpr unsigned int block_size = 256;
+    const unsigned int grid_x = std::min(linear_grid_size(max_len, block_size), 1024u);
+    if (count == 1) {
+        optimizer_lowp_state_single_kernel<StateT, Adam><<<grid_x, block_size>>>(
+            items[0], lr, beta1, beta2, correction1, correction2, eps);
+    } else {
+        size_t bytes = 0;
+        if (!checked_product("CUDA lowp optimizer metadata overflow",
+                             {count, sizeof(LowpOptimizerItem)}, &bytes)) { return false; }
+        thread_local ReusableCudaWorkspace metadata;
+        if (!metadata.ensure(bytes, "CUDA lowp optimizer metadata allocation failed")) { return false; }
+        cudaError_t status = cudaMemcpy(metadata.ptr, items, bytes, cudaMemcpyHostToDevice);
+        if (status != cudaSuccess) {
+            set_cuda_error("CUDA lowp optimizer metadata upload failed", status);
+            return false;
+        }
+        dim3 grid(grid_x, static_cast<unsigned int>(count), 1);
+        optimizer_lowp_state_batched_kernel<StateT, Adam><<<grid, block_size>>>(
+            static_cast<const LowpOptimizerItem*>(metadata.ptr),
+            lr, beta1, beta2, correction1, correction2, eps);
+    }
+    return check_cuda_launch("CUDA lowp-state optimizer update failed");
+}
+
+extern "C" int lumen_cuda_optimizer_lowp_state_device(
+    const uint64_t* param_handles, const uint64_t* grad_handles,
+    const uint64_t* first_handles, const uint64_t* second_handles,
+    const size_t* lens, size_t count, int state_dtype,
+    float lr, float beta1, float beta2, float correction1, float correction2, float eps) {
+    if (!param_handles || !grad_handles || !first_handles || !lens || count == 0 ||
+        (state_dtype != kDTypeF16 && state_dtype != kDTypeBF16)) {
+        set_error("CUDA lowp optimizer received invalid metadata or state dtype");
+        return 1;
+    }
+    if (!validate_grid_yz_dimension("CUDA lowp optimizer count exceeds grid.y range", count)) {
+        return 1;
+    }
+    thread_local std::vector<LowpOptimizerItem> items;
+    items.resize(count);
+    size_t max_len = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!validate_handle(param_handles[i], "CUDA lowp optimizer parameter") ||
+            !validate_handle(grad_handles[i], "CUDA lowp optimizer gradient") ||
+            !validate_handle(first_handles[i], "CUDA lowp optimizer first state") ||
+            (second_handles && !validate_handle(second_handles[i], "CUDA lowp optimizer second state")) ||
+            lens[i] == 0) {
+            set_error("CUDA lowp optimizer received invalid handle or zero tensor length");
+            return 1;
+        }
+        items[i] = {handle_to_ptr(param_handles[i]), handle_to_ptr(grad_handles[i]),
+                    reinterpret_cast<uint16_t*>(handle_to_ptr(first_handles[i])),
+                    second_handles ? reinterpret_cast<uint16_t*>(handle_to_ptr(second_handles[i])) : nullptr,
+                    lens[i]};
+        max_len = std::max(max_len, lens[i]);
+    }
+    bool ok;
+    if (state_dtype == kDTypeF16) {
+        ok = second_handles
+            ? launch_lowp_state_optimizer<__half, true>(items.data(), count, max_len, lr, beta1, beta2, correction1, correction2, eps)
+            : launch_lowp_state_optimizer<__half, false>(items.data(), count, max_len, lr, beta1, beta2, correction1, correction2, eps);
+    } else {
+        ok = second_handles
+            ? launch_lowp_state_optimizer<__nv_bfloat16, true>(items.data(), count, max_len, lr, beta1, beta2, correction1, correction2, eps)
+            : launch_lowp_state_optimizer<__nv_bfloat16, false>(items.data(), count, max_len, lr, beta1, beta2, correction1, correction2, eps);
+    }
+    return ok ? 0 : 1;
+}
+
 bool append_optimizer_metadata_block(
     size_t count,
     size_t element_size,

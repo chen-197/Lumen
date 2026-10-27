@@ -596,3 +596,55 @@ extern "C" int lumen_cuda_cross_entropy_loss_typed_target_device(
             return 1;
     }
 }
+
+
+extern "C" int lumen_cuda_cross_entropy_logits_device(
+    uint64_t logits_handle, int logits_dtype, float logits_scale,
+    uint64_t target_handle, int target_dtype, float target_scale,
+    uint64_t probabilities_handle, uint64_t loss_handle, size_t rows, size_t cols) {
+    if (!validate_handle(logits_handle, "CUDA cross entropy logits") ||
+        !validate_handle(target_handle, "CUDA cross entropy targets") ||
+        !validate_handle(probabilities_handle, "CUDA cross entropy probabilities") ||
+        !validate_handle(loss_handle, "CUDA cross entropy loss")) return 1;
+    if (rows == 0 || cols == 0 || rows > SIZE_MAX / cols ||
+        logits_dtype < kDTypeF32 || logits_dtype > kDTypeI8 ||
+        target_dtype < kDTypeF32 || target_dtype > kDTypeI8 ||
+        (logits_dtype == kDTypeI8 && (!std::isfinite(logits_scale) || logits_scale <= 0.0f)) ||
+        (target_dtype == kDTypeI8 && (!std::isfinite(target_scale) || target_scale <= 0.0f))) {
+        set_error("invalid CUDA cross entropy shape, dtype or scale"); return 1;
+    }
+    cudaError_t status = cudaMemset(handle_to_ptr(loss_handle), 0, sizeof(float));
+    if (status != cudaSuccess) {set_cuda_error("CUDA cross entropy loss initialization", status); return 1;}
+    cross_entropy_logits_kernel<<<static_cast<unsigned int>(std::min(rows, size_t(65535))), 256>>>(
+        handle_to_ptr(logits_handle), logits_dtype, logits_scale,
+        handle_to_ptr(target_handle), target_dtype, target_scale,
+        handle_to_ptr(probabilities_handle), handle_to_ptr(loss_handle), rows, cols);
+    return check_cuda_launch("CUDA cross entropy logits kernel") ? 0 : 1;
+}
+
+extern "C" int lumen_cuda_cross_entropy_logits_backward_device(
+    uint64_t logits_handle, int logits_dtype, float logits_scale,
+    uint64_t target_handle, int target_dtype, float target_scale,
+    uint64_t probabilities_handle, uint64_t grad_logits_handle, uint64_t grad_targets_handle,
+    size_t rows, size_t cols, float factor) {
+    if (!validate_handle(logits_handle, "CUDA cross entropy backward logits") ||
+        !validate_handle(target_handle, "CUDA cross entropy backward targets") ||
+        !validate_handle(probabilities_handle, "CUDA cross entropy backward probabilities")) return 1;
+    if ((grad_logits_handle != 0 && !validate_handle(grad_logits_handle, "CUDA cross entropy logits gradient")) ||
+        (grad_targets_handle != 0 && !validate_handle(grad_targets_handle, "CUDA cross entropy target gradient"))) return 1;
+    if (rows == 0 || cols == 0 || rows > SIZE_MAX / cols ||
+        (grad_logits_handle == 0 && grad_targets_handle == 0) ||
+        logits_dtype < kDTypeF32 || logits_dtype > kDTypeI8 ||
+        target_dtype < kDTypeF32 || target_dtype > kDTypeI8 ||
+        (logits_dtype == kDTypeI8 && (!std::isfinite(logits_scale) || logits_scale <= 0.0f)) ||
+        (target_dtype == kDTypeI8 && (!std::isfinite(target_scale) || target_scale <= 0.0f))) {
+        set_error("invalid CUDA cross entropy backward shape, dtype, scale or outputs"); return 1;
+    }
+    cross_entropy_logits_backward_kernel<<<static_cast<unsigned int>(std::min(rows, size_t(65535))), 256>>>(
+        handle_to_ptr(logits_handle), logits_dtype, logits_scale,
+        handle_to_ptr(target_handle), target_dtype, target_scale,
+        handle_to_ptr(probabilities_handle),
+        grad_logits_handle == 0 ? nullptr : handle_to_ptr(grad_logits_handle),
+        grad_targets_handle == 0 ? nullptr : handle_to_ptr(grad_targets_handle), rows, cols, factor);
+    return check_cuda_launch("CUDA cross entropy logits backward kernel") ? 0 : 1;
+}

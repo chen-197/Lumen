@@ -1,13 +1,21 @@
 [package]
 name = "lumen"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
+description = "A compact Rust-first neural-network library with dtype-aware CPU/CUDA execution and dynamic autograd"
+repository = "https://github.com/chen-197/Lumen"
+readme = "README.md"
+license-file = "LICENSE"
+keywords = ["tensor", "autograd", "cuda", "neural-network", "machine-learning"]
+categories = ["science", "algorithms"]
+include = ["Cargo.toml", "Cargo.lock", "build.rs", "src/**", "README.md", "README_zh-CN.md", "CHANGELOG.md", "LICENSE", "dev-tools/*.py", "dev-tools/*.ps1", "dev-tools/**/*.rs", "dev-tools/README.md", "tests/**"]
 autobins = false
 build = "build.rs"
 
 [features]
 default = []
 dev-tools = []
+cpu-profiling = ["dev-tools"]
 arm64-int8-kernels = []
 x86-int8-kernels = []
 arm64-fp-kernels = []
@@ -47,15 +55,45 @@ path = "src/bin/quantize_safetensors.rs"
 
 [[bin]]
 name = "kernel_bench"
-path = "src/bin/kernel_bench.rs"
+path = "dev-tools/benchmarks/kernel_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "cpu_projection_bench"
+path = "dev-tools/benchmarks/cpu_projection_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "cpu_decode_bench"
+path = "dev-tools/benchmarks/cpu_decode_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "cpu_scaling_bench"
+path = "dev-tools/benchmarks/cpu_scaling_bench.rs"
 required-features = ["dev-tools"]
 
 [[bin]]
 name = "prefill_decode_bench"
-path = "src/bin/prefill_decode_bench.rs"
+path = "dev-tools/benchmarks/prefill_decode_bench/main.rs"
 required-features = ["dev-tools"]
 
 [[bin]]
 name = "cuda_cpu_bench"
-path = "src/bin/cuda_cpu_bench.rs"
+path = "dev-tools/benchmarks/cuda_cpu_bench/main.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "manual_state_check"
+path = "dev-tools/bin/manual_state_check.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "generic_prefill_bench"
+path = "dev-tools/benchmarks/generic_prefill_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "cpu_backward_bench"
+path = "dev-tools/benchmarks/cpu_backward_bench.rs"
 required-features = ["dev-tools"]

@@ -1,5 +1,57 @@
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::marker::PhantomData;
+use std::rc::Rc;
+
+/// Whether inference may quantize floating activations beyond their declared dtype.
+/// Explicit I8 tensors are unaffected. The opt-in mode permits supported kernels
+/// to use dynamic I8 activations; it does not require every backend to do so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InferenceActivationQuantization {
+    #[default]
+    Disabled,
+    AllowDynamicI8,
+}
+
+thread_local! {
+    static INFERENCE_ACTIVATION_QUANTIZATION: Cell<InferenceActivationQuantization> =
+        const { Cell::new(InferenceActivationQuantization::Disabled) };
+}
+
+#[inline]
+pub fn inference_activation_quantization() -> InferenceActivationQuantization {
+    INFERENCE_ACTIVATION_QUANTIZATION.with(Cell::get)
+}
+
+struct InferenceQuantizationGuard {
+    previous: InferenceActivationQuantization,
+    _caller_thread: PhantomData<Rc<()>>,
+}
+
+impl Drop for InferenceQuantizationGuard {
+    fn drop(&mut self) {
+        INFERENCE_ACTIVATION_QUANTIZATION.with(|value| value.set(self.previous));
+    }
+}
+
+/// Scopes the policy to this calling thread, restoring it on return or unwind.
+/// Apply the scope where inference is executed, including when using other threads.
+pub fn with_inference_activation_quantization<R>(
+    policy: InferenceActivationQuantization,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous = INFERENCE_ACTIVATION_QUANTIZATION.with(|value| value.replace(policy));
+    let _guard = InferenceQuantizationGuard {
+        previous,
+        _caller_thread: PhantomData,
+    };
+    run()
+}
+
+#[inline]
+pub(crate) fn allow_dynamic_i8_activations() -> bool {
+    inference_activation_quantization() == InferenceActivationQuantization::AllowDynamicI8
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DType {
@@ -144,6 +196,35 @@ fn validate_quantization_scale(scale: f32) {
     );
 }
 
+/// Prepared scalar storage conversion. Preserve reciprocal multiplication for
+/// ordinary scales; division handles positive subnormal scales whose reciprocal
+/// overflows. Callers validate the scale before constructing this converter.
+#[derive(Clone, Copy)]
+pub(crate) struct I8Requantizer {
+    scale: f32,
+    inverse: f32,
+}
+
+impl I8Requantizer {
+    #[inline]
+    pub(crate) fn new(scale: f32) -> Self {
+        Self {
+            scale,
+            inverse: scale.recip(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn quantize(self, value: f32) -> i8 {
+        let scaled = if self.inverse.is_finite() {
+            value * self.inverse
+        } else {
+            value / self.scale
+        };
+        scaled.round().clamp(-127.0, 127.0) as i8
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrecisionConfig {
     pub parameter_dtype: DType,
@@ -161,26 +242,49 @@ impl Default for PrecisionConfig {
     }
 }
 
+/// Restores the caller's precision state; cannot be sent to another thread.
+///
+/// ```compile_fail
+/// let guard = lumen::precision::precision_guard(Default::default());
+/// std::thread::spawn(move || drop(guard));
+/// ```
 pub struct PrecisionConfigGuard {
     previous: PrecisionConfig,
     _scope: Option<()>,
+    _caller_thread: PhantomData<Rc<()>>,
 }
 
+/// Restores caller-thread parameter quantization on drop.
+///
+/// ```compile_fail
+/// use lumen::precision::{parameter_quantization_guard, ParameterQuantization};
+/// let guard = parameter_quantization_guard(ParameterQuantization::Int8);
+/// std::thread::spawn(move || drop(guard));
+/// ```
 pub struct ParameterQuantizationGuard {
     previous: ParameterQuantization,
     _scope: Option<()>,
+    _caller_thread: PhantomData<Rc<()>>,
 }
 
+/// Restores caller-thread activation and KV cache dtype settings on drop.
+///
+/// ```compile_fail
+/// let guard = lumen::precision::runtime_component_dtypes_guard(None, None);
+/// std::thread::spawn(move || drop(guard));
+/// ```
 pub struct RuntimeComponentDTypesGuard {
     previous_activation_dtype: DType,
     previous_activation_follows_runtime: bool,
     previous_kv_cache_dtype: DType,
     previous_kv_cache_follows_runtime: bool,
     _scope: Option<()>,
+    _caller_thread: PhantomData<Rc<()>>,
 }
 
 struct GlobalConfigWriteGuard {
     _scope: Option<()>,
+    _caller_thread: PhantomData<Rc<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -235,6 +339,7 @@ fn end_global_config_scope(scope_name: &'static str) {
 fn global_config_write_guard(lock_message: &'static str) -> GlobalConfigWriteGuard {
     GlobalConfigWriteGuard {
         _scope: begin_global_config_scope(lock_message),
+        _caller_thread: PhantomData,
     }
 }
 
@@ -463,6 +568,7 @@ pub fn precision_guard(config: PrecisionConfig) -> PrecisionConfigGuard {
     PrecisionConfigGuard {
         previous,
         _scope: lock,
+        _caller_thread: PhantomData,
     }
 }
 
@@ -482,6 +588,7 @@ pub fn parameter_quantization_guard(
     ParameterQuantizationGuard {
         previous,
         _scope: lock,
+        _caller_thread: PhantomData,
     }
 }
 
@@ -518,6 +625,7 @@ pub fn runtime_component_dtypes_guard(
         previous_kv_cache_dtype,
         previous_kv_cache_follows_runtime,
         _scope: lock,
+        _caller_thread: PhantomData,
     }
 }
 
@@ -585,227 +693,5 @@ impl Drop for GlobalConfigWriteGuard {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn precision_scope_restores_previous_config() {
-        let _guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: false,
-        });
-
-        with_precision_config(
-            PrecisionConfig {
-                parameter_dtype: DType::BF16,
-                runtime_dtype: DType::BF16,
-                allow_parameter_dtype_copies: true,
-            },
-            || {
-                assert_eq!(precision_config().parameter_dtype, DType::BF16);
-                assert_eq!(precision_config().runtime_dtype, DType::BF16);
-                assert!(precision_config().allow_parameter_dtype_copies);
-            },
-        );
-
-        assert_eq!(precision_config().parameter_dtype, DType::F32);
-        assert_eq!(precision_config().runtime_dtype, DType::F32);
-        assert!(!precision_config().allow_parameter_dtype_copies);
-    }
-
-    #[test]
-    fn precision_config_is_thread_local() {
-        set_precision_config(PrecisionConfig::default());
-
-        let scoped = PrecisionConfig {
-            parameter_dtype: DType::BF16,
-            runtime_dtype: DType::F16,
-            allow_parameter_dtype_copies: true,
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let _guard = precision_guard(scoped);
-            tx.send(precision_config())
-                .expect("send thread-local precision config");
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            tx.send(precision_config())
-                .expect("send thread-local precision config");
-        });
-
-        assert_eq!(rx.recv().expect("receive spawned precision config"), scoped);
-        assert_eq!(
-            precision_config(),
-            PrecisionConfig::default(),
-            "main thread should not inherit spawned thread's precision config"
-        );
-        assert_eq!(rx.recv().expect("receive spawned precision config"), scoped);
-        assert_eq!(
-            precision_config(),
-            PrecisionConfig::default(),
-            "main thread should keep its own precision config"
-        );
-
-        handle.join().expect("join precision config thread");
-        set_precision_config(PrecisionConfig::default());
-    }
-
-    #[test]
-    fn nested_precision_scopes_restore_in_stack_order() {
-        let _guard = precision_guard(PrecisionConfig::default());
-
-        let outer = PrecisionConfig {
-            parameter_dtype: DType::BF16,
-            runtime_dtype: DType::BF16,
-            allow_parameter_dtype_copies: false,
-        };
-        let inner = PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: true,
-        };
-
-        with_precision_config(outer, || {
-            assert_eq!(precision_config(), outer);
-            with_precision_config(inner, || {
-                assert_eq!(precision_config(), inner);
-            });
-            assert_eq!(precision_config(), outer);
-        });
-
-        assert_eq!(precision_config(), PrecisionConfig::default());
-    }
-
-    #[test]
-    fn parameter_quantization_scope_restores_previous_setting() {
-        let _precision_guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: false,
-        });
-        let _quantization_guard = parameter_quantization_guard(ParameterQuantization::Disabled);
-
-        with_parameter_quantization(ParameterQuantization::Int8, || {
-            assert_eq!(
-                default_parameter_quantization(),
-                ParameterQuantization::Int8
-            );
-            assert!(parameter_quantization_enabled());
-            assert_eq!(default_parameter_storage_dtype(), DType::I8);
-        });
-
-        assert_eq!(
-            default_parameter_quantization(),
-            ParameterQuantization::Disabled
-        );
-        assert_eq!(default_parameter_storage_dtype(), DType::F32);
-    }
-
-    #[test]
-    fn enabling_parameter_quantization_defaults_parameter_storage_to_i8() {
-        let _precision_guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: false,
-        });
-        let _quantization_guard = parameter_quantization_guard(ParameterQuantization::Disabled);
-
-        set_parameter_quantization_enabled(true);
-        assert!(parameter_quantization_enabled());
-        assert_eq!(default_parameter_storage_dtype(), DType::I8);
-
-        set_parameter_quantization_enabled(false);
-        assert!(!parameter_quantization_enabled());
-        assert_eq!(default_parameter_storage_dtype(), DType::F32);
-    }
-
-    #[test]
-    fn parameter_quantization_can_store_manual_scale() {
-        let _precision_guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: false,
-        });
-        let _quantization_guard = parameter_quantization_guard(ParameterQuantization::Disabled);
-        let quantization = ParameterQuantization::Int8.with_scale(0.25);
-        set_default_parameter_quantization(quantization);
-
-        assert_eq!(default_parameter_quantization(), quantization);
-        assert_eq!(default_parameter_quantization_dtype(), Some(DType::I8));
-        assert_eq!(default_parameter_quantization_scale(), Some(0.25));
-    }
-
-    #[test]
-    fn activation_and_kv_cache_defaults_follow_runtime_until_overridden() {
-        let _precision_guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: false,
-        });
-        reset_default_activation_dtype_to_runtime();
-        reset_default_kv_cache_dtype_to_runtime();
-
-        assert_eq!(default_activation_dtype(), DType::F32);
-        assert_eq!(default_kv_cache_dtype(), DType::F32);
-        assert!(activation_dtype_follows_runtime());
-        assert!(kv_cache_dtype_follows_runtime());
-
-        set_default_runtime_dtype(DType::BF16);
-        assert_eq!(default_runtime_dtype(), DType::BF16);
-        assert_eq!(default_activation_dtype(), DType::BF16);
-        assert_eq!(default_kv_cache_dtype(), DType::BF16);
-    }
-
-    #[test]
-    fn activation_and_kv_cache_defaults_can_override_runtime_independently() {
-        let _precision_guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::F32,
-            allow_parameter_dtype_copies: false,
-        });
-        reset_default_activation_dtype_to_runtime();
-        reset_default_kv_cache_dtype_to_runtime();
-
-        set_default_activation_dtype(DType::F16);
-        set_default_kv_cache_dtype(DType::BF16);
-        set_default_runtime_dtype(DType::F32);
-
-        assert_eq!(default_runtime_dtype(), DType::F32);
-        assert_eq!(default_activation_dtype(), DType::F16);
-        assert_eq!(default_kv_cache_dtype(), DType::BF16);
-        assert!(!activation_dtype_follows_runtime());
-        assert!(!kv_cache_dtype_follows_runtime());
-
-        reset_default_activation_dtype_to_runtime();
-        reset_default_kv_cache_dtype_to_runtime();
-        assert_eq!(default_activation_dtype(), DType::F32);
-        assert_eq!(default_kv_cache_dtype(), DType::F32);
-        assert!(activation_dtype_follows_runtime());
-        assert!(kv_cache_dtype_follows_runtime());
-    }
-
-    #[test]
-    fn runtime_component_dtype_scope_restores_previous_defaults_and_follow_flags() {
-        let _precision_guard = precision_guard(PrecisionConfig {
-            parameter_dtype: DType::F32,
-            runtime_dtype: DType::BF16,
-            allow_parameter_dtype_copies: false,
-        });
-        reset_default_activation_dtype_to_runtime();
-        set_default_kv_cache_dtype(DType::F16);
-
-        with_runtime_component_dtypes(Some(DType::F32), Some(DType::BF16), || {
-            assert_eq!(default_runtime_dtype(), DType::BF16);
-            assert_eq!(default_activation_dtype(), DType::F32);
-            assert_eq!(default_kv_cache_dtype(), DType::BF16);
-            assert!(!activation_dtype_follows_runtime());
-            assert!(!kv_cache_dtype_follows_runtime());
-        });
-
-        assert_eq!(default_runtime_dtype(), DType::BF16);
-        assert_eq!(default_activation_dtype(), DType::BF16);
-        assert_eq!(default_kv_cache_dtype(), DType::F16);
-        assert!(activation_dtype_follows_runtime());
-        assert!(!kv_cache_dtype_follows_runtime());
-    }
-}
+#[path = "../tests/unit/precision/tests.rs"]
+mod tests;

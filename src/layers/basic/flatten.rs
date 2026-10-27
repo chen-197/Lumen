@@ -18,8 +18,15 @@ impl Module for Flatten {
     fn forward(&self, input: Tensor) -> Tensor {
         let shape = input.shape_vec();
         assert!(!shape.is_empty(), "Flatten expects at least 1D input");
-        let b = shape[0];
-        reshape(&input, vec![b as i32, -1])
+        // Derive the trailing size from dimensions, including empty batches.
+        // With batch zero, reshape([0, -1]) cannot infer that size from len().
+        let features = shape[1..]
+            .iter()
+            .try_fold(1usize, |size, &dim| size.checked_mul(dim))
+            .expect("Flatten feature dimension overflow");
+        let batch = i32::try_from(shape[0]).expect("Flatten batch dimension exceeds i32");
+        let features = i32::try_from(features).expect("Flatten feature dimension exceeds i32");
+        reshape(&input, vec![batch, features])
     }
     fn parameters(&self) -> Vec<Tensor> {
         vec![]
@@ -27,23 +34,5 @@ impl Module for Flatten {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::autograd::no_grad;
-    use crate::precision::DType;
-    use ndarray::{Array, IxDyn};
-
-    #[test]
-    fn flatten_no_grad_preserves_bf16_dtype() {
-        let input = Tensor::from_array_no_grad(
-            Array::from_shape_vec(IxDyn(&[2, 3, 4]), (0..24).map(|v| v as f32).collect())
-                .expect("test tensor shape mismatch")
-                .into_dyn(),
-        );
-        input.cast_inplace(DType::BF16);
-
-        let out = no_grad(|| Flatten::new().forward(input));
-        assert_eq!(out.shape_vec(), vec![2, 12]);
-        assert_eq!(out.dtype(), DType::BF16);
-    }
-}
+#[path = "../../../tests/unit/layers/basic/flatten/tests.rs"]
+mod tests;

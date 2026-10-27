@@ -248,11 +248,10 @@ __global__ void cross_entropy_loss_kernel(
     size_t stride = blockDim.x * gridDim.x;
 
     float local = 0.0f;
-    constexpr float epsilon = 1.0e-9f;
     while (idx < len) {
         float t = target[idx];
         if (t > 0.0f) {
-            local += -t * logf(softmax[idx] + epsilon);
+            local += -t * logf(softmax[idx]);
         }
         idx += stride;
     }
@@ -300,11 +299,10 @@ __global__ void cross_entropy_loss_typed_target_kernel(
     size_t stride = blockDim.x * gridDim.x;
 
     float local = 0.0f;
-    constexpr float epsilon = 1.0e-9f;
     while (idx < len) {
         float t = typed_value_to_float(target, target_scale, idx);
         if (t > 0.0f) {
-            local += -t * logf(softmax[idx] + epsilon);
+            local += -t * logf(softmax[idx]);
         }
         idx += stride;
     }
@@ -364,7 +362,7 @@ __global__ void quantize_f32_storage_kernel(float* param, size_t len, int dtype,
             param[idx] = __bfloat162float(__float2bfloat16_rn(value));
         } else if (dtype == 3) {
             if (scale > 0.0f && isfinite(scale)) {
-                float q = nearbyintf(value / scale);
+                float q = roundf(value / scale);
                 q = fminf(127.0f, fmaxf(-127.0f, q));
                 param[idx] = q * scale;
             }
@@ -1138,7 +1136,7 @@ __global__ void quantize_f32_to_i8_kernel(
     const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     for (size_t idx = start; idx < len; idx += stride) {
-        float q = nearbyintf(input[idx] / scale);
+        float q = roundf(input[idx] / scale);
         q = fminf(127.0f, fmaxf(-127.0f, q));
         output[idx] = static_cast<int8_t>(q);
     }
@@ -1155,7 +1153,7 @@ __global__ void quantize_f32_to_i8_device_absmax_kernel(
     const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     for (size_t idx = start; idx < len; idx += stride) {
-        float q = nearbyintf(input[idx] / scale);
+        float q = roundf(input[idx] / scale);
         q = fminf(127.0f, fmaxf(-127.0f, q));
         output[idx] = static_cast<int8_t>(q);
     }
@@ -1189,10 +1187,75 @@ __global__ void f32_to_i8_storage_kernel(
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     const float inv_scale = 1.0f / scale;
     for (size_t idx = start; idx < len; idx += stride) {
-        float q = nearbyintf(input[idx] * inv_scale);
+        const float scaled = isfinite(inv_scale)
+            ? input[idx] * inv_scale : __fdiv_rn(input[idx], scale);
+        float q = roundf(scaled);
         q = fminf(127.0f, fmaxf(-127.0f, q));
         output[idx] = static_cast<int8_t>(q);
     }
+}
+
+struct LowpOptimizerItem {
+    float* param;
+    const float* grad;
+    uint16_t* first;
+    uint16_t* second;
+    size_t len;
+};
+
+template <typename T> __device__ inline float load_optimizer_state(T value);
+template <> __device__ inline float load_optimizer_state(__half value) {
+    return __half2float(value);
+}
+template <> __device__ inline float load_optimizer_state(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+template <typename T> __device__ inline T store_optimizer_state(float value);
+template <> __device__ inline __half store_optimizer_state(float value) {
+    return __float2half_rn(value);
+}
+template <> __device__ inline __nv_bfloat16 store_optimizer_state(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename StateT, bool Adam>
+__device__ inline void update_lowp_optimizer_item(
+    LowpOptimizerItem item, float lr, float beta1, float beta2,
+    float correction1, float correction2, float eps) {
+    StateT* first = reinterpret_cast<StateT*>(item.first);
+    StateT* second = reinterpret_cast<StateT*>(item.second);
+    const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t i = start; i < item.len; i += stride) {
+        const float g = item.grad[i];
+        // Match the existing floating-state semantics: use the unrounded new
+        // moments for this parameter update, and round only the saved state.
+        const float m = beta1 * load_optimizer_state(first[i]) +
+            (Adam ? (1.0f - beta1) * g : g);
+        first[i] = store_optimizer_state<StateT>(m);
+        if (Adam) {
+            const float v = beta2 * load_optimizer_state(second[i]) + (1.0f - beta2) * g * g;
+            second[i] = store_optimizer_state<StateT>(v);
+            item.param[i] -= lr * ((m / correction1) / (sqrtf(v / correction2) + eps));
+        } else {
+            item.param[i] -= lr * m;
+        }
+    }
+}
+
+template <typename StateT, bool Adam>
+__global__ void optimizer_lowp_state_single_kernel(
+    LowpOptimizerItem item, float lr, float beta1, float beta2,
+    float correction1, float correction2, float eps) {
+    update_lowp_optimizer_item<StateT, Adam>(item, lr, beta1, beta2, correction1, correction2, eps);
+}
+
+template <typename StateT, bool Adam>
+__global__ void optimizer_lowp_state_batched_kernel(
+    const LowpOptimizerItem* items, float lr, float beta1, float beta2,
+    float correction1, float correction2, float eps) {
+    update_lowp_optimizer_item<StateT, Adam>(
+        items[blockIdx.y], lr, beta1, beta2, correction1, correction2, eps);
 }
 
 __global__ void sgd_momentum_update_kernel(
@@ -1369,5 +1432,133 @@ __global__ void adam_update_batched_kernel(
         float v_hat = v / bias_correction2;
         param[idx] -= lr * (m_hat / (sqrtf(v_hat) + eps));
         idx += stride;
+    }
+}
+
+
+// Buffers carry logical row-major values, including native 16/8-bit inputs.
+__device__ inline float ce_read_value(const void* data, int dtype, float scale, size_t i) {
+    switch (dtype) {
+        case kDTypeF32: return static_cast<const float*>(data)[i];
+        case kDTypeF16: return __half2float(static_cast<const __half*>(data)[i]);
+        case kDTypeBF16: return __bfloat162float(static_cast<const __nv_bfloat16*>(data)[i]);
+        default: return static_cast<float>(static_cast<const int8_t*>(data)[i]) * scale;
+    }
+}
+
+__global__ void cross_entropy_logits_kernel(
+    const void* logits, int logits_dtype, float logits_scale,
+    const void* targets, int target_dtype, float target_scale,
+    float* probabilities, float* loss, size_t rows, size_t cols) {
+    __shared__ float scratch[256];
+    __shared__ float max_value;
+    __shared__ float sum_exp;
+    const unsigned int tid = threadIdx.x;
+    for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const size_t base = row * cols;
+        float local = -INFINITY;
+        for (size_t col = tid; col < cols; col += blockDim.x) {
+            local = fmaxf(local, ce_read_value(logits, logits_dtype, logits_scale, base + col));
+        }
+        scratch[tid] = local;
+        __syncthreads();
+        for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) scratch[tid] = fmaxf(scratch[tid], scratch[tid + offset]);
+            __syncthreads();
+        }
+        if (tid == 0) max_value = scratch[0];
+        __syncthreads();
+        local = 0.0f;
+        for (size_t col = tid; col < cols; col += blockDim.x) {
+            const size_t i = base + col;
+            const float e = expf(ce_read_value(logits, logits_dtype, logits_scale, i) - max_value);
+            probabilities[i] = e;
+            local += e;
+        }
+        scratch[tid] = local;
+        __syncthreads();
+        for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) scratch[tid] += scratch[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) sum_exp = scratch[0];
+        __syncthreads();
+        const float log_sum = logf(sum_exp);
+        local = 0.0f;
+        for (size_t col = tid; col < cols; col += blockDim.x) {
+            const size_t i = base + col;
+            probabilities[i] /= sum_exp;
+            const float target = ce_read_value(targets, target_dtype, target_scale, i);
+            if (target != 0.0f) {
+                const float value = ce_read_value(logits, logits_dtype, logits_scale, i);
+                // Subtract the row maximum before adding log(sum(exp)), so a
+                // large common offset does not erase the loss by cancellation.
+                local += target * ((max_value - value) + log_sum);
+            }
+        }
+        scratch[tid] = local;
+        __syncthreads();
+        for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) scratch[tid] += scratch[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) atomicAdd(loss, scratch[0] / static_cast<float>(rows));
+        __syncthreads();
+    }
+}
+
+__device__ inline float ce_block_sum(float value, float* scratch) {
+    const unsigned int tid = threadIdx.x;
+    scratch[tid] = value;
+    __syncthreads();
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) scratch[tid] += scratch[tid + offset];
+        __syncthreads();
+    }
+    const float result = scratch[0];
+    __syncthreads();
+    return result;
+}
+
+__global__ void cross_entropy_logits_backward_kernel(
+    const void* logits, int logits_dtype, float logits_scale,
+    const void* targets, int target_dtype, float target_scale,
+    const float* probabilities, float* grad_logits, float* grad_targets,
+    size_t rows, size_t cols, float factor) {
+    __shared__ float scratch[256];
+    __shared__ float max_value;
+    const unsigned int tid = threadIdx.x;
+    for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const size_t base = row * cols;
+        float local_mass = 0.0f;
+        for (size_t col = tid; col < cols; col += blockDim.x)
+            local_mass += ce_read_value(targets, target_dtype, target_scale, base + col);
+        const float mass = ce_block_sum(local_mass, scratch);
+        float log_sum = 0.0f;
+        if (grad_targets != nullptr) {
+            float local_max = -INFINITY;
+            for (size_t col = tid; col < cols; col += blockDim.x)
+                local_max = fmaxf(local_max, ce_read_value(logits, logits_dtype, logits_scale, base + col));
+            scratch[tid] = local_max;
+            __syncthreads();
+            for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+                if (tid < offset) scratch[tid] = fmaxf(scratch[tid], scratch[tid + offset]);
+                __syncthreads();
+            }
+            if (tid == 0) max_value = scratch[0];
+            __syncthreads();
+            float local_sum = 0.0f;
+            for (size_t col = tid; col < cols; col += blockDim.x)
+                local_sum += expf(ce_read_value(logits, logits_dtype, logits_scale, base + col) - max_value);
+            log_sum = logf(ce_block_sum(local_sum, scratch));
+        }
+        for (size_t col = tid; col < cols; col += blockDim.x) {
+            const size_t i = base + col;
+            if (grad_logits != nullptr)
+                grad_logits[i] = (probabilities[i] * mass - ce_read_value(targets, target_dtype, target_scale, i)) * factor;
+            if (grad_targets != nullptr)
+                grad_targets[i] = ((max_value - ce_read_value(logits, logits_dtype, logits_scale, i)) + log_sum) * factor;
+        }
+        __syncthreads();
     }
 }

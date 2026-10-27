@@ -296,6 +296,91 @@ int dispatch_fused_qkv_input_typed_out(
 }
 
 template <typename InputT>
+__global__ void expand_floatlike_activation_kernel(const InputT* input, float* output, size_t len) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < len;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        output[i] = load_floatlike_value(input, i);
+    }
+}
+
+// Exact expansion of the declared activation values. Reuse the existing bounded
+// I8 weight-tile SGEMM path; no activation rounding or per-parameter copies.
+template <typename InputT>
+static const float* prepare_exact_floatlike_activation(
+    const InputT* input, size_t rows, size_t k_dim) {
+    const size_t max_size = static_cast<size_t>(-1);
+    if (rows > max_size / k_dim || rows * k_dim > max_size / sizeof(float)) {
+        return nullptr;
+    }
+    const size_t len = rows * k_dim;
+    thread_local ReusableCudaWorkspace input_tmp;
+    if (!input_tmp.ensure(len * sizeof(float), "failed to allocate exact activation expansion")) {
+        return nullptr;
+    }
+    constexpr unsigned int block_size = 256;
+    expand_floatlike_activation_kernel<<<linear_grid_size(len, block_size), block_size>>>(
+        input, static_cast<float*>(input_tmp.ptr), len);
+    if (!check_cuda_launch("CUDA exact activation expansion failed")) {
+        return nullptr;
+    }
+    return static_cast<const float*>(input_tmp.ptr);
+}
+
+static bool can_use_exact_i8_projection(size_t rows, size_t n_dim, size_t k_dim) {
+    constexpr size_t max_dim = 2147483647u; // cuBLAS dimension ABI.
+    constexpr size_t min_work = 1u << 20;
+    return rows >= 8 && n_dim >= 128 && k_dim >= 128 &&
+           rows <= max_dim && n_dim <= max_dim && k_dim <= max_dim &&
+           rows <= static_cast<size_t>(-1) / n_dim &&
+           rows * n_dim >= (min_work + k_dim - 1) / k_dim;
+}
+
+template <typename InputT>
+static bool try_fused_gate_up_silu_floatlike_i8_exact_cublas(
+    const InputT* input, const int8_t* gate, float gate_scale,
+    const int8_t* up, float up_scale, float* out,
+    size_t rows, size_t n_dim, size_t k_dim) {
+    if (!can_use_exact_i8_projection(rows, n_dim, k_dim) ||
+        rows * n_dim > static_cast<size_t>(-1) / sizeof(float)) {
+        return false;
+    }
+    const float* expanded = prepare_exact_floatlike_activation(input, rows, k_dim);
+    if (!expanded) { return false; }
+    const size_t output_len = rows * n_dim;
+    thread_local ReusableCudaWorkspace gate_tmp;
+    thread_local ReusableCudaWorkspace up_tmp;
+    if (!gate_tmp.ensure(output_len * sizeof(float), "failed to allocate exact gate output") ||
+        !up_tmp.ensure(output_len * sizeof(float), "failed to allocate exact up output") ||
+        !try_launch_matmul_f32_i8_cublas_compute(expanded, gate,
+            static_cast<float*>(gate_tmp.ptr), rows, n_dim, k_dim, gate_scale) ||
+        !try_launch_matmul_f32_i8_cublas_compute(expanded, up,
+            static_cast<float*>(up_tmp.ptr), rows, n_dim, k_dim, up_scale)) {
+        return false;
+    }
+    constexpr unsigned int block_size = 256;
+    silu_mul_kernel<<<linear_grid_size(output_len, block_size), block_size>>>(
+        static_cast<const float*>(gate_tmp.ptr), static_cast<const float*>(up_tmp.ptr), out, output_len);
+    return check_cuda_launch("CUDA exact gate/up SiLU failed");
+}
+
+template <typename InputT>
+static bool try_fused_qkv_floatlike_i8_exact_cublas(
+    const InputT* input, const int8_t* q, const int8_t* k, const int8_t* v,
+    float q_scale, float k_scale, float v_scale,
+    float* q_out, float* k_out, float* v_out,
+    size_t rows, size_t q_n, size_t k_n, size_t k_dim) {
+    if (!can_use_exact_i8_projection(rows, q_n, k_dim) ||
+        !can_use_exact_i8_projection(rows, k_n, k_dim)) {
+        return false;
+    }
+    const float* expanded = prepare_exact_floatlike_activation(input, rows, k_dim);
+    return expanded &&
+        try_launch_matmul_f32_i8_cublas_compute(expanded, q, q_out, rows, q_n, k_dim, q_scale) &&
+        try_launch_matmul_f32_i8_cublas_compute(expanded, k, k_out, rows, k_n, k_dim, k_scale) &&
+        try_launch_matmul_f32_i8_cublas_compute(expanded, v, v_out, rows, k_n, k_dim, v_scale);
+}
+
+template <typename InputT>
 static bool try_fused_gate_up_silu_floatlike_i8_dynamic_cublas(
     const InputT* input,
     const int8_t* gate,
@@ -438,6 +523,7 @@ extern "C" int lumen_cuda_fused_gate_up_silu_typed_device(
     uint64_t up_handle,
     float up_scale,
     uint64_t out_handle,
+    int allow_dynamic_i8,
     size_t rows,
     size_t n_dim,
     size_t k_dim) {
@@ -468,8 +554,21 @@ extern "C" int lumen_cuda_fused_gate_up_silu_typed_device(
                 n_dim,
                 k_dim);
         case kDTypeF16:
-            if (weight_dtype == kDTypeI8 &&
+            if (allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
                 try_fused_gate_up_silu_floatlike_i8_dynamic_cublas(
+                    reinterpret_cast<const __half*>(handle_to_ptr(input_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(gate_handle)),
+                    gate_scale,
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(up_handle)),
+                    up_scale,
+                    out,
+                    rows,
+                    n_dim,
+                    k_dim)) {
+                return 0;
+            }
+            if (!allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
+                try_fused_gate_up_silu_floatlike_i8_exact_cublas(
                     reinterpret_cast<const __half*>(handle_to_ptr(input_handle)),
                     reinterpret_cast<const int8_t*>(handle_to_ptr(gate_handle)),
                     gate_scale,
@@ -494,8 +593,21 @@ extern "C" int lumen_cuda_fused_gate_up_silu_typed_device(
                 n_dim,
                 k_dim);
         case kDTypeBF16:
-            if (weight_dtype == kDTypeI8 &&
+            if (allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
                 try_fused_gate_up_silu_floatlike_i8_dynamic_cublas(
+                    reinterpret_cast<const __nv_bfloat16*>(handle_to_ptr(input_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(gate_handle)),
+                    gate_scale,
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(up_handle)),
+                    up_scale,
+                    out,
+                    rows,
+                    n_dim,
+                    k_dim)) {
+                return 0;
+            }
+            if (!allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
+                try_fused_gate_up_silu_floatlike_i8_exact_cublas(
                     reinterpret_cast<const __nv_bfloat16*>(handle_to_ptr(input_handle)),
                     reinterpret_cast<const int8_t*>(handle_to_ptr(gate_handle)),
                     gate_scale,
@@ -712,6 +824,7 @@ extern "C" int lumen_cuda_fused_qkv_typed_device(
     uint64_t q_out_handle,
     uint64_t k_out_handle,
     uint64_t v_out_handle,
+    int allow_dynamic_i8,
     size_t rows,
     size_t q_n,
     size_t k_n,
@@ -753,8 +866,26 @@ extern "C" int lumen_cuda_fused_qkv_typed_device(
                 k_n,
                 k_dim);
         case kDTypeF16:
-            if (weight_dtype == kDTypeI8 &&
+            if (allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
                 try_fused_qkv_floatlike_i8_dynamic_cublas(
+                    reinterpret_cast<const __half*>(handle_to_ptr(input_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(q_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(k_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(v_handle)),
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    q_out,
+                    k_out,
+                    v_out,
+                    rows,
+                    q_n,
+                    k_n,
+                    k_dim)) {
+                return 0;
+            }
+            if (!allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
+                try_fused_qkv_floatlike_i8_exact_cublas(
                     reinterpret_cast<const __half*>(handle_to_ptr(input_handle)),
                     reinterpret_cast<const int8_t*>(handle_to_ptr(q_handle)),
                     reinterpret_cast<const int8_t*>(handle_to_ptr(k_handle)),
@@ -789,8 +920,26 @@ extern "C" int lumen_cuda_fused_qkv_typed_device(
                 k_n,
                 k_dim);
         case kDTypeBF16:
-            if (weight_dtype == kDTypeI8 &&
+            if (allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
                 try_fused_qkv_floatlike_i8_dynamic_cublas(
+                    reinterpret_cast<const __nv_bfloat16*>(handle_to_ptr(input_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(q_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(k_handle)),
+                    reinterpret_cast<const int8_t*>(handle_to_ptr(v_handle)),
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    q_out,
+                    k_out,
+                    v_out,
+                    rows,
+                    q_n,
+                    k_n,
+                    k_dim)) {
+                return 0;
+            }
+            if (!allow_dynamic_i8 && weight_dtype == kDTypeI8 &&
+                try_fused_qkv_floatlike_i8_exact_cublas(
                     reinterpret_cast<const __nv_bfloat16*>(handle_to_ptr(input_handle)),
                     reinterpret_cast<const int8_t*>(handle_to_ptr(q_handle)),
                     reinterpret_cast<const int8_t*>(handle_to_ptr(k_handle)),

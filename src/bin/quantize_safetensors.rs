@@ -164,6 +164,16 @@ fn finite_max_abs(values: impl Iterator<Item = f32>) -> Result<f32, Box<dyn std:
     Ok(max_abs)
 }
 
+#[inline]
+fn quantize_i8(value: f32, scale: f32, inverse: f32) -> i8 {
+    let scaled = if inverse.is_finite() {
+        value * inverse
+    } else {
+        value / scale
+    };
+    scaled.round().clamp(-127.0, 127.0) as i8
+}
+
 fn quantize_f32_slice_to_i8(
     data: &[f32],
     scale_override: Option<f32>,
@@ -184,7 +194,7 @@ fn quantize_f32_slice_to_i8(
     let inv_scale = 1.0 / scale;
     let quantized = data
         .iter()
-        .map(|&v| (v * inv_scale).round().clamp(-127.0, 127.0) as i8)
+        .map(|&v| quantize_i8(v, scale, inv_scale))
         .collect::<Vec<_>>();
     Ok((quantized, scale))
 }
@@ -209,7 +219,7 @@ fn quantize_f16_slice_to_i8(
     let inv_scale = 1.0 / scale;
     let quantized = data
         .iter()
-        .map(|&v| (v.to_f32() * inv_scale).round().clamp(-127.0, 127.0) as i8)
+        .map(|&v| quantize_i8(v.to_f32(), scale, inv_scale))
         .collect::<Vec<_>>();
     Ok((quantized, scale))
 }
@@ -234,7 +244,7 @@ fn quantize_bf16_slice_to_i8(
     let inv_scale = 1.0 / scale;
     let quantized = data
         .iter()
-        .map(|&v| (v.to_f32() * inv_scale).round().clamp(-127.0, 127.0) as i8)
+        .map(|&v| quantize_i8(v.to_f32(), scale, inv_scale))
         .collect::<Vec<_>>();
     Ok((quantized, scale))
 }
@@ -374,38 +384,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn offline_i8_quantization_rejects_non_finite_values() {
-        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(quantize_f32_slice_to_i8(&[value], None).is_err());
-            assert!(quantize_f16_slice_to_i8(&[f16::from_f32(value)], None).is_err());
-            assert!(quantize_bf16_slice_to_i8(&[bf16::from_f32(value)], None).is_err());
-        }
-    }
-
-    #[test]
-    fn offline_i8_quantization_rejects_invalid_manual_scale() {
-        for scale in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
-            assert!(quantize_f32_slice_to_i8(&[1.0], Some(scale)).is_err());
-        }
-    }
-
-    #[test]
-    fn offline_i8_quantization_keeps_subnormal_scale_positive() {
-        let (_, scale) =
-            quantize_f32_slice_to_i8(&[f32::from_bits(1)], None).expect("quantize subnormal");
-        assert_eq!(scale, f32::MIN_POSITIVE);
-    }
-
-    #[test]
-    fn existing_i8_scale_name_is_preserved() {
-        let mut i8_names = HashSet::new();
-        i8_names.insert("layer.weight".to_string());
-        assert!(is_existing_i8_scale_name("layer.weight.scale", &i8_names));
-        assert!(!is_existing_i8_scale_name("layer.bias.scale", &i8_names));
-        assert!(!is_existing_i8_scale_name("layer.weight", &i8_names));
-    }
-}
+#[path = "../../tests/unit/bin/quantize_safetensors/tests.rs"]
+mod tests;

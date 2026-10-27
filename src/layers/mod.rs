@@ -31,6 +31,8 @@ pub use attention::RotaryEmbedding;
 pub use attention::SelfAttention;
 
 // Norm
+pub use attention::{AttentionMask, AttentionOptions, scaled_dot_product_attention};
+pub use norm::LayerNorm;
 pub use norm::RMSNorm;
 
 pub use activation::Gelu;

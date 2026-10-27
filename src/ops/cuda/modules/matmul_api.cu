@@ -1385,6 +1385,165 @@ __global__ void matmul_i8_floatlike_tiled_kernel(
     }
 }
 
+__global__ void unpack_i8_weight_vec4_kernel(
+    const char4* input,
+    float scale,
+    float4* out,
+    size_t len) {
+    const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    const size_t vectors = len / 4;
+    for (size_t idx = start; idx < vectors; idx += stride) {
+        const char4 q = input[idx];
+        out[idx] = make_float4(
+            static_cast<float>(q.x) * scale,
+            static_cast<float>(q.y) * scale,
+            static_cast<float>(q.z) * scale,
+            static_cast<float>(q.w) * scale);
+    }
+    if (start == 0) {
+        const int8_t* input_tail = reinterpret_cast<const int8_t*>(input);
+        float* out_tail = reinterpret_cast<float*>(out);
+        for (size_t idx = vectors * 4; idx < len; ++idx) {
+            out_tail[idx] = static_cast<float>(input_tail[idx]) * scale;
+        }
+    }
+}
+
+static bool launch_unpack_i8_weight(
+    const int8_t* input,
+    float scale,
+    float* out,
+    size_t len) {
+    constexpr unsigned int block_size = 256;
+    if (len >= 4 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(char4) == 0 &&
+        reinterpret_cast<uintptr_t>(out) % alignof(float4) == 0) {
+        unpack_i8_weight_vec4_kernel<<<linear_grid_size(len / 4, block_size), block_size>>>(
+            reinterpret_cast<const char4*>(input), scale, reinterpret_cast<float4*>(out), len);
+    } else {
+        launch_unary_i8_to_f32_kernel(
+            -1, linear_grid_size(len, block_size), block_size, input, scale, out, len);
+    }
+    return check_cuda_launch("CUDA F32xI8 weight tile unpack failed");
+}
+
+// F32 activations can follow mixed-precision RMSNorm or fused gate/up. Keep
+// their precision: unpack one bounded weight tile, then use FP32 cuBLAS GEMM.
+// This workspace is shared between calls, not a persistent copy per parameter.
+__global__ void unpack_transpose_i8_weight_kernel(
+    const int8_t* input, float scale, float* out, size_t rows, size_t cols) {
+    // Coalesced I8 reads and F32 writes, with padding to avoid shared-bank
+    // conflicts during the transpose. Both dimensions may have partial tiles.
+    __shared__ float tile[32][33];
+    size_t col = static_cast<size_t>(blockIdx.x) * 32 + threadIdx.x;
+    size_t row = static_cast<size_t>(blockIdx.y) * 32 + threadIdx.y;
+    #pragma unroll
+    for (int offset = 0; offset < 32; offset += 8) {
+        if (col < cols && row + offset < rows) {
+            tile[threadIdx.y + offset][threadIdx.x] =
+                static_cast<float>(input[(row + offset) * cols + col]) * scale;
+        }
+    }
+    __syncthreads();
+    col = static_cast<size_t>(blockIdx.y) * 32 + threadIdx.x;
+    row = static_cast<size_t>(blockIdx.x) * 32 + threadIdx.y;
+    #pragma unroll
+    for (int offset = 0; offset < 32; offset += 8) {
+        if (col < rows && row + offset < cols) {
+            out[(row + offset) * rows + col] = tile[threadIdx.x][threadIdx.y + offset];
+        }
+    }
+}
+
+static bool try_launch_matmul_f32_i8_cublas_compute(
+    const float* a,
+    const int8_t* b,
+    float* out,
+    size_t m,
+    size_t n,
+    size_t k,
+    float b_scale) {
+    constexpr size_t min_work = 1u << 20;
+    constexpr size_t max_weight_workspace_bytes = 32u << 20;
+    const size_t max_size = static_cast<size_t>(-1);
+    if (m < 8 || n < 128 || k < 128 || m > max_size / n ||
+        n > max_size / k ||
+        m * n < (min_work + k - 1) / k) {
+        return false;
+    }
+    CublasHandle handle;
+    if (!init_cublas(handle)) {
+        return false;
+    }
+    // Keep room in larger L2 caches for the I8 source, activations and output.
+    // Smaller caches retain the old bound to avoid excessive tiny GEMMs.
+    // Cache only the device property, never a parameter's converted contents.
+    thread_local int budget_device = -1;
+    thread_local size_t weight_workspace_bytes = max_weight_workspace_bytes;
+    if (budget_device != handle.device) {
+        cudaDeviceProp properties;
+        const cudaError_t status = cudaGetDeviceProperties(&properties, handle.device);
+        if (status != cudaSuccess) {
+            set_cuda_error("failed to query CUDA F32xI8 weight tile device", status);
+            return false;
+        }
+        const size_t l2_bytes = properties.l2CacheSize > 0
+            ? static_cast<size_t>(properties.l2CacheSize) : 0;
+        weight_workspace_bytes = l2_bytes >= (16u << 20)
+            ? std::min(max_weight_workspace_bytes, l2_bytes - l2_bytes / 4)
+            : max_weight_workspace_bytes;
+        budget_device = handle.device;
+    }
+    size_t tile_n = weight_workspace_bytes / sizeof(float) / k;
+    if (tile_n == 0) {
+        return false;
+    }
+    if (tile_n < n && tile_n >= 128) {
+        tile_n -= tile_n % 128;
+    }
+    tile_n = std::min(tile_n, n);
+    thread_local ReusableCudaWorkspace weight_tmp;
+    if (!weight_tmp.ensure(tile_n * k * sizeof(float),
+                           "failed to allocate CUDA F32xI8 weight tile")) {
+        return false;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    // Larger token batches benefit from the NN GEMM layout. Small batches
+    // retain the vectorized unpack + TN path to avoid transpose overhead.
+    const bool transpose_weight = m >= 128;
+    for (size_t col = 0; col < n; col += tile_n) {
+        const size_t cols = std::min(tile_n, n - col);
+        const size_t elements = cols * k;
+        if (transpose_weight) {
+            const dim3 grid(
+                static_cast<unsigned int>((k + 31) / 32),
+                static_cast<unsigned int>((cols + 31) / 32));
+            unpack_transpose_i8_weight_kernel<<<grid, dim3(32, 8)>>>(
+                b + col * k, b_scale, static_cast<float*>(weight_tmp.ptr), cols, k);
+            if (!check_cuda_launch("CUDA F32xI8 transposed weight tile unpack failed")) {
+                return false;
+            }
+        } else if (!launch_unpack_i8_weight(
+                b + col * k, b_scale, static_cast<float*>(weight_tmp.ptr), elements)) {
+            return false;
+        }
+        // The full output row stride remains n, including the last partial tile.
+        const cublasStatus_t status = cublasGemmEx(
+            handle.handle, transpose_weight ? CUBLAS_OP_N : CUBLAS_OP_T, CUBLAS_OP_N,
+            static_cast<int>(cols), static_cast<int>(m), static_cast<int>(k),
+            &alpha, weight_tmp.ptr, CUDA_R_32F, static_cast<int>(transpose_weight ? cols : k),
+            a, CUDA_R_32F, static_cast<int>(k), &beta,
+            out + col, CUDA_R_32F, static_cast<int>(n),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename LhsT>
 static bool launch_matmul_floatlike_i8_compute(
     const LhsT* a,
@@ -2908,7 +3067,10 @@ extern "C" int lumen_cuda_matmul_f32_i8_device(
             n,
             k,
             b_scale);
-    } else {
+    } else if (!try_launch_matmul_f32_i8_cublas_compute(
+                   handle_to_ptr(a_handle),
+                   reinterpret_cast<const int8_t*>(handle_to_ptr(b_handle)),
+                   handle_to_ptr(out_handle), m, n, k, b_scale)) {
         if (!launch_matmul_floatlike_i8_compute(
             handle_to_ptr(a_handle),
             reinterpret_cast<const int8_t*>(handle_to_ptr(b_handle)),

@@ -54,6 +54,13 @@ impl MSELoss {
                     .ok_or_else(|| "CUDA mse_loss returned empty host scalar".to_string())?;
                 Ok::<_, String>((diff_buf, loss_buf, loss_val))
             })();
+            let cuda_forward = cuda_forward.map_err(|err| {
+                assert!(
+                    !is_strict_device_execution(),
+                    "mse_loss CUDA forward failed in strict device execution: {err}"
+                );
+                err
+            });
             if let Ok((diff_buf, loss_buf, loss_val)) = cuda_forward {
                 if !build_graph {
                     return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
@@ -91,8 +98,12 @@ impl MSELoss {
                                 cuda::mse_backward_f32_buffers(&diff_buf, factor).unwrap_or_else(
                                     |err| panic!("CUDA mse_loss backward failed: {}", err),
                                 );
-                            output_clone.add_cuda_grad_buffer_only(grad_output_buffer);
-                            target_clone.add_cuda_grad_buffer_only(grad_target_buffer);
+                            if output_clone.requires_grad() {
+                                output_clone.add_backward_cuda_grad_buffer_only(grad_output_buffer);
+                            }
+                            if target_clone.requires_grad() {
+                                target_clone.add_backward_cuda_grad_buffer_only(grad_target_buffer);
+                            }
                             return;
                         }
                         let (
@@ -112,9 +123,18 @@ impl MSELoss {
                         )
                         .expect("CUDA mse_loss target grad shape build failed")
                         .into_dyn();
-                        output_clone.add_grad_with_cuda_buffer(grad_out, Some(grad_output_buffer));
-                        target_clone
-                            .add_grad_with_cuda_buffer(grad_target, Some(grad_target_buffer));
+                        if output_clone.requires_grad() {
+                            output_clone.add_backward_grad_with_cuda_buffer(
+                                grad_out,
+                                Some(grad_output_buffer),
+                            );
+                        }
+                        if target_clone.requires_grad() {
+                            target_clone.add_backward_grad_with_cuda_buffer(
+                                grad_target,
+                                Some(grad_target_buffer),
+                            );
+                        }
                     })),
                     requires_grad: true,
                     device: output_device,
@@ -182,20 +202,32 @@ impl MSELoss {
             parents: vec![output.clone(), target.clone()],
             backward_op: Some(std::rc::Rc::new(move |grad_output| {
                 let grad_val = grad_output.first().unwrap();
-                let (grad_out, grad_target) = {
-                    let out_d = output_clone.data_ref();
-                    let tar_d = target_clone.data_ref();
-                    let n = out_d.len() as f32;
-                    let factor = 2.0 / n * grad_val;
-
-                    let grad = Zip::from(&*out_d)
-                        .and(&*tar_d)
-                        .par_map_collect(|&o, &t| (o - t) * factor);
-                    (grad.clone(), grad.mapv(|x| -x))
-                };
-
-                output_clone.add_grad(grad_out);
-                target_clone.add_grad(grad_target);
+                let grad = output_clone.with_storage_view_preferring(
+                    StoragePreference::F32Compute,
+                    |out| {
+                        target_clone.with_storage_view_preferring(
+                            StoragePreference::F32Compute,
+                            |tar| {
+                                let TensorStorageView::F32(out) = out else {
+                                    unreachable!("F32 compute view")
+                                };
+                                let TensorStorageView::F32(tar) = tar else {
+                                    unreachable!("F32 compute view")
+                                };
+                                let factor = 2.0 / out.len() as f32 * grad_val;
+                                Zip::from(out)
+                                    .and(tar)
+                                    .par_map_collect(|&o, &t| (o - t) * factor)
+                            },
+                        )
+                    },
+                );
+                if output_clone.requires_grad() {
+                    output_clone.add_backward_grad(grad.clone());
+                }
+                if target_clone.requires_grad() {
+                    target_clone.add_backward_grad(grad.mapv(|v| -v));
+                }
             })),
             requires_grad: true,
             device: output_device,
@@ -205,7 +237,14 @@ impl MSELoss {
 
 // --- Cross Entropy Loss ---
 // 针对 Batch 进行行级并行优化
+/// Mean dense-target cross entropy: `-sum(target * log_softmax(logits)) / batch`.
+/// Targets are used as supplied, without normalization; gradients are supported
+/// for both logits and floating/quantized target storage through F32 autograd.
 pub struct CrossEntropyLoss;
+
+#[cfg(test)]
+#[path = "../tests/unit/loss/dense_targets.rs"]
+mod dense_targets_tests;
 
 impl CrossEntropyLoss {
     pub fn apply(input_logits: &Tensor, target_onehot: &Tensor) -> Tensor {
@@ -246,29 +285,24 @@ impl CrossEntropyLoss {
                     .ok_or_else(|| {
                         "CUDA cross_entropy target missing resident buffer".to_string()
                     })?;
-                let softmax_buf = if logits_dtype == DType::F32 {
-                    cuda::softmax_lastdim_f32_no_host(&logits_buf, batch_size, dim)?
-                } else {
-                    cuda::softmax_lastdim_typed_no_host(
-                        &logits_buf,
-                        logits_dtype,
-                        logits_scale,
-                        batch_size,
-                        dim,
-                    )?
-                };
-                let (loss_buf, loss_host) = cuda::cross_entropy_loss_typed_target(
-                    &softmax_buf,
+                let (softmax_buf, loss_buf, loss_val) = cuda::cross_entropy_logits_typed(
+                    &logits_buf,
+                    logits_dtype,
+                    logits_scale,
                     &target_buf,
                     target_dtype,
                     target_scale,
                     batch_size,
                 )?;
-                let loss_val = loss_host.first().copied().ok_or_else(|| {
-                    "CUDA cross_entropy loss returned empty host scalar".to_string()
-                })?;
                 Ok::<_, String>((softmax_buf, loss_buf, loss_val))
             })();
+            let cuda_forward = cuda_forward.map_err(|err| {
+                assert!(
+                    !is_strict_device_execution(),
+                    "cross_entropy CUDA forward failed in strict device execution: {err}"
+                );
+                err
+            });
             if let Ok((softmax_buf, loss_buf, loss_val)) = cuda_forward {
                 if !build_graph {
                     return Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
@@ -303,54 +337,38 @@ impl CrossEntropyLoss {
                     backward_op: Some(std::rc::Rc::new(move |grad_output| {
                         let grad_val = *grad_output.first().unwrap();
                         let factor = grad_val / batch_size as f32;
-                        if is_strict_device_execution() {
-                            let (target_buffer, target_dtype, target_scale) =
-                                cuda_loss_storage(&target_clone).unwrap_or_else(|| {
-                                    panic!(
-                                        "CUDA cross_entropy backward target missing resident buffer"
-                                    )
-                                });
-                            let grad_buffer = cuda::cross_entropy_backward_typed_target_buffer(
-                                &softmax_buffer,
-                                &target_buffer,
-                                target_dtype,
-                                target_scale,
-                                factor,
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!("CUDA cross_entropy backward failed: {}", err)
-                            });
-                            input_clone.add_cuda_grad_buffer_only(grad_buffer);
-                            return;
-                        }
-                        let (grad_buffer, grad_host) =
-                            if let Some((target_buffer, target_dtype, target_scale)) =
-                                cuda_loss_storage(&target_clone)
-                            {
-                                cuda::cross_entropy_backward_typed_target(
-                                    &softmax_buffer,
-                                    &target_buffer,
-                                    target_dtype,
-                                    target_scale,
-                                    factor,
-                                )
-                            } else {
-                                target_clone.with_cuda_f32_buffer(|target_buf| {
-                                    cuda::cross_entropy_backward_f32(
-                                        &softmax_buffer,
-                                        target_buf,
-                                        factor,
-                                    )
-                                })
+                        let (xb, xd, xs) = cuda_loss_storage(&input_clone)
+                            .expect("CUDA cross_entropy backward logits missing resident buffer");
+                        let (tb, td, ts) = cuda_loss_storage(&target_clone)
+                            .expect("CUDA cross_entropy backward target missing resident buffer");
+                        let (dx, dt) = cuda::cross_entropy_logits_backward_typed(
+                            &xb,
+                            xd,
+                            xs,
+                            &tb,
+                            td,
+                            ts,
+                            &softmax_buffer,
+                            batch_size,
+                            factor,
+                            input_clone.requires_grad(),
+                            target_clone.requires_grad(),
+                        )
+                        .unwrap_or_else(|err| panic!("CUDA cross_entropy backward failed: {err}"));
+                        for (tensor, buffer) in [(&input_clone, dx), (&target_clone, dt)] {
+                            if let Some(buffer) = buffer {
+                                if is_strict_device_execution() {
+                                    tensor.add_backward_cuda_grad_buffer_only(buffer);
+                                } else {
+                                    let host = cuda::download_f32(&buffer)
+                                        .expect("CUDA cross_entropy gradient download failed");
+                                    let grad =
+                                        ndarray::Array::from_shape_vec(tensor.shape_vec(), host)
+                                            .expect("CUDA cross_entropy grad shape build failed");
+                                    tensor.add_backward_grad_with_cuda_buffer(grad, Some(buffer));
+                                }
                             }
-                            .unwrap_or_else(|err| {
-                                panic!("CUDA cross_entropy backward failed: {}", err)
-                            });
-                        let grad =
-                            ndarray::Array::from_shape_vec(input_clone.shape_vec(), grad_host)
-                                .expect("CUDA cross_entropy grad shape build failed")
-                                .into_dyn();
-                        input_clone.add_grad_with_cuda_buffer(grad, Some(grad_buffer));
+                        }
                     })),
                     requires_grad: true,
                     device: output_device,
@@ -358,7 +376,7 @@ impl CrossEntropyLoss {
             }
         }
         // Forward
-        let (loss_val, softmax_output) = input_logits.with_storage_view_preferring(
+        let (loss_val, logits_gradient, normalizers) = input_logits.with_storage_view_preferring(
             StoragePreference::F32Compute,
             |logits_view| {
                 target_onehot.with_storage_view_preferring(
@@ -386,15 +404,23 @@ impl CrossEntropyLoss {
                         let batch_size = logits_ref.shape()[0];
                         let dim = logits_ref.shape()[1];
 
-                        let logits_2d = logits_ref.view().into_shape((batch_size, dim)).unwrap();
-                        let targets_2d = targets_ref.view().into_shape((batch_size, dim)).unwrap();
+                        let logits_2d = logits_ref
+                            .view()
+                            .into_dimensionality::<ndarray::Ix2>()
+                            .unwrap();
+                        let targets_2d = targets_ref
+                            .view()
+                            .into_dimensionality::<ndarray::Ix2>()
+                            .unwrap();
 
                         let mut softmax_out_flat = Array2::<f32>::zeros((batch_size, dim));
+                        let mut normalizers = Array2::<f32>::zeros((batch_size, 2));
                         let total_loss: f32 = Zip::from(softmax_out_flat.outer_iter_mut())
                             .and(logits_2d.outer_iter())
                             .and(targets_2d.outer_iter())
+                            .and(normalizers.outer_iter_mut())
                             .into_par_iter()
-                            .map(|(mut sm_row, l_row, t_row)| {
+                            .map(|(mut sm_row, l_row, t_row, mut norm)| {
                                 let max_val = l_row.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                                 let mut sum_exp = 0.0f32;
 
@@ -405,20 +431,29 @@ impl CrossEntropyLoss {
                                 }
 
                                 let inv_sum = 1.0 / sum_exp;
-                                let epsilon = 1e-9;
+                                let log_sum = sum_exp.ln();
+                                norm[0] = max_val;
+                                norm[1] = log_sum;
+                                let target_mass = t_row.sum();
                                 let mut row_loss = 0.0;
 
-                                for (s_val, &t_val) in sm_row.iter_mut().zip(t_row.iter()) {
-                                    *s_val *= inv_sum;
-                                    if t_val > 0.0 {
-                                        row_loss -= t_val * (*s_val + epsilon).ln();
+                                for ((s_val, &t_val), &l_val) in
+                                    sm_row.iter_mut().zip(t_row.iter()).zip(l_row.iter())
+                                {
+                                    *s_val = (*s_val * inv_sum) * target_mass - t_val;
+                                    if t_val != 0.0 {
+                                        row_loss += t_val * ((max_val - l_val) + log_sum);
                                     }
                                 }
                                 row_loss
                             })
                             .sum();
 
-                        (total_loss / batch_size as f32, softmax_out_flat.into_dyn())
+                        (
+                            total_loss / batch_size as f32,
+                            softmax_out_flat.into_dyn(),
+                            normalizers,
+                        )
                     },
                 )
             },
@@ -434,7 +469,6 @@ impl CrossEntropyLoss {
 
         let input_clone = input_logits.clone();
         let target_clone = target_onehot.clone();
-        let softmax_cache = softmax_output;
 
         Tensor(Rc::new(RefCell::new(TensorData {
             data: arr0(loss_val).into_dyn().into_shared(),
@@ -455,17 +489,28 @@ impl CrossEntropyLoss {
             parents: vec![input_logits.clone(), target_onehot.clone()],
             backward_op: Some(std::rc::Rc::new(move |grad_output| {
                 let grad_val = grad_output.first().unwrap();
-                let grad = {
-                    let targets_ref = target_clone.data_ref();
-                    let batch_size = targets_ref.shape()[0] as f32;
-                    let factor = grad_val / batch_size;
-
-                    Zip::from(&softmax_cache)
-                        .and(&*targets_ref)
-                        .par_map_collect(|&p, &t| (p - t) * factor)
-                };
-
-                input_clone.add_grad(grad);
+                let factor = grad_val / batch_size as f32;
+                if input_clone.requires_grad() {
+                    input_clone.add_backward_grad(logits_gradient.mapv(|v| v * factor));
+                }
+                if target_clone.requires_grad() {
+                    let grad = input_clone.with_storage_view_preferring(
+                        StoragePreference::F32Compute,
+                        |view| {
+                            let TensorStorageView::F32(view) = view else {
+                                unreachable!("F32 compute view")
+                            };
+                            let logits = view.into_dimensionality::<ndarray::Ix2>().unwrap();
+                            Array2::from_shape_fn((batch_size, dim), |(row, col)| {
+                                ((normalizers[[row, 0]] - logits[[row, col]])
+                                    + normalizers[[row, 1]])
+                                    * factor
+                            })
+                            .into_dyn()
+                        },
+                    );
+                    target_clone.add_backward_grad(grad);
+                }
             })),
             requires_grad: true,
             device: output_device,
@@ -474,351 +519,5 @@ impl CrossEntropyLoss {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::autograd::no_grad;
-    #[cfg(feature = "cuda")]
-    use crate::autograd::set_strict_device_execution;
-    use ndarray::{Array, IxDyn};
-
-    fn make_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
-        let t = Tensor::from_array_no_grad(
-            Array::from_shape_vec(IxDyn(shape), data)
-                .expect("test tensor shape mismatch")
-                .into_dyn(),
-        );
-        t.cast_inplace(dtype);
-        t
-    }
-
-    #[test]
-    fn mse_loss_no_grad_returns_f32_scalar_without_materializing_bf16_input() {
-        let output = make_tensor(&[2], vec![1.0, 3.0], DType::BF16);
-        let target = make_tensor(&[2], vec![2.0, 1.0], DType::BF16);
-
-        let loss = no_grad(|| MSELoss::apply(&output, &target));
-
-        assert_eq!(loss.dtype(), DType::F32);
-        assert!(!loss.requires_grad());
-        assert_eq!(output.dtype(), DType::BF16);
-        assert_eq!(target.dtype(), DType::BF16);
-        assert!((loss.data_ref().first().copied().unwrap_or_default() - 2.5).abs() <= 1e-6);
-    }
-
-    #[test]
-    fn cross_entropy_no_grad_accepts_i8_logits_and_returns_f32_scalar() {
-        let logits = make_tensor(&[2, 3], vec![2.0, 0.0, -1.0, -1.0, 0.0, 2.0], DType::I8);
-        let target = make_tensor(&[2, 3], vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0], DType::F32);
-
-        let loss = no_grad(|| CrossEntropyLoss::apply(&logits, &target));
-
-        assert_eq!(loss.dtype(), DType::F32);
-        assert!(!loss.requires_grad());
-        assert_eq!(logits.dtype(), DType::I8);
-        assert!(
-            loss.data_ref()
-                .first()
-                .copied()
-                .unwrap_or_default()
-                .is_finite()
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "mse_loss expects at least one element")]
-    fn mse_loss_rejects_empty_input() {
-        let output = make_tensor(&[0, 4], vec![], DType::F32);
-        let target = make_tensor(&[0, 4], vec![], DType::F32);
-        let _ = no_grad(|| MSELoss::apply(&output, &target));
-    }
-
-    #[test]
-    #[should_panic(expected = "batch size must be greater than zero")]
-    fn cross_entropy_rejects_empty_batch() {
-        let logits = make_tensor(&[0, 4], vec![], DType::F32);
-        let target = make_tensor(&[0, 4], vec![], DType::F32);
-        let _ = no_grad(|| CrossEntropyLoss::apply(&logits, &target));
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_mse_loss_backward_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let output_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0])
-                .unwrap()
-                .into_dyn(),
-            true,
-        );
-        let target_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(&[2, 3]), vec![0.5, -1.5, 0.25, 2.5, -0.5, 1.0])
-                .unwrap()
-                .into_dyn(),
-            true,
-        );
-        let output_cuda = output_cpu.to_cuda();
-        let target_cuda = target_cpu.to_cuda();
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let loss_cuda = MSELoss::apply(&output_cuda, &target_cuda);
-        loss_cuda.backward();
-        assert!(output_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(target_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!output_cuda.has_host_grad());
-        assert!(!target_cuda.has_host_grad());
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let loss_cpu = MSELoss::apply(&output_cpu, &target_cpu);
-        loss_cpu.backward();
-
-        let out_cuda_grad = output_cuda.grad().expect("cuda output grad");
-        let out_cpu_grad = output_cpu.grad().expect("cpu output grad");
-        let tar_cuda_grad = target_cuda.grad().expect("cuda target grad");
-        let tar_cpu_grad = target_cpu.grad().expect("cpu target grad");
-        for (got, expect) in out_cuda_grad.iter().zip(out_cpu_grad.iter()) {
-            assert!(
-                (got - expect).abs() < 1e-5,
-                "output grad got {got}, expect {expect}"
-            );
-        }
-        for (got, expect) in tar_cuda_grad.iter().zip(tar_cpu_grad.iter()) {
-            assert!(
-                (got - expect).abs() < 1e-5,
-                "target grad got {got}, expect {expect}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_mse_loss_lowp_inputs_read_resident_buffers_and_write_f32_grads() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let output_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
-        let target_data = vec![0.5, -1.5, 0.25, 2.5, -0.5, 1.0];
-        let output_cpu = Tensor::parameter_with_dtype(
-            Array::from_shape_vec(IxDyn(&[2, 3]), output_data.clone())
-                .unwrap()
-                .into_dyn(),
-            DType::BF16,
-        );
-        let target_cpu = Tensor::parameter_with_dtype(
-            Array::from_shape_vec(IxDyn(&[2, 3]), target_data.clone())
-                .unwrap()
-                .into_dyn(),
-            DType::I8,
-        );
-        let output_cuda = Tensor::parameter_with_dtype(
-            Array::from_shape_vec(IxDyn(&[2, 3]), output_data)
-                .unwrap()
-                .into_dyn(),
-            DType::BF16,
-        )
-        .to_cuda();
-        let target_cuda = Tensor::parameter_with_dtype(
-            Array::from_shape_vec(IxDyn(&[2, 3]), target_data)
-                .unwrap()
-                .into_dyn(),
-            DType::I8,
-        )
-        .to_cuda();
-        assert!(output_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(target_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(output_cuda.0.borrow().cuda_bf16_data.is_some());
-        assert!(target_cuda.0.borrow().cuda_i8_data.is_some());
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let loss_cuda = MSELoss::apply(&output_cuda, &target_cuda);
-        loss_cuda.backward();
-        assert!(output_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(target_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(output_cuda.0.borrow().cuda_bf16_data.is_some());
-        assert!(target_cuda.0.borrow().cuda_i8_data.is_some());
-        assert!(output_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(target_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!output_cuda.has_host_grad());
-        assert!(!target_cuda.has_host_grad());
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let loss_cpu = MSELoss::apply(&output_cpu, &target_cpu);
-        loss_cpu.backward();
-        let got_loss = loss_cuda.data_ref().first().copied().unwrap_or_default();
-        let expect_loss = loss_cpu.data_ref().first().copied().unwrap_or_default();
-        assert!(
-            (got_loss - expect_loss).abs() < 3e-2,
-            "loss got {got_loss}, expect {expect_loss}"
-        );
-
-        let got_output_grad = output_cuda.grad().expect("cuda lowp output grad");
-        let expect_output_grad = output_cpu.grad().expect("cpu lowp output grad");
-        for (got, expect) in got_output_grad.iter().zip(expect_output_grad.iter()) {
-            assert!(
-                (got - expect).abs() < 3e-2,
-                "output grad got {got}, expect {expect}"
-            );
-        }
-        let got_target_grad = target_cuda.grad().expect("cuda lowp target grad");
-        let expect_target_grad = target_cpu.grad().expect("cpu lowp target grad");
-        for (got, expect) in got_target_grad.iter().zip(expect_target_grad.iter()) {
-            assert!(
-                (got - expect).abs() < 3e-2,
-                "target grad got {got}, expect {expect}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_cross_entropy_backward_matches_cpu_reference_in_strict_mode() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let logits_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(&[2, 3]), vec![2.0, 0.0, -1.0, -1.0, 0.0, 2.0])
-                .unwrap()
-                .into_dyn(),
-            true,
-        );
-        let targets_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-                .unwrap()
-                .into_dyn(),
-            true,
-        );
-        let logits_cuda = logits_cpu.to_cuda();
-        let targets_cuda = targets_cpu.to_cuda();
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let loss_cuda = CrossEntropyLoss::apply(&logits_cuda, &targets_cuda);
-        loss_cuda.backward();
-        assert!(logits_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!logits_cuda.has_host_grad());
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let loss_cpu = CrossEntropyLoss::apply(&logits_cpu, &targets_cpu);
-        loss_cpu.backward();
-
-        let logits_cuda_grad = logits_cuda.grad().expect("cuda logits grad");
-        let logits_cpu_grad = logits_cpu.grad().expect("cpu logits grad");
-        for (got, expect) in logits_cuda_grad.iter().zip(logits_cpu_grad.iter()) {
-            assert!(
-                (got - expect).abs() < 1e-5,
-                "logits grad got {got}, expect {expect}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_cross_entropy_lowp_logits_and_target_read_resident_buffers() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let logits_data = vec![2.0, 0.0, -1.0, -1.0, 0.0, 2.0];
-        let target_data = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-        let logits_cpu = Tensor::parameter_with_dtype(
-            Array::from_shape_vec(IxDyn(&[2, 3]), logits_data.clone())
-                .unwrap()
-                .into_dyn(),
-            DType::BF16,
-        );
-        let targets_cpu = make_tensor(&[2, 3], target_data.clone(), DType::I8);
-        let logits_cuda = Tensor::parameter_with_dtype(
-            Array::from_shape_vec(IxDyn(&[2, 3]), logits_data)
-                .unwrap()
-                .into_dyn(),
-            DType::BF16,
-        )
-        .to_cuda();
-        let targets_cuda = make_tensor(&[2, 3], target_data, DType::I8).to_cuda();
-        assert!(logits_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(targets_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(logits_cuda.0.borrow().cuda_bf16_data.is_some());
-        assert!(targets_cuda.0.borrow().cuda_i8_data.is_some());
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let loss_cuda = CrossEntropyLoss::apply(&logits_cuda, &targets_cuda);
-        loss_cuda.backward();
-        assert!(logits_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(targets_cuda.0.borrow().cuda_f32_data.is_none());
-        assert!(logits_cuda.0.borrow().cuda_bf16_data.is_some());
-        assert!(targets_cuda.0.borrow().cuda_i8_data.is_some());
-        assert!(logits_cuda.cloned_cuda_f32_grad().is_some());
-        assert!(!logits_cuda.has_host_grad());
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let loss_cpu = CrossEntropyLoss::apply(&logits_cpu, &targets_cpu);
-        loss_cpu.backward();
-        let got_loss = loss_cuda.data_ref().first().copied().unwrap_or_default();
-        let expect_loss = loss_cpu.data_ref().first().copied().unwrap_or_default();
-        assert!(
-            (got_loss - expect_loss).abs() < 3e-2,
-            "loss got {got_loss}, expect {expect_loss}"
-        );
-
-        let got_grad = logits_cuda.grad().expect("cuda lowp logits grad");
-        let expect_grad = logits_cpu.grad().expect("cpu lowp logits grad");
-        for (got, expect) in got_grad.iter().zip(expect_grad.iter()) {
-            assert!(
-                (got - expect).abs() < 3e-2,
-                "grad got {got}, expect {expect}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_cross_entropy_forward_keeps_resident_scalar_loss_buffer() {
-        if !crate::ops::cuda::is_available() {
-            return;
-        }
-
-        let logits_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(&[2, 3]), vec![2.0, 0.0, -1.0, -1.0, 0.0, 2.0])
-                .unwrap()
-                .into_dyn(),
-            false,
-        );
-        let targets_cpu = Tensor::from_data_with_grad_flag(
-            Array::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-                .unwrap()
-                .into_dyn(),
-            false,
-        );
-        let logits_cuda = logits_cpu.to_cuda();
-        let targets_cuda = targets_cpu.to_cuda();
-
-        crate::ops::cuda::set_enabled(true);
-        set_strict_device_execution(true);
-        let loss_cuda = no_grad(|| CrossEntropyLoss::apply(&logits_cuda, &targets_cuda));
-        let loss_buffer = loss_cuda
-            .cloned_cuda_f32_buffer()
-            .expect("CUDA cross_entropy loss should keep a resident scalar buffer");
-        assert_eq!(loss_buffer.len(), 1);
-        set_strict_device_execution(false);
-        crate::ops::cuda::set_enabled(false);
-
-        let loss_cpu = CrossEntropyLoss::apply(&logits_cpu, &targets_cpu);
-        let got = loss_cuda.data_ref().first().copied().unwrap_or_default();
-        let expect = loss_cpu.data_ref().first().copied().unwrap_or_default();
-        assert!(
-            (got - expect).abs() < 1e-5,
-            "loss got {got}, expect {expect}"
-        );
-    }
-}
+#[path = "../tests/unit/loss/tests.rs"]
+mod tests;

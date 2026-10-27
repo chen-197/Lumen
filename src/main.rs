@@ -1,6 +1,7 @@
 use mimalloc::MiMalloc;
 
 use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
+use lumen::cpu::CpuInferenceContext;
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
 use lumen::models::{LlamaConfig, LlamaModel};
@@ -8,8 +9,9 @@ use lumen::module::Module;
 use lumen::ops::fp_kernels::active_float_backend_name;
 use lumen::ops::int8_kernels::active_int8_backend_name;
 use lumen::precision::{
-    DType, ParameterQuantization, PrecisionConfig, with_parameter_quantization,
-    with_precision_config, with_runtime_component_dtypes,
+    DType, InferenceActivationQuantization, ParameterQuantization, PrecisionConfig,
+    with_inference_activation_quantization, with_parameter_quantization, with_precision_config,
+    with_runtime_component_dtypes,
 };
 use lumen::tokenizer::LlamaTokenizer;
 
@@ -19,6 +21,7 @@ use ndarray_rand::rand_distr::Uniform;
 
 use std::env;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 #[global_allocator]
@@ -40,15 +43,32 @@ struct Args {
     kv_cache_dtype: DType,
     allow_parameter_copies: bool,
     parameter_quantization: ParameterQuantization,
+    activation_quantization: InferenceActivationQuantization,
     stream_weights: bool,
     max_seq_len: usize,
     load_only: bool,
     device: Device,
+    cpu_threads: Option<usize>,
+    cpu_prefill_tasks: Option<NonZeroUsize>,
+    cpu_decode_tasks: Option<NonZeroUsize>,
+}
+
+impl Args {
+    fn cpu_context(&self) -> CpuInferenceContext {
+        let mut context = CpuInferenceContext::default();
+        if let Some(limit) = self.cpu_prefill_tasks {
+            context = context.with_prefill_task_limit(limit);
+        }
+        if let Some(limit) = self.cpu_decode_tasks {
+            context = context.with_decode_task_limit(limit);
+        }
+        context
+    }
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --device DEVICE            cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --cpu-prefill-tasks N       Prefill CPU kernel task limit (default: unconstrained)\n  --cpu-decode-tasks N        Decode CPU kernel task limit (default: unconstrained)\n  --cpu-threads N             CPU workers (default: Rayon configuration / available CPUs)\n  --device DEVICE            cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --activation-quantization MODE  off/dynamic-i8 (default: off)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
     );
 }
 
@@ -106,6 +126,7 @@ fn parse_args() -> Result<Args, String> {
     let mut max_gen = 200usize;
     let mut parameter_dtype = DType::F32;
     let mut runtime_dtype = DType::F32;
+    let mut activation_quantization = InferenceActivationQuantization::Disabled;
     let mut activation_dtype: Option<DType> = None;
     let mut kv_cache_dtype: Option<DType> = None;
     let mut allow_parameter_copies = false;
@@ -115,6 +136,9 @@ fn parse_args() -> Result<Args, String> {
     let mut max_seq_len = 2048usize;
     let mut load_only = false;
     let mut device = Device::Cpu;
+    let mut cpu_threads = None;
+    let mut cpu_prefill_tasks = None;
+    let mut cpu_decode_tasks = None;
 
     let mut i = 1usize;
     while i < argv.len() {
@@ -175,6 +199,32 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<usize>()
                     .map_err(|_| "--max-gen 需要 usize")?;
             }
+            "--cpu-prefill-tasks" | "--cpu-decode-tasks" => {
+                let flag = argv[i].clone();
+                i += 1;
+                let limit = argv
+                    .get(i)
+                    .ok_or_else(|| format!("{flag} needs a positive integer"))?
+                    .parse::<NonZeroUsize>()
+                    .map_err(|_| format!("{flag} needs a positive integer"))?;
+                if flag == "--cpu-prefill-tasks" {
+                    cpu_prefill_tasks = Some(limit);
+                } else {
+                    cpu_decode_tasks = Some(limit);
+                }
+            }
+            "--cpu-threads" => {
+                i += 1;
+                let threads = argv
+                    .get(i)
+                    .ok_or("--cpu-threads 缺少数字")?
+                    .parse::<usize>()
+                    .map_err(|_| "--cpu-threads 需要正整数")?;
+                if threads == 0 {
+                    return Err("--cpu-threads 必须 >= 1".to_string());
+                }
+                cpu_threads = Some(threads);
+            }
             "--device" => {
                 i += 1;
                 device = match argv
@@ -195,6 +245,17 @@ fn parse_args() -> Result<Args, String> {
                     argv.get(i).ok_or("--parameter-dtype 缺少 dtype")?,
                     true,
                 )?;
+            }
+            "--activation-quantization" => {
+                let value = argv
+                    .get(i + 1)
+                    .ok_or("--activation-quantization requires off/dynamic-i8")?;
+                activation_quantization = match value.as_str() {
+                    "off" => InferenceActivationQuantization::Disabled,
+                    "dynamic-i8" => InferenceActivationQuantization::AllowDynamicI8,
+                    _ => return Err("--activation-quantization must be off/dynamic-i8".into()),
+                };
+                i += 1;
             }
             "--runtime-dtype" => {
                 i += 1;
@@ -324,10 +385,14 @@ fn parse_args() -> Result<Args, String> {
         kv_cache_dtype,
         allow_parameter_copies,
         parameter_quantization,
+        activation_quantization,
         stream_weights,
         max_seq_len,
         load_only,
         device,
+        cpu_threads,
+        cpu_prefill_tasks,
+        cpu_decode_tasks,
     })
 }
 
@@ -357,9 +422,6 @@ fn lcp_char_boundary(prev: &str, cur: &str) -> usize {
 }
 
 fn print_new_suffix(prev_printed: &mut String, cur_full: String) {
-    if cur_full.contains('\u{FFFD}') {
-        return;
-    }
     let cut = lcp_char_boundary(prev_printed, &cur_full);
     if cut < cur_full.len() {
         print!("{}", &cur_full[cut..]);
@@ -496,6 +558,11 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| format!("参数错误: {e}"))?;
+    if args.device == Device::Cpu {
+        lumen::arch::init_cpu_inference_threads(args.cpu_threads)?;
+        println!("cpu_threads={}", rayon::current_num_threads());
+    }
+    let cpu = args.cpu_context();
     let config = model_config(args.max_seq_len);
 
     if !Path::new(&args.tokenizer).exists() {
@@ -525,6 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.allow_parameter_copies,
         );
     }
+    println!("activation_quantization={:?}", args.activation_quantization);
     let tokenizer = LlamaTokenizer::from_file(&args.tokenizer)?;
     if tokenizer.vocab_size() != config.vocab_size {
         return Err(format!(
@@ -628,35 +696,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("🤖 Assistant: ");
         io::stdout().flush()?;
 
-        no_grad(|| {
-            let turn_prompt = if first_turn {
-                build_first_turn_prompt(&args.system, user_msg)
-            } else {
-                build_next_turn_prompt(user_msg)
-            };
+        with_inference_activation_quantization(args.activation_quantization, || {
+            no_grad(|| {
+                let turn_prompt = if first_turn {
+                    build_first_turn_prompt(&args.system, user_msg)
+                } else {
+                    build_next_turn_prompt(user_msg)
+                };
 
-            let mut new_tokens = match tokenizer.encode(&turn_prompt, false) {
-                Ok(tokens) => tokens,
-                Err(err) => {
-                    eprintln!("tokenization failed: {err}");
-                    println!();
-                    return;
-                }
-            };
-
-            if new_tokens.is_empty() {
-                println!();
-                first_turn = false;
-                return;
-            }
-
-            let cur_len = kv_caches[0].borrow().len;
-            if cur_len + new_tokens.len() + args.max_gen + 8 >= config.max_seq_len {
-                all_tokens.clear();
-                model.reset_kv_caches(&mut kv_caches);
-
-                let prompt2 = build_first_turn_prompt(&args.system, user_msg);
-                new_tokens = match tokenizer.encode(&prompt2, false) {
+                let mut new_tokens = match tokenizer.encode(&turn_prompt, false) {
                     Ok(tokens) => tokens,
                     Err(err) => {
                         eprintln!("tokenization failed: {err}");
@@ -664,75 +712,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                 };
+
                 if new_tokens.is_empty() {
                     println!();
                     first_turn = false;
                     return;
                 }
-            }
 
-            all_tokens.extend_from_slice(&new_tokens);
-            let assistant_start = all_tokens.len();
+                let cur_len = kv_caches[0].borrow().len;
+                if cur_len + new_tokens.len() + args.max_gen + 8 >= config.max_seq_len {
+                    all_tokens.clear();
+                    model.reset_kv_caches(&mut kv_caches);
 
-            let prefill_logits = model.forward_last_logits(
-                tensor_from_token_ids(&new_tokens, args.device),
-                &mut kv_caches,
-                0,
-            );
-            let mut logits_vec = last_step_logits_vec(&prefill_logits);
-
-            let mut prev_gen_text = String::new();
-            for _ in 0..args.max_gen {
-                let start = all_tokens.len().saturating_sub(args.recent_window);
-                let recent = &all_tokens[start..];
-
-                let next_token = sample_top_p(
-                    &logits_vec,
-                    args.temperature,
-                    args.top_p,
-                    args.repetition_penalty,
-                    recent,
-                );
-
-                if stop_ids.contains(&next_token) {
-                    break;
-                }
-
-                all_tokens.push(next_token);
-
-                let gen_tokens = &all_tokens[assistant_start..];
-                let cur_gen_text = tokenizer.decode(gen_tokens, true);
-                if cur_gen_text.contains("<|user|>") || cur_gen_text.contains("<|assistant|>") {
-                    break;
-                }
-                print_new_suffix(&mut prev_gen_text, cur_gen_text);
-
-                if args.temperature <= 1e-5 && args.repetition_penalty <= 1.0 {
-                    let next = model.forward_last_argmax(
-                        tensor_from_token_ids(&[next_token], args.device),
-                        &mut kv_caches,
-                        0,
-                    );
-                    logits_vec.fill(f32::NEG_INFINITY);
-                    if next < logits_vec.len() {
-                        logits_vec[next] = 0.0;
+                    let prompt2 = build_first_turn_prompt(&args.system, user_msg);
+                    new_tokens = match tokenizer.encode(&prompt2, false) {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            eprintln!("tokenization failed: {err}");
+                            println!();
+                            return;
+                        }
+                    };
+                    if new_tokens.is_empty() {
+                        println!();
+                        first_turn = false;
+                        return;
                     }
-                } else {
-                    let logits2 = model.forward_last_logits(
-                        tensor_from_token_ids(&[next_token], args.device),
+                }
+
+                all_tokens.extend_from_slice(&new_tokens);
+                let assistant_start = all_tokens.len();
+
+                let prefill_logits = cpu.prefill(|| {
+                    model.forward_last_logits(
+                        tensor_from_token_ids(&new_tokens, args.device),
                         &mut kv_caches,
                         0,
+                    )
+                });
+                let mut logits_vec = last_step_logits_vec(&prefill_logits);
+
+                let mut prev_gen_text = String::new();
+                for _ in 0..args.max_gen {
+                    let start = all_tokens.len().saturating_sub(args.recent_window);
+                    let recent = &all_tokens[start..];
+
+                    let next_token = sample_top_p(
+                        &logits_vec,
+                        args.temperature,
+                        args.top_p,
+                        args.repetition_penalty,
+                        recent,
                     );
-                    logits_vec = last_step_logits_vec(&logits2);
+
+                    if stop_ids.contains(&next_token) {
+                        break;
+                    }
+
+                    all_tokens.push(next_token);
+
+                    let gen_tokens = &all_tokens[assistant_start..];
+                    let cur_gen_text = tokenizer.decode_complete_prefix(gen_tokens, true).text;
+                    if cur_gen_text.contains("<|user|>") || cur_gen_text.contains("<|assistant|>") {
+                        break;
+                    }
+                    print_new_suffix(&mut prev_gen_text, cur_gen_text);
+
+                    if args.temperature <= 1e-5 && args.repetition_penalty <= 1.0 {
+                        let next = cpu.decode(|| {
+                            model.forward_last_argmax(
+                                tensor_from_token_ids(&[next_token], args.device),
+                                &mut kv_caches,
+                                0,
+                            )
+                        });
+                        logits_vec.fill(f32::NEG_INFINITY);
+                        if next < logits_vec.len() {
+                            logits_vec[next] = 0.0;
+                        }
+                    } else {
+                        let logits2 = cpu.decode(|| {
+                            model.forward_last_logits(
+                                tensor_from_token_ids(&[next_token], args.device),
+                                &mut kv_caches,
+                                0,
+                            )
+                        });
+                        logits_vec = last_step_logits_vec(&logits2);
+                    }
+
+                    if kv_caches[0].borrow().len + 2 >= config.max_seq_len {
+                        break;
+                    }
                 }
 
-                if kv_caches[0].borrow().len + 2 >= config.max_seq_len {
-                    break;
-                }
-            }
-
-            println!();
-            first_turn = false;
+                println!();
+                first_turn = false;
+            })
         });
     }
 
