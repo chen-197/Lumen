@@ -96,6 +96,11 @@ try {
         Get-Content (Join-Path $OutputDirectory 'reference-row-matmul.log') -Tail 35
         throw 'Independent mixed-precision row matmul reference failed'
     }
+    & $Python (Join-Path $PSScriptRoot 'check_qwen3.py') $testLog --output (Join-Path $OutputDirectory 'qwen3-comparison.json') *> (Join-Path $OutputDirectory 'reference-qwen3.log')
+    if ($LASTEXITCODE -ne 0) {
+        Get-Content (Join-Path $OutputDirectory 'reference-qwen3.log') -Tail 30
+        throw 'Independent Qwen3 forward/gradient reference failed'
+    }
     cargo clippy --release --locked --all-targets --no-default-features --features ($features -join ',') -- -D warnings -A clippy::chunks_exact_to_as_chunks *> (Join-Path $OutputDirectory 'clippy.log')
     if ($LASTEXITCODE -ne 0) {Get-Content (Join-Path $OutputDirectory 'clippy.log') -Tail 35; throw 'Clippy failed'}
     if (!$SkipFormatCheck) {
@@ -110,6 +115,7 @@ try {
     Get-Content (Join-Path $OutputDirectory 'reference-generic-nn.log')
     Get-Content (Join-Path $OutputDirectory 'reference-generic-prefill.log')
     Get-Content (Join-Path $OutputDirectory 'reference-row-matmul.log')
+    Get-Content (Join-Path $OutputDirectory 'reference-qwen3.log')
     Write-Output "Operator accuracy gate passed. Evidence: $OutputDirectory"
 } finally {
     Pop-Location

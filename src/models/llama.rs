@@ -3,6 +3,7 @@ use crate::autograd::{
     is_no_grad, is_strict_device_execution,
 };
 use crate::layers::attention::self_attention::KVCacheInner;
+use crate::layers::attention::self_attention::SelfAttentionOptions;
 use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};
 use crate::module::Module;
 use crate::ops::cuda;
@@ -269,7 +270,7 @@ impl Default for LlamaConfig {
             intermediate_size: 5632,
             num_hidden_layers: 22,
             num_attention_heads: 32,
-            num_key_value_heads: 4, // TinyLlama 1.1B 其实是 32 (MHA)，但 Qwen 是 GQA
+            num_key_value_heads: 4,
             rms_norm_eps: 1e-5,
             max_seq_len: 2048,
             rope_theta: 10000.0,
@@ -421,6 +422,14 @@ impl LlamaMLP {
 // - Cache 类型改为 layers::KVCache（Rc<RefCell<KVCacheInner>>）
 
 // Llama Decoder Block
+/// Extra decoder features shared by dense rotary/SwiGLU architectures.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecoderOptions {
+    pub head_dim: Option<usize>,
+    pub qk_norm: bool,
+    pub tie_word_embeddings: bool,
+}
+
 struct LlamaDecoderLayer {
     self_attn: SelfAttention,
     mlp: LlamaMLP,
@@ -475,9 +484,10 @@ impl LlamaDecoderLayer {
         parameter_dtype: DType,
         activation_dtype: DType,
         kv_cache_dtype: DType,
+        options: DecoderOptions,
     ) -> Self {
         Self {
-            self_attn: SelfAttention::new_with_runtime_dtypes(
+            self_attn: SelfAttention::new_with_options(
                 config.hidden_size,
                 config.num_attention_heads,
                 config.num_key_value_heads,
@@ -487,6 +497,10 @@ impl LlamaDecoderLayer {
                 parameter_dtype,
                 activation_dtype,
                 kv_cache_dtype,
+                SelfAttentionOptions {
+                    head_dim: options.head_dim,
+                    qk_norm_eps: options.qk_norm.then_some(config.rms_norm_eps),
+                },
             ),
             mlp: LlamaMLP::new_with_dtype(config, parameter_dtype),
             input_layernorm: RMSNorm::new_with_dtype(
@@ -532,6 +546,7 @@ impl LlamaDecoderLayer {
 }
 
 pub struct LlamaModel {
+    decoder_options: DecoderOptions,
     embed_tokens: Embedding,
     layers: Vec<LlamaDecoderLayer>,
     norm: RMSNorm,
@@ -576,6 +591,7 @@ impl LlamaModel {
             layers,
             norm,
             lm_head,
+            decoder_options: DecoderOptions::default(),
             activation_dtype,
             kv_cache_dtype,
             config,
@@ -604,6 +620,7 @@ impl LlamaModel {
             layers,
             norm,
             lm_head,
+            decoder_options: DecoderOptions::default(),
             activation_dtype: dtype,
             kv_cache_dtype: dtype,
             config,
@@ -615,6 +632,22 @@ impl LlamaModel {
         parameter_dtype: DType,
         activation_dtype: DType,
         kv_cache_dtype: DType,
+    ) -> Self {
+        Self::new_with_decoder_options(
+            config,
+            parameter_dtype,
+            activation_dtype,
+            kv_cache_dtype,
+            DecoderOptions::default(),
+        )
+    }
+
+    pub fn new_with_decoder_options(
+        config: LlamaConfig,
+        parameter_dtype: DType,
+        activation_dtype: DType,
+        kv_cache_dtype: DType,
+        options: DecoderOptions,
     ) -> Self {
         config.validate();
         assert!(
@@ -632,19 +665,29 @@ impl LlamaModel {
                 parameter_dtype,
                 activation_dtype,
                 kv_cache_dtype,
+                options,
             ));
         }
 
         let norm =
             RMSNorm::new_with_dtype(config.hidden_size, config.rms_norm_eps, parameter_dtype);
-        let lm_head =
-            Linear::new_no_bias_with_dtype(config.hidden_size, config.vocab_size, parameter_dtype);
+        let lm_head = if options.tie_word_embeddings {
+            Linear {
+                weight: embed_tokens.weight.clone(),
+                bias: None,
+                in_features: config.hidden_size,
+                out_features: config.vocab_size,
+            }
+        } else {
+            Linear::new_no_bias_with_dtype(config.hidden_size, config.vocab_size, parameter_dtype)
+        };
 
         Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            decoder_options: options,
             config,
             activation_dtype,
             kv_cache_dtype,
@@ -672,7 +715,10 @@ impl LlamaModel {
         dtype: Option<DType>,
     ) -> Vec<KVCache> {
         assert!(batch_size > 0, "KV cache batch size must be > 0");
-        let head_dim = self.config.hidden_size / self.config.num_attention_heads;
+        let head_dim = self
+            .decoder_options
+            .head_dim
+            .unwrap_or(self.config.hidden_size / self.config.num_attention_heads);
         let h_kv = self.config.num_key_value_heads;
         let max_seq = self.config.max_seq_len;
         let cache_device = self.embed_tokens.weight.device();
@@ -1250,6 +1296,18 @@ impl LlamaModel {
             );
 
             // MLP
+            if let Some(norm) = &layer.self_attn.q_norm {
+                params.insert(
+                    format!("{prefix}.self_attn.q_norm.weight"),
+                    norm.weight.clone(),
+                );
+            }
+            if let Some(norm) = &layer.self_attn.k_norm {
+                params.insert(
+                    format!("{prefix}.self_attn.k_norm.weight"),
+                    norm.weight.clone(),
+                );
+            }
             params.insert(
                 format!("{}.mlp.gate_proj.weight", prefix),
                 layer.mlp.gate_proj.weight.clone(),
@@ -1280,6 +1338,15 @@ impl LlamaModel {
 
         params
     }
+
+    /// Canonical checkpoint names, omitting the output alias when embeddings are tied.
+    pub fn checkpoint_parameters(&self) -> HashMap<String, Tensor> {
+        let mut parameters = self.named_parameters();
+        if self.decoder_options.tie_word_embeddings {
+            parameters.remove("lm_head.weight");
+        }
+        parameters
+    }
 }
 
 impl Module for LlamaModel {
@@ -1292,10 +1359,7 @@ impl Module for LlamaModel {
         // 收集所有参数
         let mut params = vec![self.embed_tokens.weight.clone()];
         for layer in &self.layers {
-            params.extend(layer.self_attn.w_q.parameters());
-            params.extend(layer.self_attn.w_k.parameters());
-            params.extend(layer.self_attn.w_v.parameters());
-            params.extend(layer.self_attn.w_o.parameters());
+            params.extend(layer.self_attn.parameters());
             params.extend(layer.mlp.gate_proj.parameters());
             params.extend(layer.mlp.up_proj.parameters());
             params.extend(layer.mlp.down_proj.parameters());
@@ -1303,7 +1367,9 @@ impl Module for LlamaModel {
             params.push(layer.post_attention_layernorm.weight.clone());
         }
         params.push(self.norm.weight.clone());
-        params.push(self.lm_head.weight.clone());
+        if !self.decoder_options.tie_word_embeddings {
+            params.push(self.lm_head.weight.clone());
+        }
         params
     }
 }

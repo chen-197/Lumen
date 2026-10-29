@@ -5,7 +5,7 @@ use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scope
 use lumen::cpu::CpuInferenceContext;
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
-use lumen::models::{LlamaConfig, LlamaModel};
+use lumen::models::{CausalLMConfig, LlamaConfig, LlamaModel};
 use lumen::module::Module;
 use lumen::ops::fp_kernels::active_float_backend_name;
 use lumen::ops::int8_kernels::active_int8_backend_name;
@@ -14,7 +14,7 @@ use lumen::precision::{
     with_inference_activation_quantization, with_parameter_quantization, with_precision_config,
     with_runtime_component_dtypes,
 };
-use lumen::tokenizer::LlamaTokenizer;
+use lumen::tokenizer::{ChatFormat, LlamaTokenizer};
 
 use ndarray::{Array, Array1, Ix3, s};
 use ndarray_rand::RandomExt;
@@ -43,6 +43,8 @@ enum DecodeMode {
 
 #[derive(Debug, Clone)]
 struct Args {
+    config: Option<String>,
+    enable_thinking: bool,
     weights: String,
     tokenizer: String,
     prompt: String,
@@ -140,22 +142,23 @@ impl Args {
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --prompt TEXT               User prompt text\n  --prompt-file PATH          Read user prompt text from file\n  --system TEXT               System prompt\n  --runs N                    Timed runs (default: 5)\n  --warmup N                  Warmup runs (default: 1)\n  --max-gen N                 Decode tokens per run (default: 128)\n  --mode MODE                 greedy/sample (default: sample)\n  --temperature FLOAT         Sampling temperature (default: 0.8)\n  --top-p FLOAT               Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT  Repetition penalty (default: 1.05)\n  --recent-window N           Recent token window (default: 96)\n  --stop-on-eos               Stop decode when EOS/stop token appears\n  --stop-on-chat-marker       Stop when decoded text emits chat role markers\n  --decode-text-each-step     Include tokenizer.decode(gen_tokens) timing each step\n  --show-output               Print decoded generated text for the first measured run\n  --show-token-ids            Print generated token ids for the first measured run\n  --samples-output PATH      Save every warmup/timed sample and token IDs as JSON\n  --profile-cpu              Interleave profiled/plain samples (cpu-profiling feature)\n  --replay-token-ids PATH     JSON token array for fixed-input timing; not free generation\n  --capture-logits           Untimed diagnostic: sample mode, runs=1, warmup=0, max-gen<=32\n  --compare-cpu               After CUDA run, compare first run token ids with CPU\n                              Sample mode replays CUDA random draws on CPU\n  --fail-on-mismatch          Return an error when --compare-cpu finds token mismatch\n  --cpu-tune-tasks SPEC       Explicit CPU task sweep: auto or 1,2,4,... (greedy only)\n  --cpu-tune-output PATH      Sweep JSON report (default: cpu-task-tuning.json)\n  --cpu-prefill-tasks N       Prefill CPU kernel task limit (default: unconstrained)\n  --cpu-decode-tasks N        Decode CPU kernel task limit (default: unconstrained)\n  --cpu-threads N             CPU workers (default: Rayon configuration / available CPUs)\n  --device DEVICE             cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE     f32/f16/bf16/i8 (default: f32)\n  --activation-quantization MODE  off/dynamic-i8 (default: off)\n  --runtime-dtype DTYPE       f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE    f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE      f32/f16/bf16\n  --quantize DTYPE            off/i8 (default: off)\n  --quant-scale FLOAT         Manual quant scale override\n  --allow-parameter-copies    Allow cached parameter dtype copies\n  --stream-weights            Stream weights from disk\n  --max-seq-len N             Override KV cache max seq len (default: 2048)\n\nExamples:\n  cargo run --release --features \"dev-tools cuda\" --bin prefill_decode_bench -- \\\n    --weights model.safetensors --tokenizer tokenizer.json --prompt \"你好，请解释 Transformer 的 KV cache\" \\\n    --show-output --show-token-ids --compare-cpu --fail-on-mismatch --device cuda --parameter-dtype f16 --activation-dtype f16 --kv-cache-dtype f16 --allow-parameter-copies\n"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --prompt TEXT               User prompt text\n  --prompt-file PATH          Read user prompt text from file\n  --config PATH              Model config (default: config.json beside weights)\n  --enable-thinking          Enable Qwen3 thinking (default: disabled)\n  --system TEXT               System prompt\n  --runs N                    Timed runs (default: 5)\n  --warmup N                  Warmup runs (default: 1)\n  --max-gen N                 Decode tokens per run (default: 128)\n  --mode MODE                 greedy/sample (default: sample)\n  --temperature FLOAT         Sampling temperature (default: 0.8)\n  --top-p FLOAT               Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT  Repetition penalty (default: 1.05)\n  --recent-window N           Recent token window (default: 96)\n  --stop-on-eos               Stop decode when EOS/stop token appears\n  --stop-on-chat-marker       Stop when decoded text emits chat role markers\n  --decode-text-each-step     Include tokenizer.decode(gen_tokens) timing each step\n  --show-output               Print decoded generated text for the first measured run\n  --show-token-ids            Print generated token ids for the first measured run\n  --samples-output PATH      Save every warmup/timed sample and token IDs as JSON\n  --profile-cpu              Interleave profiled/plain samples (cpu-profiling feature)\n  --replay-token-ids PATH     JSON token array for fixed-input timing; not free generation\n  --capture-logits           Untimed diagnostic: sample mode, runs=1, warmup=0, max-gen<=32\n  --compare-cpu               After CUDA run, compare first run token ids with CPU\n                              Sample mode replays CUDA random draws on CPU\n  --fail-on-mismatch          Return an error when --compare-cpu finds token mismatch\n  --cpu-tune-tasks SPEC       Explicit CPU task sweep: auto or 1,2,4,... (greedy only)\n  --cpu-tune-output PATH      Sweep JSON report (default: cpu-task-tuning.json)\n  --cpu-prefill-tasks N       Prefill CPU kernel task limit (default: unconstrained)\n  --cpu-decode-tasks N        Decode CPU kernel task limit (default: unconstrained)\n  --cpu-threads N             CPU workers (default: Rayon configuration / available CPUs)\n  --device DEVICE             cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE     f32/f16/bf16/i8 (default: f32)\n  --activation-quantization MODE  off/dynamic-i8 (default: off)\n  --runtime-dtype DTYPE       f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE    f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE      f32/f16/bf16\n  --quantize DTYPE            off/i8 (default: off)\n  --quant-scale FLOAT         Manual quant scale override\n  --allow-parameter-copies    Allow cached parameter dtype copies\n  --stream-weights            Stream weights from disk\n  --max-seq-len N             Override KV cache max seq len (default: 2048)\n\nExamples:\n  cargo run --release --features \"dev-tools cuda\" --bin prefill_decode_bench -- \\\n    --weights model.safetensors --tokenizer tokenizer.json --prompt \"你好，请解释 Transformer 的 KV cache\" \\\n    --show-output --show-token-ids --compare-cpu --fail-on-mismatch --device cuda --parameter-dtype f16 --activation-dtype f16 --kv-cache-dtype f16 --allow-parameter-copies\n"
     );
 }
 
-fn model_config(max_seq_len: usize) -> LlamaConfig {
-    LlamaConfig {
-        vocab_size: 32000,
-        hidden_size: 2048,
-        intermediate_size: 5632,
-        num_hidden_layers: 22,
-        num_attention_heads: 32,
-        num_key_value_heads: 4,
-        rms_norm_eps: 1e-5,
-        max_seq_len,
-        rope_theta: 10000.0,
-    }
+fn read_config(args: &Args) -> Result<CausalLMConfig, Box<dyn std::error::Error>> {
+    let path = Path::new(&args.weights);
+    let directory = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(Path::new("."))
+    };
+    let config = args
+        .config
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| directory.join("config.json"));
+    CausalLMConfig::from_file(config)
 }
 
 fn parse_dtype_flag(flag: &str, value: &str, allow_integer: bool) -> Result<DType, String> {
@@ -189,6 +192,8 @@ fn parse_args() -> Result<Args, String> {
     }
 
     let mut weights: Option<String> = None;
+    let mut config = None;
+    let mut enable_thinking = false;
     let mut tokenizer: Option<String> = None;
     let mut prompt =
         "请用简洁但准确的方式解释一下 Transformer 里的 KV cache，以及它为什么能加速 decode。"
@@ -234,6 +239,11 @@ fn parse_args() -> Result<Args, String> {
     let mut i = 1usize;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--config" => {
+                i += 1;
+                config = Some(argv.get(i).ok_or("--config requires a path")?.clone());
+            }
+            "--enable-thinking" => enable_thinking = true,
             "-h" | "--help" => {
                 usage(&program);
                 std::process::exit(0);
@@ -544,10 +554,12 @@ fn parse_args() -> Result<Args, String> {
     let replay_token_ids = replay_ids_path
         .map(|path| {
             let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            replay_audit::parse_ids(&text, max_gen, model_config(max_seq_len).vocab_size)
+            replay_audit::parse_ids(&text, max_gen, u32::MAX as usize)
         })
         .transpose()?;
     Ok(Args {
+        config,
+        enable_thinking,
         weights: weights.ok_or("必须提供 --weights")?,
         tokenizer: tokenizer.ok_or("必须提供 --tokenizer")?,
         prompt,
@@ -716,7 +728,15 @@ fn last_step_logits_vec(logits: &Tensor) -> Vec<f32> {
 
 fn build_stop_ids(tokenizer: &LlamaTokenizer) -> Vec<usize> {
     let mut stop_ids = Vec::new();
-    for t in ["</s>", "<|system|>", "<|user|>", "<|assistant|>"] {
+    for t in [
+        "</s>",
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+    ] {
         if let Some(id) = tokenizer.token_to_id(t) {
             stop_ids.push(id);
         }
@@ -791,7 +811,11 @@ fn first_token_mismatch(lhs: &[usize], rhs: &[usize]) -> Option<usize> {
     (lhs.len() != rhs.len()).then_some(shared)
 }
 
-fn load_model(args: &Args, config: &LlamaConfig) -> Result<LlamaModel, Box<dyn std::error::Error>> {
+fn load_model(
+    args: &Args,
+    _config: &LlamaConfig,
+) -> Result<LlamaModel, Box<dyn std::error::Error>> {
+    let pretrained = read_config(args)?;
     let precision_config = PrecisionConfig {
         parameter_dtype: args.parameter_dtype,
         runtime_dtype: args.runtime_dtype,
@@ -808,11 +832,16 @@ fn load_model(args: &Args, config: &LlamaConfig) -> Result<LlamaModel, Box<dyn s
             || {
                 with_parameter_quantization(args.parameter_quantization, || {
                     let model = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
-                        LlamaModel::new(config.clone())
-                    });
-                    ModelLoader::load_llama_weights_with_options(
+                        pretrained.build(
+                            args.max_seq_len,
+                            args.parameter_dtype,
+                            args.activation_dtype,
+                            args.kv_cache_dtype,
+                        )
+                    })?;
+                    ModelLoader::load_weights_with_options(
                         &args.weights,
-                        &model.named_parameters(),
+                        &model.checkpoint_parameters(),
                         load_options,
                     )?;
                     Ok::<LlamaModel, Box<dyn std::error::Error>>(model)
@@ -1057,7 +1086,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cpu_threads={}", rayon::current_num_threads());
     }
     cpu_tuning::validate_pool(&args)?;
-    let config = model_config(args.max_seq_len);
+    let pretrained = read_config(&args)?;
+    let config = pretrained.decoder_config(args.max_seq_len)?;
+    if args
+        .replay_token_ids
+        .as_ref()
+        .is_some_and(|ids| ids.iter().any(|&id| id >= config.vocab_size))
+    {
+        return Err("Replay token ID outside model vocabulary".into());
+    }
 
     if !Path::new(&args.tokenizer).exists() {
         return Err(format!("tokenizer 文件不存在: {}", args.tokenizer).into());
@@ -1066,7 +1103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("weights 文件不存在: {}", args.weights).into());
     }
 
-    let prompt = build_first_turn_prompt(&args.system, &args.prompt);
+    let prompt = if pretrained.model_type == "qwen3" {
+        ChatFormat::Qwen3 {
+            enable_thinking: args.enable_thinking,
+        }
+        .first_turn(&args.system, &args.prompt)
+    } else {
+        build_first_turn_prompt(&args.system, &args.prompt)
+    };
     println!("activation_quantization={:?}", args.activation_quantization);
     let tokenizer = LlamaTokenizer::from_file(&args.tokenizer)?;
     let prompt_tokens = tokenizer.encode(&prompt, false)?;
@@ -1131,7 +1175,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         model.to_cuda();
     }
-    let stop_ids = build_stop_ids(&tokenizer);
+    let mut stop_ids = build_stop_ids(&tokenizer);
+    if let Some(ids) = &pretrained.eos_token_id {
+        stop_ids.extend(ids.values());
+    }
 
     if args.cpu_tune_tasks.is_some() {
         return cpu_tuning::run(

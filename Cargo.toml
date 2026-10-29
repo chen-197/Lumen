@@ -8,7 +8,7 @@ readme = "README.md"
 license-file = "LICENSE"
 keywords = ["tensor", "autograd", "cuda", "neural-network", "machine-learning"]
 categories = ["science", "algorithms"]
-include = ["Cargo.toml", "Cargo.lock", "build.rs", "src/**", "README.md", "README_zh-CN.md", "CHANGELOG.md", "LICENSE", "dev-tools/*.py", "dev-tools/*.ps1", "dev-tools/**/*.rs", "dev-tools/README.md", "tests/**"]
+include = ["Cargo.toml", "Cargo.lock", "build.rs", "src/**", "README.md", "README_zh-CN.md", "CHANGELOG.md", "LICENSE", "dev-tools/*.py", "dev-tools/*.ps1", "dev-tools/**/*.rs", "dev-tools/README.md", "dev-tools/benchmarks/results/*.json", "tests/**"]
 autobins = false
 build = "build.rs"
 
@@ -33,7 +33,7 @@ rayon = "1.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
-tokenizers = "0.19"
+tokenizers = "0.23"
 safetensors = "0.3"
 memmap2 = "0.5"
 half = "2.3"

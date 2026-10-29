@@ -8,6 +8,8 @@ in [`tests/`](../tests/README.md).
 
 - `benchmarks/`: warmed kernel, scheduling, backward, and model benchmarks.
   Multi-file programs keep `main.rs` and their helper modules in one directory.
+- `benchmarks/results/`: dated measurement data with source fingerprints, build
+  metadata and individual samples; README performance tables use these files.
 - `bin/`: explicit developer diagnostics such as `manual_state_check`.
 - `check_*.ps1`: accuracy, state, endurance, and release check runners.
 - `check_*.py`: independent numerical and training references.
@@ -24,6 +26,10 @@ cargo run --release --features dev-tools --bin manual_state_check -- --device cp
 The production inference CLI and weight conversion CLI remain in `src/`.
 The `cpu-profiling` feature enables library instrumentation used by benchmarks;
 it depends on `dev-tools` and is disabled by default.
+
+`matmul.total` includes `matmul.kernel`, while `rms_norm` measures the full
+normalization call. These regions are inclusive and must not be summed as
+independent shares of total time.
 
 ## Check runners
 
@@ -45,12 +51,22 @@ Paths are resolved from the repository and script locations. Runners accept
 Build output discovery follows Cargo metadata, including `CARGO_TARGET_DIR` and
 Cargo configuration. Model locations and Python executables are caller inputs;
 no user profile, downloaded model, or Python installation path is hard-coded.
-Generated logs, samples, and reference results belong under `target/` or an
-explicit output directory, rather than the source tree.
+Temporary logs, samples, and reference results belong under `target/` or an
+explicit output directory. Reviewed datasets published with documentation belong
+in `benchmarks/results/`; include source/build identities and remove machine-specific paths.
 
 Endurance tests are opt-in. The runner reports real-weight tests as skipped when
 `-ModelDirectory` is absent. Timing comparisons should run serially with warmup,
 without other builds, tests, or model processes competing for resources.
+
+The accuracy runner includes `check_qwen3.py`, an independent FP64 reference for
+Q/K normalization, attention heads wider than `hidden_size / num_heads`, tied
+embeddings, full forward logits and parameter gradients. Like the other ordinary
+numerical tests, it uses small fixtures and requires no downloaded weights.
+
+`prefill_decode_bench` reads an adjacent `config.json` or an explicit `--config`.
+It supports the documented Llama/dense Qwen3 configurations. Qwen3 text prompts
+use ChatML with thinking disabled unless `--enable-thinking` is supplied.
 
 ## Bounded performance runs
 

@@ -36,7 +36,7 @@ scheduler experiments serve different purposes.
 | Suite | Required coverage | Selection |
 | --- | --- | --- |
 | Daily | All ordinary unit and cross-module tests, including operator boundaries, gradients and short training | `cargo test --release --locked --all-targets --features dev-tools` |
-| Release | Portable correctness; native correctness when supported; all eight independent references per configuration; public API state/training; Clippy, format, docs and source package | `check_release.ps1 -NativeCpu`, or `-Cuda` on a CUDA host |
+| Release | Portable correctness; native correctness when supported; all nine independent references per configuration; public API state/training; Clippy, format, docs and source package | `check_release.ps1 -NativeCpu`, or `-Cuda` on a CUDA host |
 | Endurance | 1000-step training, graph/buffer release, long KV routes and real-weight reference when assets are supplied | Add `-Endurance -ModelDirectory ...` to the release runner, once on the optimized build |
 | Performance | Representative warmed forward/backward, four weight types, decoding, request scaling and tail shapes | `check_performance.py`; independent of the correctness runner |
 | Investigation | Intermediate thread budgets, precision/request cross products, SIMD timing, old/new scheduler comparisons | Select a named ignored test or use `check_performance.py --extended` |
@@ -53,9 +53,11 @@ architectures are not covered by running more combinations on one x86 machine.
   conversion, quantization scales, forward values, VJPs, frozen parameters,
   retained graphs, accumulation, optimizer state and checkpoints catch different
   failures. A training loss decrease alone cannot replace numerical references.
-- Keep all eight Python references: operator FP64, dense cross entropy, autograd
+- Keep all nine Python references: operator FP64, dense cross entropy, autograd
   reuse, gradient flags, accumulation, generic NN, generic prefill and row matmul.
-  Their targets differ; none is replaced by the real-model generation check.
+  The Qwen3 reference also checks expanded attention heads, Q/K normalization,
+  tied embeddings, full logits and all parameter VJPs against independent FP64
+  equations. Their targets differ; none is replaced by the real-model generation check.
 - Keep the 1000-step endurance assertions unchanged. Short training is already
   included in ordinary/public API tests. Endurance requires finite values and
   overall loss descent, allowing intermediate rebounds. It also checks lifetime
@@ -63,14 +65,16 @@ architectures are not covered by running more combinations on one x86 machine.
 - Keep real-weight free generation separate from forced-token timing. For a
   routine release with a small model, use simple English questions, such as
   asking for a capital city or a basic fact, across CPU/CUDA and
-  F32/F16/BF16/I8 where supported. Check relevance, readable sentences,
-  corruption and abnormal repetition; use PyTorch at matching floating
-  precision to investigate differences. Model language quality is not a
-  strict token-equality gate.
+  F32/F16/BF16/I8 where supported. Small models have limited capabilities and
+  may give poor answers, so the primary criteria are fluent sentences and no
+  significant text corruption. Record relevance and abnormal repetition as
+  additional observations; use PyTorch at matching floating precision to
+  investigate inference differences. Model language quality is not a strict
+  token-equality gate.
 
 ### Repetition removed from routine release work
 
-- Do not rerun the full suite and eight references in both `dev-tools` and
+- Do not rerun the full suite and nine references in both `dev-tools` and
   production-only builds. Check production compilation/package separately;
   rerun feature-gated behavior when that behavior changes. For `cpu-profiling`,
   select its two scope-restoration tests instead of rerunning all library tests.

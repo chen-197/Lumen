@@ -167,6 +167,23 @@ extern "C" int lumen_cuda_copy_f32_offset(
     return 0;
 }
 
+extern "C" int lumen_cuda_round_kv_cache_rows_f32_device(
+    uint64_t handle, size_t batch_size, size_t num_heads,
+    size_t rows, size_t capacity, size_t dim, size_t start, int dtype) {
+    if (!validate_handle(handle, "CUDA KV rounding handle")) return 1;
+    if (batch_size == 0 || num_heads == 0 || rows == 0 || capacity == 0 || dim == 0 ||
+        start > capacity || rows > capacity - start || (dtype != 1 && dtype != 2)) {
+        set_error("Invalid CUDA KV rounding geometry or dtype");
+        return 1;
+    }
+    size_t total = 0;
+    if (!checked_product("CUDA KV rounding length overflow", {batch_size, num_heads, rows, dim}, &total)) return 1;
+    constexpr int block_size = 256;
+    round_kv_cache_rows_kernel<<<linear_grid_size(total, block_size), block_size>>>(
+        handle_to_ptr(handle), total, rows, capacity, dim, start, dtype);
+    return check_cuda_launch("CUDA KV rounding kernel launch failed") ? 0 : 1;
+}
+
 extern "C" int lumen_cuda_append_kv_cache_f32_device(
     uint64_t dst_handle,
     uint64_t src_handle,

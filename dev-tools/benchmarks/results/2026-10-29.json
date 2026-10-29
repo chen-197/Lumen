@@ -1,0 +1,3931 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-29",
+  "source_snapshot": {
+    "fingerprint_sha256": "2b52402a61ba3a9cc074407c8913458a957ae744d8e02a1991b53b382a9bf546",
+    "algorithm": "SHA-256 of sorted compact JSON file-hash map (UTF-8)",
+    "files": {
+      "Cargo.lock": "7a9cd817c49849090dde9179abd671a25cc34635a754536e7117248737e1f62d",
+      "Cargo.toml": "6b4330c5ec1e32b230a26fe2ec92c7ec3807cb39d60cdba5e428edd17e0bd457",
+      "build.rs": "9f27af7957ab570c026079f0c26f9d403d41e39f3c68abdf05391e07e8fefdb1",
+      "dev-tools/benchmarks/cpu_backward_bench.rs": "7fe831bb2e7ff3cd96ef8416e93c269605af7297d2533413cc1df2921f23940f",
+      "dev-tools/benchmarks/cpu_decode_bench.rs": "3d4030d94cde25ec0f9734d12b1c40b01666551ba3f03689a348c62debdac8db",
+      "dev-tools/benchmarks/cpu_projection_bench.rs": "d5371e72c00af9190ee90bab06a3ae2c0637bb355dac9bc37f4da1273d34eb07",
+      "dev-tools/benchmarks/cpu_scaling_bench.rs": "6227136e5a9cf507fd7d6d88e7bfc7996a7c46ca61944dc640038f9c431285ec",
+      "dev-tools/benchmarks/cuda_cpu_bench/main.rs": "0bed724374c52cc753ac225847193283a816ebef5f08dcc2adceee7c7da1655e",
+      "dev-tools/benchmarks/cuda_cpu_bench/paths.rs": "72e47a0fc6f8c951ecdf4bb1099d973e3990450d19933b9481e9928af5700656",
+      "dev-tools/benchmarks/generic_prefill_bench.rs": "bf34082d630590559f68d5920296d9b53c78a6dd5c84601f2b7344dcdc8a789b",
+      "dev-tools/benchmarks/kernel_bench.rs": "93821f198c18bcee6c5f985f6f05376a97a1027028a1ecaac623c41ace76e978",
+      "dev-tools/benchmarks/prefill_decode_bench/cpu_tuning.rs": "8f98fff240b67587f95516873d08d20e3e9583828e32b8f74490152bc637be7f",
+      "dev-tools/benchmarks/prefill_decode_bench/main.rs": "e7c45e7bcb8b8e19c440c2cf1274c3c077ba6f53ae602e87e1000db556bc9950",
+      "dev-tools/benchmarks/prefill_decode_bench/replay_audit.rs": "4810336ad19051623f3c89bd31a67678c24f0e12b9026bd06c2299573a870ea6",
+      "dev-tools/benchmarks/prefill_decode_bench/samples.rs": "3e2c587d3b54e020bcd308bc6da8d0beceb2d7c11b52efbef12159c0f2687e0b",
+      "src/arch.rs": "9144330db19c2533780c8d234ca45c65cfe968873c98bd7378957187a2ff8b69",
+      "src/autograd/backward.rs": "2717c06f31b27f01cefaa0ea6ff90591be2fe2f06d97d86c30fdc5d050628c64",
+      "src/autograd/checkpoint.rs": "b85afa39981b9bf217d71af9d3751fe1692c432b37453b29423a8017d5a3b5a6",
+      "src/autograd/creation.rs": "b4cbaed73638b29770e3204bfaef6c56f8ee6b0bc837b22ce8c364e451d4ccbd",
+      "src/autograd/device.rs": "8c8397fecc0d57373459075a66404b99938be02fc4ef4efb8d304f541dce08bc",
+      "src/autograd/diagnostics.rs": "d76627622e477b25fdab9d3f469fd00b1263aecbe6caff99cd03d4e7cc5227cb",
+      "src/autograd/mod.rs": "47793ccb3e578a1612806a290dbbe926e96bb4624bc3db5b31c22ea4aaf5bfca",
+      "src/autograd/operations.rs": "4eb34ae91fd1cfaaf6606d86de1b1d194f9719e3feaa835f6f825d9595f05cdb",
+      "src/autograd/optimizer.rs": "c1f54ce099d5024b7612798e590f5591d5d879a6753292a4c9e489db216b5323",
+      "src/autograd/quantization.rs": "47377153c8660e47b680e6fb97fc25554caa40406cc5a91ec7f31521ae26e798",
+      "src/autograd/storage.rs": "720d3ebcaf267a7ae9936aeaec6aa06ff9eb5556b3cdfc20b94a101fdd0c40be",
+      "src/autograd/views.rs": "624f82236530c9a338a0c52d081061343c5dd4993b1b51a290c519bc4b2ac5f1",
+      "src/bin/quantize_safetensors.rs": "0c2563c8a1b769d9a4c727f498178aa756577b18e07f738b182344fcc4f5454f",
+      "src/cpu/mod.rs": "a11b34276e751564048710ea1663cfead8ffe742a9b64f041e73151182c9cc46",
+      "src/cpu/profiling.rs": "47caaceec3e0b158283507fc7c46b0df17082cc75f94f9d92f3e6eba8cbe0376",
+      "src/init.rs": "431b1c38998d710f385a1cd36bd530e1425029c57aeaab25f289fd072d71fef2",
+      "src/layers/activation.rs": "30be7b98002dd029632f8df8a81b166819ef4438f55ae3e0f45f63a7c2f6efe8",
+      "src/layers/attention/cpu_infer.rs": "97c63c22b35e6d3bdd63f5eb1ed967b5f0b019a3ebd504e1db571287a2aced7a",
+      "src/layers/attention/encoding.rs": "4fa92919682a2742dab1abdf47204603499aefde73c7f3c66efd73b77e782ab5",
+      "src/layers/attention/mod.rs": "b4b3747455fae49b78c55a53f5a663b50ff4d001f6d156275322b09d7a43fe88",
+      "src/layers/attention/scaled_dot_product.rs": "c9684fbb0b08d6ae48d15dfad0e6801f13f2e5aed78bc97dd9bfd1e520c71f49",
+      "src/layers/attention/self_attention.rs": "64a7acf41356580c21b828f0a845941212429a8649ddb771050db17ff218e2d2",
+      "src/layers/basic/dropout.rs": "6cd3292ef554bdbb7fc1d58389f0dba6218d0c849bebb36c3d88623a31d3e5c2",
+      "src/layers/basic/embedding.rs": "643b4f281a5fce827e9b905b456be4ceb8fbef7d27a762f1dc74cc50f6ce03b8",
+      "src/layers/basic/flatten.rs": "0a1deab535871d82603008ee77fa498e9ee3c3a979479781769f5952e03cac84",
+      "src/layers/basic/linear.rs": "0cd5efc0edbe1857fe544d79dde9d209d370942c382dcc098bcf2d951d1486f0",
+      "src/layers/basic/mod.rs": "3b7ca894c465b1f384feb3b90ad871496a208f88a4ba12ed6dd9e0b3050a7a6e",
+      "src/layers/conv/conv2d.rs": "19598cddac0d90edead2913f3ddc8d67762ce658dcfa3f3738253797a60afcdf",
+      "src/layers/conv/mod.rs": "d59df229fa2a3ccbcf37bcdf9797784799efb328514587cffa2dc514fbd928b5",
+      "src/layers/conv/pool.rs": "626b0e64f638dd3043f1b259ee7dac6d24031989433caeec37ea13641de56427",
+      "src/layers/mod.rs": "14174ad7fdc5a2708392b546350eff7ce7dd02744832c0af31b9c8df48278779",
+      "src/layers/norm/layer_norm.rs": "27306cc4df538f2167ec7439e075d7be2f9640d7bc9d5054b0e06ff4e5f0247c",
+      "src/layers/norm/mod.rs": "09bb4c065ad0e27a1489ed2053dc5f83a6f832b36ca63d47cba0a0199346b6c9",
+      "src/layers/norm/rms_norm.rs": "f800db2be9f2fa3f4a2ff46d8a23662f1c0ae2427c0c0785d068f9c8c47b0a03",
+      "src/layers/rnn/gru.rs": "e1c0878037def13bcdc54ab9475849002fcc22ab41b9d97d251d25434369b538",
+      "src/layers/rnn/lstm.rs": "bc1f1a5e73369f5800936dcc03572c29a1b5c90fad287c52077a49d8a37b73d0",
+      "src/layers/rnn/mod.rs": "898d81f5c90cc3447215d2a4eab6e29f2327ebba7d4f8987d816cb00b491bc4f",
+      "src/layers/rnn/simple.rs": "01e26ce78ae0615082dc55478f64f22cea0f1ef8552819e9e56737ab86a0f5ed",
+      "src/lib.rs": "39cfd48dc5c7536b7ee7b38f8579d57977fc074b3977a5ca83ffdf5ae3b69df3",
+      "src/loader.rs": "cf37f9248c9a3e2f9f963d7284ba8f06b70101bf5c3f34e8343fff4ebbdfe569",
+      "src/loader/pretrained.rs": "8b4f07e5b00898ba8b5bcec48ffc35b31ebe54f0bbd8ddf95196b5e2c84ac468",
+      "src/loss.rs": "7df4ee21ce572064f6dd03f124e7df2a5c1ca3a7b11ef5268099da80826135bc",
+      "src/main.rs": "5a0adf0c83229d4f04f8127bb1cefdec67360669b25af90d1a92015c022fcc19",
+      "src/models/llama.rs": "7e890f0ff66783bf378cba127ad475d43243bc08f1b2205d4ed8f6b1ee945ac9",
+      "src/models/mod.rs": "15dbbbafa69b74f7f914c17a868af117e623ad9129afc8f5e914a3d15bcdda47",
+      "src/models/pretrained.rs": "2105cf9be1fa6c16b94bb681b383c516754c4d2991165317ed0e17de4314d91b",
+      "src/models/qwen3.rs": "d5db6b2e737f3f61854c232836e65e8291839fe80ed841d4b267517120c741c3",
+      "src/module.rs": "bf79d8a81b55c71f70663dca9553f33a837f8fbf3236cddf63ebdb95672ce81e",
+      "src/ops/arithmetic.rs": "13b8212b4c6ccc8434bb779ba17bf94df9ead777b157cd5df2590ce094e59519",
+      "src/ops/convolution.rs": "7a92e7a481df8f48cfd3e50c22b197c91133cd7eefdfe49a0fea380a92ed4099",
+      "src/ops/cpu_gemm.rs": "902d8491ba25b6d098cb7437f57059df31b05d17fec67ce3be96607283d3ef28",
+      "src/ops/cuda/api/attention.rs": "9eed26b2cfd70df25e7b0c67f433cbd08438db7c3338a9b893a3ae0bf2bfbdfc",
+      "src/ops/cuda/api/convolution.rs": "3de724a8ff1dbfe921f8f5d831f867f3412f3290d51abf791850ae9b1f5af204",
+      "src/ops/cuda/api/elementwise.rs": "8ca46da465b94cc9514345115b92ce8bc5d9353b2d1a7aff6ddf8e54f7bb99a0",
+      "src/ops/cuda/api/matmul.rs": "086db7bc5699e261db55edc461792fc53099aa7a454fe9220f6217377d2d7355",
+      "src/ops/cuda/api/memory.rs": "4741b708feb3fdab8b08b864fcb17fdfb8efa116b4e57ef6c11ead4e27e55680",
+      "src/ops/cuda/api/normalization.rs": "e0d52efc1529dbff1690067c85641c42c53e18b25181428a916ef68284e38263",
+      "src/ops/cuda/api/optimizer.rs": "1f99ad57851a9f0df86a5b8d9eac6be647d0e4d44b8d1d46e7f19c23f364261f",
+      "src/ops/cuda/api/projection.rs": "b6b0d2db1ec5ce2a56303626fd917c12a73cdb3a5e31aee83978ce8dd3ee5c9a",
+      "src/ops/cuda/api/reduction_loss.rs": "65a769ee44a8e245f67c9b78c6a692261a892450a070cd41abbc9c84bff8f976",
+      "src/ops/cuda/api/selection.rs": "9f375673ff114ab52be19656342c92e9ef23e1c3279199fb1834922f2c33bf8f",
+      "src/ops/cuda/api/shape.rs": "3dabc1b30eeaac3097f667a92cdd1809ddc8983789f6043dbabc2bcfb6e0dc89",
+      "src/ops/cuda/generic.rs": "28013713e449b97b165a45d6b146aae1b6950904fdecab3bfc98bc9953bdae87",
+      "src/ops/cuda/imp/attention.rs": "cdc6f7840e31cbd8f9058f02ec0f23caab54679670d8e3ac241e8e995099abff",
+      "src/ops/cuda/imp/convolution.rs": "560e949da0c7c9471002b232673ca309f3aba777f00b85311dcaf1ba16c63fee",
+      "src/ops/cuda/imp/elementwise.rs": "92c77bff93a2352b45ebb85eb718ba3199deda95ee15c1c2780ca1b2269fd47e",
+      "src/ops/cuda/imp/ffi.rs": "fc463c0ac5f253bf6555da5931034b815460d875529d7b6be0f1120d67863885",
+      "src/ops/cuda/imp/matmul.rs": "962e53c0759091e8901f1e16b8afcc331962d20a5707fcf5d870fa9703feead6",
+      "src/ops/cuda/imp/memory.rs": "fc077e0b9b54b909f73aa46d318323f086fd5cd42e53e6eeccad9f273171df4f",
+      "src/ops/cuda/imp/mod.rs": "1e2f84c44f35f21c4cb1647de7bcda42690c62280f00b2372c4339e307d7e9c2",
+      "src/ops/cuda/imp/normalization.rs": "e4c3576d4b9d8c45103687dc9d29c2aeea402b9d19aa821b1f5299e97c97b901",
+      "src/ops/cuda/imp/optimizer.rs": "2a2647154997f4061a789291f72da11f9e554700009881221f1f2de07c311b15",
+      "src/ops/cuda/imp/projection.rs": "8c0d18080492da87a45d962d07946b0e2a7ae401d15314f5f00f55ceb9672a7d",
+      "src/ops/cuda/imp/reduction_loss.rs": "19f0e69dc4de8af0bdd8afce558448470900a41b320d00ed82ecb5405c9dcdc3",
+      "src/ops/cuda/imp/selection.rs": "425361564fe929b23a35238a4966290e41d925bfccdb34ecaa2ca671192d1efd",
+      "src/ops/cuda/imp/shape.rs": "ab0336a7ab9966f55fc1765469361c1cb6abdd1e260f473538e6278ce9fb90a8",
+      "src/ops/cuda/lumen_cuda.cu": "a05d6e429ea06d437c77bf860e84d8eaa3c2feae1c6e518f04193af490f490ee",
+      "src/ops/cuda/mod.rs": "3b1de427a3a07c2d31cb77a84f986b4539e20f59a47d62178ea3ee7d27516210",
+      "src/ops/cuda/modules/cnn_pool_api.cu": "f850ffe15d4999e060c11e2d7afe9fbae932147ce0862f5e77694df67509974b",
+      "src/ops/cuda/modules/elementwise_api.cu": "ae93704e6ba98d04715445cef5eddecae7e7730dc7dfb2775044fd8e3800015d",
+      "src/ops/cuda/modules/elementwise_kernels.cu": "09900b39424b306c821bc4c5b5b232f7711c8c7d5456ffc391fe219bc34b6234",
+      "src/ops/cuda/modules/fused_rope_api.cu": "ac5e2436deaecbd04e5ad820aad3e9b6e264d67fadd7f16b7cf06dbf07205c4d",
+      "src/ops/cuda/modules/generic_nn.cu": "a0997e84a4ec91e38c8e6a303d5fcf09bf0a92c56e6df692c66ba715c29196b8",
+      "src/ops/cuda/modules/matmul_api.cu": "74b34113ccd79790d699500fb3056901d9d7a836dc40ca8f21676e0e7a500278",
+      "src/ops/cuda/modules/memory_api.cu": "e619234cd13015a525f2daf39c27566ab93a967ec61d579782009e19aa1275cc",
+      "src/ops/cuda/modules/nn_api.cu": "cfaa78b9e0adfb87c8577a8b910013e5f01363dca14dac37ecf749d4def08e68",
+      "src/ops/cuda/modules/nn_shape_fused_kernels.cu": "20c2e061357e0dad744884c7d111545070244f3e6f05fa19d757bc22ae04cd6e",
+      "src/ops/cuda/modules/optim_api.cu": "3618567cdbd36e23b7bb683500e70d7fe3662ca062a6c773c57572d7e9d25d7b",
+      "src/ops/cuda/modules/reduction_loss_api.cu": "aa541b77350f4171c3f7028e7f612efabce2644828742e3c8217fc086fe2f253",
+      "src/ops/cuda/modules/reduction_loss_optim_kernels.cu": "2fa0439a83205bf22fa6286449a7bd1ba995dcb2526afa575b66f89d9d119768",
+      "src/ops/cuda/modules/runtime_common.cu": "8c3135f2f43ea822cf08fa88822b135ff551a88d41f80bc17494ce4bf5ac8c9a",
+      "src/ops/cuda/modules/shape_cache_attention_api.cu": "1df4f05b76240c8c7c00ddcf9c9d13c7fa361f35bd7a62f0106e99dc8f676f43",
+      "src/ops/cuda/stub.rs": "c991e47f14f8ffd2a6f197bfabef238b3d51af2e716b16304b8f8f2258f30b98",
+      "src/ops/fp_kernels.rs": "afe157e4bb0f435810aeed22bcb1c97ed49d5e3cbff82e52bb39f6f45d63f26f",
+      "src/ops/fused.rs": "9978633890af9e198e2d08060289bcb421ce39fa3e847937d9274d8710a27984",
+      "src/ops/int8_kernels.rs": "2c95863da7e35fbb6652f96a493938e2cdf84c5cd5e5456cefb895ea1a787909",
+      "src/ops/matmul/argmax.rs": "9c6cbf2a25a68f5a18cb477c1cac17356b7c0c7b307b30d1e5665a0dd6ca3c15",
+      "src/ops/matmul/backward.rs": "b35fe3e9dd3739b4cfaa9a6d7107c23d1c8d2037f58619f3d7bb3ae304e1ce68",
+      "src/ops/matmul/conversion.rs": "4a2a77d2bba17ecb11910d2e3f6b23f0daa9a267fbd0844af8c50a5de79b3131",
+      "src/ops/matmul/cuda_route.rs": "75cdf0f9f10a1884c3f33de49c5ad2515292a702f9bff383a4db15782c13af1b",
+      "src/ops/matmul/dot.rs": "ebba2dcaedb0dbe163d34a536057aacde74b40862755f6d753729ee21dc44c56",
+      "src/ops/matmul/matvec.rs": "6a48423850192782850cd3df86ec8c79442bd9bea7fac062a65c554a57ebb604",
+      "src/ops/matmul/mod.rs": "efe3e7b24ba860168e553f22cb941ace089cf2ec314dd08f12dbad044a1584bd",
+      "src/ops/matmul/policy.rs": "56acbabca012a262121dabcb27fde679a4abbbee462264e006e2423c3dd374df",
+      "src/ops/matmul/prefill.rs": "cc1a8fa1dd975b14466da238900b1db49dc9d68dfe33c08ce6f14a22da771357",
+      "src/ops/matmul/projection.rs": "24a9f641422e55ae5ebb1e7f651be8eb184a356d7b23c61d6c248399beeaa6cd",
+      "src/ops/matmul/rows.rs": "a0a54bfee301bf4b220f78143a369d0b7b292badcd2ad0182b513fbc38a4dca6",
+      "src/ops/matmul/tensor.rs": "ceb7b30bb4aa08f6ab419db7d599af390ea1d3455112fa6c42fc7e2b3d85d574",
+      "src/ops/mod.rs": "58471fcecc53b9b297f70b33991cb0ef09d8305f48afcecd2c3fa46dde3b23c3",
+      "src/ops/shape.rs": "9ce41205fb1461b4e5e0b50d7557fe7248ffa6e1d63c7b738de0c829bf8f46a1",
+      "src/optim/lowp_cpu.rs": "3f771c7437001a0e4efcc92e7ef9874c855a9e0c305a2657ab34a4ff306b9bac",
+      "src/optim/lowp_cuda.rs": "a84bf8a925b002f9088a911a191dfa79840d9205d1a2b0a1ecde194939d9c8c6",
+      "src/optim/master.rs": "67658a8be1f1b0a1ba6e2c0d555af7c1d11941ef125a9f8f0935a78240f80be6",
+      "src/optim/mod.rs": "f4fe4c07a9542328a0a7d159ad348da72b77ef8fc60a511f2fab0d5a29d8a71f",
+      "src/precision.rs": "0eff67ab2182411dc809f59a5e92ef6a0b4873e57ee0f744b96993f5e96475b1",
+      "src/tokenizer.rs": "3065ecb310f520b0ecabd647e456fd288ec6a4336c61197f1c8382882ac536ee"
+    }
+  },
+  "hardware": {
+    "os": "Windows x86-64",
+    "cpu": "AMD Ryzen 9 8945HX",
+    "gpu": "NVIDIA GeForce RTX 5070 Laptop GPU",
+    "gpu_memory_gib": 8,
+    "cpu_workers": 8
+  },
+  "build": {
+    "rustc": "1.98.1",
+    "profile": "release",
+    "rustflags": "-C target-cpu=native",
+    "features": [
+      "dev-tools",
+      "cuda",
+      "x86-fp-kernels",
+      "x86-int8-kernels"
+    ],
+    "binary_sha256": "88d53bdc91adb7082fbd72ae5fe245040a803172d9810fd5177b47a34b79b533"
+  },
+  "reference": {
+    "torch": "2.14.0+cu130",
+    "transformers": "5.17.0",
+    "attention": "SDPA",
+    "cache": "DynamicCache",
+    "cpu_workers": 8,
+    "interop_workers": 1,
+    "tf32": false,
+    "reduced_precision_reduction": false,
+    "compile": false
+  },
+  "protocol": {
+    "warmups_per_process": 2,
+    "formal_runs_per_process": 5,
+    "short_decode_forwards": 64,
+    "long_decode_forwards": 1,
+    "summary": "Median of all retained formal runs; decode token/s = replay length / median total decode time.",
+    "timing_boundary": "Loading and external prompt construction excluded; forward, argmax, host token completion and final decode forward included.",
+    "cache": "Lumen preallocated KV; PyTorch DynamicCache.",
+    "repeat_policy": "One reverse PyTorch/Lumen pair when either initial prefill range divided by median exceeds 25%. All runs retained.",
+    "i8_policy": "I8 weights with BF16 activations/runtime/KV; dynamic activation I8 off; no PyTorch I8 ratio.",
+    "total_model_processes": 40,
+    "total_model_warmups": 80,
+    "total_model_formal_samples": 200
+  },
+  "models": {
+    "TinyLlama-1.1B": {
+      "checkpoint": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "weight_sha256": "6e6001da2106d4757498752a021df6c2bdc332c650aae4bae6b0c004dcf14933",
+      "prompt": {
+        "system": "You are a helpful assistant.",
+        "prompt": "Explain how neural networks learn from data in one detailed paragraph."
+      },
+      "prompt_tokens": 46,
+      "max_seq_len": 512,
+      "replay_token_ids": [
+        3247,
+        1934,
+        671,
+        6575,
+        4366,
+        304,
+        1207,
+        9687,
+        491,
+        17415,
+        22004,
+        20562,
+        29916,
+        680,
+        313,
+        3217,
+        29906,
+        29897,
+        322,
+        4094,
+        313,
+        29950,
+        29906,
+        29949,
+        29897,
+        964,
+        3144,
+        1682,
+        852,
+        313,
+        29907,
+        29953,
+        29950,
+        29896,
+        29906,
+        29949,
+        29953,
+        29897,
+        1549,
+        278,
+        1889,
+        310,
+        20612,
+        948,
+        26533,
+        29889,
+        7133,
+        20612,
+        948,
+        26533,
+        29892,
+        521,
+        5095,
+        3021,
+        15114,
+        29892,
+        263,
+        282,
+        335,
+        358,
+        1476,
+        297,
+        278,
+        11308
+      ],
+      "summaries": [
+        {
+          "device": "cpu",
+          "dtype": "f32",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 291.39759999999995,
+            "decode_tps": 11.509010161287089,
+            "total_ms": 5863.27,
+            "prefill_range_ms": [
+              286.8125,
+              307.78020000000004
+            ],
+            "decode_range_tps": [
+              11.482636602827512,
+              11.554236334574504
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 275.9765,
+            "decode_tps": 8.651759540781907,
+            "total_ms": 7681.9771,
+            "prefill_range_ms": [
+              267.6349,
+              298.79429999999996
+            ],
+            "decode_range_tps": [
+              8.552917461620254,
+              8.735791116314669
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.3302508128013641,
+          "prefill_speed_ratio": 0.9470788366136167
+        },
+        {
+          "device": "cpu",
+          "dtype": "f16",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 291.338,
+            "decode_tps": 21.007405537164775,
+            "total_ms": 3342.9822,
+            "prefill_range_ms": [
+              264.8111,
+              300.4605
+            ],
+            "decode_range_tps": [
+              20.38234995501233,
+              21.048839325888558
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 1162.7546,
+            "decode_tps": 18.799460572978177,
+            "total_ms": 4554.651,
+            "prefill_range_ms": [
+              1045.552,
+              1209.0709
+            ],
+            "decode_range_tps": [
+              18.599324402790227,
+              19.138909939197774
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.1174472509791178,
+          "prefill_speed_ratio": 3.991084582169164
+        },
+        {
+          "device": "cpu",
+          "dtype": "bf16",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 248.2265,
+            "decode_tps": 21.109791895713407,
+            "total_ms": 3281.8192000000004,
+            "prefill_range_ms": [
+              240.25979999999998,
+              261.9865
+            ],
+            "decode_range_tps": [
+              21.0522278470778,
+              21.288429648675383
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 97.5899,
+            "decode_tps": 16.925563434816716,
+            "total_ms": 3878.5638,
+            "prefill_range_ms": [
+              95.4412,
+              108.4293
+            ],
+            "decode_range_tps": [
+              16.8009927916653,
+              17.196044662534486
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.247213540453816,
+          "prefill_speed_ratio": 0.39314859614102443
+        },
+        {
+          "device": "cpu",
+          "dtype": "i8",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 256.48710000000005,
+            "decode_tps": 35.902843763277744,
+            "total_ms": 2041.0488,
+            "prefill_range_ms": [
+              246.5248,
+              292.7559
+            ],
+            "decode_range_tps": [
+              35.10723807573059,
+              36.40478204115697
+            ]
+          }
+        },
+        {
+          "device": "cuda",
+          "dtype": "f32",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 31.6703,
+            "decode_tps": 49.54848555441,
+            "total_ms": 1325.274,
+            "prefill_range_ms": [
+              30.963399999999996,
+              33.3015
+            ],
+            "decode_range_tps": [
+              49.121986701910664,
+              49.81686076561042
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 22.482200000000002,
+            "decode_tps": 60.44394947565817,
+            "total_ms": 1084.3633,
+            "prefill_range_ms": [
+              22.4106,
+              26.765099999999997
+            ],
+            "decode_range_tps": [
+              47.02609198626896,
+              62.57172528431518
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 0.8197426869725651,
+          "prefill_speed_ratio": 0.7098827608200744
+        },
+        {
+          "device": "cuda",
+          "dtype": "f16",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 19.991799999999998,
+            "decode_tps": 85.82488103531627,
+            "total_ms": 767.6181,
+            "prefill_range_ms": [
+              19.7413,
+              20.5563
+            ],
+            "decode_range_tps": [
+              83.00160789677297,
+              88.0965582326509
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 16.7387,
+            "decode_tps": 63.34149547885231,
+            "total_ms": 1029.7311,
+            "prefill_range_ms": [
+              16.5548,
+              17.1277
+            ],
+            "decode_range_tps": [
+              60.9246747312532,
+              63.75498322397196
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.3549550793913674,
+          "prefill_speed_ratio": 0.8372782840964798
+        },
+        {
+          "device": "cuda",
+          "dtype": "bf16",
+          "lumen": {
+            "samples": 10,
+            "prefill_ms": 19.67685,
+            "decode_tps": 88.4302613052044,
+            "total_ms": 747.3768,
+            "prefill_range_ms": [
+              19.2317,
+              29.7129
+            ],
+            "decode_range_tps": [
+              62.87456416383657,
+              90.1606550171587
+            ]
+          },
+          "torch": {
+            "samples": 10,
+            "prefill_ms": 19.3811,
+            "decode_tps": 54.55079804408114,
+            "total_ms": 1200.1755,
+            "prefill_range_ms": [
+              16.3036,
+              40.2752
+            ],
+            "decode_range_tps": [
+              25.639444747377155,
+              64.45563040577538
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.6210626512511532,
+          "prefill_speed_ratio": 0.9849696470725751
+        },
+        {
+          "device": "cuda",
+          "dtype": "i8",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 38.883,
+            "decode_tps": 148.02650599622996,
+            "total_ms": 473.74319999999994,
+            "prefill_range_ms": [
+              38.7614,
+              39.0413
+            ],
+            "decode_range_tps": [
+              147.93685869949633,
+              148.639415178221
+            ]
+          }
+        }
+      ],
+      "runs": [
+        {
+          "id": "perf-cpu-f32-0-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "decode_us": 5601541.2,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 288200.89999999997,
+              "replay_tokens_match": true,
+              "total_us": 5891841.9,
+              "warmup": true
+            },
+            {
+              "decode_us": 5573891.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 315626.10000000003,
+              "replay_tokens_match": true,
+              "total_us": 5891690.8,
+              "warmup": true
+            },
+            {
+              "decode_us": 5565762.8,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 295445.2,
+              "replay_tokens_match": true,
+              "total_us": 5863270.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 5549087.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 288027.39999999997,
+              "replay_tokens_match": true,
+              "total_us": 5839125.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 5539093.9,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 286812.5,
+              "replay_tokens_match": true,
+              "total_us": 5828091.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 5573632.800000001,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 291397.6,
+              "replay_tokens_match": true,
+              "total_us": 5867262.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 5560860.5,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 307780.2,
+              "replay_tokens_match": true,
+              "total_us": 5870721.7,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-f32-1-torch",
+          "engine": "PyTorch",
+          "device": "cpu",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 472663.8,
+              "decode_us": 7635454.800000001,
+              "total_us": 8110208.8
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 261622.2,
+              "decode_us": 7354402.999999999,
+              "total_us": 7617894.6
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 275976.5,
+              "decode_us": 7326182.500000001,
+              "total_us": 7604034.7
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 282674.6,
+              "decode_us": 7397339.2,
+              "total_us": 7681977.1
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 271215.6,
+              "decode_us": 7384806.9,
+              "total_us": 7657945.1
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 267634.9,
+              "decode_us": 7482826.8,
+              "total_us": 7752381.4
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 298794.3,
+              "decode_us": 7441273.200000001,
+              "total_us": 7741968.0
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-f16-0-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "decode_us": 3154591.5,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 252066.9,
+              "replay_tokens_match": true,
+              "total_us": 3408726.4,
+              "warmup": true
+            },
+            {
+              "decode_us": 3047531.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 281998.6,
+              "replay_tokens_match": true,
+              "total_us": 3331532.5,
+              "warmup": true
+            },
+            {
+              "decode_us": 3114980.6999999997,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 274200.3,
+              "replay_tokens_match": true,
+              "total_us": 3391230.1999999997,
+              "warmup": false
+            },
+            {
+              "decode_us": 3139971.6,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 291672.0,
+              "replay_tokens_match": true,
+              "total_us": 3433886.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 3046544.7,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 264811.10000000003,
+              "replay_tokens_match": true,
+              "total_us": 3313325.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 3043812.4000000004,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 291338.0,
+              "replay_tokens_match": true,
+              "total_us": 3337252.2,
+              "warmup": false
+            },
+            {
+              "decode_us": 3040547.6999999997,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 300460.5,
+              "replay_tokens_match": true,
+              "total_us": 3342982.1999999997,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-f16-1-torch",
+          "engine": "PyTorch",
+          "device": "cpu",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1395553.8,
+              "decode_us": 3447176.1999999997,
+              "total_us": 4844736.6
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1246634.1,
+              "decode_us": 3388033.200000001,
+              "total_us": 4636286.4
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1209070.9,
+              "decode_us": 3343973.1000000006,
+              "total_us": 4554651.0
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1162754.6,
+              "decode_us": 3401852.4,
+              "total_us": 4566255.3
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1175742.2,
+              "decode_us": 3404353.0000000014,
+              "total_us": 4581741.7
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1088482.8,
+              "decode_us": 3440288.4999999986,
+              "total_us": 4530385.9
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1045552.0,
+              "decode_us": 3440985.1999999997,
+              "total_us": 4488164.1
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-bf16-0-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "decode_us": 3116692.0,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 261766.80000000002,
+              "replay_tokens_match": true,
+              "total_us": 3380583.9,
+              "warmup": true
+            },
+            {
+              "decode_us": 3001052.5,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 288917.0,
+              "replay_tokens_match": true,
+              "total_us": 3292013.1,
+              "warmup": true
+            },
+            {
+              "decode_us": 3033579.9,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 247918.8,
+              "replay_tokens_match": true,
+              "total_us": 3283524.7,
+              "warmup": false
+            },
+            {
+              "decode_us": 3031768.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 240259.8,
+              "replay_tokens_match": true,
+              "total_us": 3274145.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 3017800.7,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 261986.5,
+              "replay_tokens_match": true,
+              "total_us": 3281819.2,
+              "warmup": false
+            },
+            {
+              "decode_us": 3040058.3000000003,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 248226.5,
+              "replay_tokens_match": true,
+              "total_us": 3290474.8000000003,
+              "warmup": false
+            },
+            {
+              "decode_us": 3006327.9,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 249058.2,
+              "replay_tokens_match": true,
+              "total_us": 3257394.9,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-bf16-1-torch",
+          "engine": "PyTorch",
+          "device": "cpu",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 244095.5,
+              "decode_us": 3746645.6,
+              "total_us": 3992681.2
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 96751.7,
+              "decode_us": 3732251.0,
+              "total_us": 3830876.3
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 99851.4,
+              "decode_us": 3809298.7,
+              "total_us": 3911001.8
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 95441.2,
+              "decode_us": 3781262.600000001,
+              "total_us": 3878563.8
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 97589.9,
+              "decode_us": 3763791.8999999994,
+              "total_us": 3863296.5
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 95660.5,
+              "decode_us": 3803871.900000001,
+              "total_us": 3901409.2
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 108429.3,
+              "decode_us": 3721786.0999999978,
+              "total_us": 3832022.9
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-i8-single-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "i8",
+          "samples": [
+            {
+              "decode_us": 1783579.5999999999,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 244164.1,
+              "replay_tokens_match": true,
+              "total_us": 2029773.2000000002,
+              "warmup": true
+            },
+            {
+              "decode_us": 1807354.7,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 272291.0,
+              "replay_tokens_match": true,
+              "total_us": 2081604.2000000002,
+              "warmup": true
+            },
+            {
+              "decode_us": 1758010.8,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 250272.2,
+              "replay_tokens_match": true,
+              "total_us": 2010192.7000000002,
+              "warmup": false
+            },
+            {
+              "decode_us": 1782588.5999999999,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 256487.10000000003,
+              "replay_tokens_match": true,
+              "total_us": 2041048.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 1793081.1,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 261687.89999999997,
+              "replay_tokens_match": true,
+              "total_us": 2056646.6,
+              "warmup": false
+            },
+            {
+              "decode_us": 1822985.9,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 292755.9,
+              "replay_tokens_match": true,
+              "total_us": 2117850.1,
+              "warmup": false
+            },
+            {
+              "decode_us": 1765566.7,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 246524.8,
+              "replay_tokens_match": true,
+              "total_us": 2014007.2,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f32-0-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "decode_us": 1295741.0999999999,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 384902.89999999997,
+              "replay_tokens_match": true,
+              "total_us": 1683422.1,
+              "warmup": true
+            },
+            {
+              "decode_us": 1263242.5999999999,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 31381.699999999997,
+              "replay_tokens_match": true,
+              "total_us": 1297132.1,
+              "warmup": true
+            },
+            {
+              "decode_us": 1284705.6,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 31252.7,
+              "replay_tokens_match": true,
+              "total_us": 1318483.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 1289190.3,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 31670.3,
+              "replay_tokens_match": true,
+              "total_us": 1323355.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 1302243.9000000001,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 32339.600000000002,
+              "replay_tokens_match": true,
+              "total_us": 1337150.3,
+              "warmup": false
+            },
+            {
+              "decode_us": 1302878.9000000001,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 33301.5,
+              "replay_tokens_match": true,
+              "total_us": 1339277.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 1291664.1,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 30963.399999999998,
+              "replay_tokens_match": true,
+              "total_us": 1325274.0,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f32-1-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 887547.5,
+              "decode_us": 1312301.2999999993,
+              "total_us": 2203289.5
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 22864.0,
+              "decode_us": 1059781.4,
+              "total_us": 1085644.6
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 22410.6,
+              "decode_us": 1022826.1999999998,
+              "total_us": 1048131.8
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 23038.7,
+              "decode_us": 1040341.8,
+              "total_us": 1066329.7
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 22420.4,
+              "decode_us": 1360946.6000000003,
+              "total_us": 1387812.0
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 26765.1,
+              "decode_us": 1267769.5,
+              "total_us": 1298499.5
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 22482.2,
+              "decode_us": 1058832.2000000002,
+              "total_us": 1084363.3
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f16-0-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "decode_us": 1178480.1,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 806471.2000000001,
+              "replay_tokens_match": true,
+              "total_us": 1987206.2000000002,
+              "warmup": true
+            },
+            {
+              "decode_us": 727826.8,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 19605.399999999998,
+              "replay_tokens_match": true,
+              "total_us": 749444.1,
+              "warmup": true
+            },
+            {
+              "decode_us": 771069.4,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 20556.3,
+              "replay_tokens_match": true,
+              "total_us": 793657.7999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 756285.5,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 20079.1,
+              "replay_tokens_match": true,
+              "total_us": 778336.2000000001,
+              "warmup": false
+            },
+            {
+              "decode_us": 726475.6,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 19807.0,
+              "replay_tokens_match": true,
+              "total_us": 748320.1000000001,
+              "warmup": false
+            },
+            {
+              "decode_us": 745704.5,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 19741.3,
+              "replay_tokens_match": true,
+              "total_us": 767618.1,
+              "warmup": false
+            },
+            {
+              "decode_us": 741083.3999999999,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 19991.8,
+              "replay_tokens_match": true,
+              "total_us": 763099.7000000001,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f16-1-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1202262.6,
+              "decode_us": 1213240.2000000004,
+              "total_us": 2418155.5
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16624.5,
+              "decode_us": 1006388.5000000001,
+              "total_us": 1025464.2
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16738.7,
+              "decode_us": 1008913.4999999998,
+              "total_us": 1028188.8
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16820.8,
+              "decode_us": 1010396.0999999999,
+              "total_us": 1029731.1
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16554.8,
+              "decode_us": 1050477.4999999995,
+              "total_us": 1069533.9
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16601.2,
+              "decode_us": 1003843.0999999999,
+              "total_us": 1022897.1
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 17127.7,
+              "decode_us": 1015905.2000000004,
+              "total_us": 1035606.8
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-0-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "decode_us": 1441441.4,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 712330.0,
+              "replay_tokens_match": true,
+              "total_us": 2156260.8000000003,
+              "warmup": true
+            },
+            {
+              "decode_us": 1014176.0,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 25580.6,
+              "replay_tokens_match": true,
+              "total_us": 1041868.1000000001,
+              "warmup": true
+            },
+            {
+              "decode_us": 1017899.7000000001,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 26842.3,
+              "replay_tokens_match": true,
+              "total_us": 1046878.9,
+              "warmup": false
+            },
+            {
+              "decode_us": 770947.0,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 25553.0,
+              "replay_tokens_match": true,
+              "total_us": 798600.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 804191.8999999999,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 19606.8,
+              "replay_tokens_match": true,
+              "total_us": 825826.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 715253.5,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 19845.100000000002,
+              "replay_tokens_match": true,
+              "total_us": 737166.3,
+              "warmup": false
+            },
+            {
+              "decode_us": 717359.2,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 29712.9,
+              "replay_tokens_match": true,
+              "total_us": 749045.7999999999,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-1-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1100268.4,
+              "decode_us": 1781955.7000000004,
+              "total_us": 2886125.6
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 40304.5,
+              "decode_us": 2021808.7000000004,
+              "total_us": 2066374.2
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 39720.0,
+              "decode_us": 2496153.9,
+              "total_us": 2542021.4
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 40275.2,
+              "decode_us": 1289170.0999999996,
+              "total_us": 1332491.4
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 18329.0,
+              "decode_us": 1391001.1,
+              "total_us": 1412610.7
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 17300.8,
+              "decode_us": 1303437.2,
+              "total_us": 1324242.5
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 39719.5,
+              "decode_us": 1376640.1000000006,
+              "total_us": 1419560.0
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-i8-single-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "i8",
+          "samples": [
+            {
+              "decode_us": 433663.8,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 308190.6,
+              "replay_tokens_match": true,
+              "total_us": 744417.6,
+              "warmup": true
+            },
+            {
+              "decode_us": 430401.0,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 38910.5,
+              "replay_tokens_match": true,
+              "total_us": 471673.89999999997,
+              "warmup": true
+            },
+            {
+              "decode_us": 432390.7,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 39041.3,
+              "replay_tokens_match": true,
+              "total_us": 473743.19999999995,
+              "warmup": false
+            },
+            {
+              "decode_us": 432355.0,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 38912.5,
+              "replay_tokens_match": true,
+              "total_us": 473945.3,
+              "warmup": false
+            },
+            {
+              "decode_us": 430572.2,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 38883.0,
+              "replay_tokens_match": true,
+              "total_us": 471735.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 432617.0,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 38761.4,
+              "replay_tokens_match": true,
+              "total_us": 474063.89999999997,
+              "warmup": false
+            },
+            {
+              "decode_us": 430710.2,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 38831.6,
+              "replay_tokens_match": true,
+              "total_us": 471806.0,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-2-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1003271.6,
+              "decode_us": 1259039.4000000004,
+              "total_us": 2265011.6
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16637.2,
+              "decode_us": 996172.0,
+              "total_us": 1015255.4
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 20433.2,
+              "decode_us": 992931.1,
+              "total_us": 1015806.6
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16578.1,
+              "decode_us": 1039547.5000000001,
+              "total_us": 1058692.9
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16303.6,
+              "decode_us": 1057266.7,
+              "total_us": 1076108.5
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 22978.7,
+              "decode_us": 1039620.5000000005,
+              "total_us": 1065073.3
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 16812.7,
+              "decode_us": 1002548.4000000003,
+              "total_us": 1021765.7
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-3-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "decode_us": 1087310.8,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 592813.1,
+              "replay_tokens_match": true,
+              "total_us": 1682544.2000000002,
+              "warmup": true
+            },
+            {
+              "decode_us": 712077.7000000001,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 19465.199999999997,
+              "replay_tokens_match": true,
+              "total_us": 733467.8,
+              "warmup": true
+            },
+            {
+              "decode_us": 724109.6,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 19604.8,
+              "replay_tokens_match": true,
+              "total_us": 745707.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 739252.1,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 19332.6,
+              "replay_tokens_match": true,
+              "total_us": 760650.9,
+              "warmup": false
+            },
+            {
+              "decode_us": 723358.7000000001,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 19553.8,
+              "replay_tokens_match": true,
+              "total_us": 744932.2000000001,
+              "warmup": false
+            },
+            {
+              "decode_us": 709844.0,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 19746.9,
+              "replay_tokens_match": true,
+              "total_us": 731569.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 718656.5,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 19231.7,
+              "replay_tokens_match": true,
+              "total_us": 739958.1,
+              "warmup": false
+            }
+          ]
+        }
+      ]
+    },
+    "Qwen3-0.6B": {
+      "checkpoint": "Qwen/Qwen3-0.6B",
+      "weight_sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+      "prompt": {
+        "system": "You are a helpful assistant.",
+        "prompt": "Explain how neural networks learn from data in one detailed paragraph."
+      },
+      "prompt_tokens": 36,
+      "max_seq_len": 512,
+      "replay_token_ids": [
+        8813,
+        4176,
+        14155,
+        3960,
+        504,
+        10295,
+        553,
+        42368,
+        279,
+        14324,
+        429,
+        4564,
+        862,
+        13617,
+        13,
+        11954,
+        4862,
+        11,
+        264,
+        4637,
+        1494,
+        18644,
+        19898,
+        11,
+        264,
+        4709,
+        10953,
+        862,
+        5975,
+        11,
+        323,
+        1182,
+        2674,
+        27137,
+        57203,
+        52149,
+        13,
+        1527,
+        25632,
+        5711,
+        1493,
+        52149,
+        311,
+        2647,
+        279,
+        14324,
+        13,
+        1032,
+        64877,
+        419,
+        1882,
+        916,
+        1657,
+        44792,
+        8609,
+        279,
+        3922,
+        15282,
+        12624,
+        323,
+        1281,
+        2664,
+        19898,
+        389
+      ],
+      "summaries": [
+        {
+          "device": "cpu",
+          "dtype": "f32",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 163.5335,
+            "decode_tps": 17.861407866309147,
+            "total_ms": 3770.9288,
+            "prefill_range_ms": [
+              150.35090000000002,
+              179.3019
+            ],
+            "decode_range_tps": [
+              17.634346372343547,
+              18.147327433164598
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 131.5259,
+            "decode_tps": 11.832041289830785,
+            "total_ms": 5543.091,
+            "prefill_range_ms": [
+              128.8226,
+              146.4449
+            ],
+            "decode_range_tps": [
+              11.808068844583783,
+              11.912961372706718
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.509579575390798,
+          "prefill_speed_ratio": 0.8042749650683194
+        },
+        {
+          "device": "cpu",
+          "dtype": "f16",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 194.18869999999998,
+            "decode_tps": 28.334455126878375,
+            "total_ms": 2463.5312,
+            "prefill_range_ms": [
+              186.5661,
+              216.0348
+            ],
+            "decode_range_tps": [
+              28.132837632734244,
+              28.51606031200223
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 488.8942,
+            "decode_tps": 24.26872639392359,
+            "total_ms": 3117.4747,
+            "prefill_range_ms": [
+              457.5152,
+              543.8955
+            ],
+            "decode_range_tps": [
+              23.837627911687115,
+              25.15702998462472
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.1675295467492173,
+          "prefill_speed_ratio": 2.517624351983406
+        },
+        {
+          "device": "cpu",
+          "dtype": "bf16",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 145.10829999999999,
+            "decode_tps": 27.897452278247624,
+            "total_ms": 2455.5883000000003,
+            "prefill_range_ms": [
+              142.0762,
+              167.451
+            ],
+            "decode_range_tps": [
+              27.703624889456044,
+              28.314351952172814
+            ]
+          },
+          "torch": {
+            "samples": 5,
+            "prefill_ms": 64.4875,
+            "decode_tps": 22.743941387157253,
+            "total_ms": 2879.538,
+            "prefill_range_ms": [
+              59.8351,
+              69.192
+            ],
+            "decode_range_tps": [
+              22.556993857624832,
+              22.942036586095906
+            ]
+          },
+          "sdpa_predicted_matching": 62,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.2265882945864601,
+          "prefill_speed_ratio": 0.444409451423523
+        },
+        {
+          "device": "cpu",
+          "dtype": "i8",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 145.3675,
+            "decode_tps": 41.54427603938423,
+            "total_ms": 1696.7612000000001,
+            "prefill_range_ms": [
+              139.2617,
+              147.942
+            ],
+            "decode_range_tps": [
+              39.496459636099374,
+              41.92646883487652
+            ]
+          }
+        },
+        {
+          "device": "cuda",
+          "dtype": "f32",
+          "lumen": {
+            "samples": 10,
+            "prefill_ms": 21.6961,
+            "decode_tps": 56.3741602342135,
+            "total_ms": 1165.1303500000001,
+            "prefill_range_ms": [
+              21.563100000000002,
+              21.7672
+            ],
+            "decode_range_tps": [
+              55.82723842365512,
+              57.26437009103424
+            ]
+          },
+          "torch": {
+            "samples": 10,
+            "prefill_ms": 26.65055,
+            "decode_tps": 34.22575656636515,
+            "total_ms": 1899.3863000000001,
+            "prefill_range_ms": [
+              25.756400000000003,
+              38.0816
+            ],
+            "decode_range_tps": [
+              15.916080871994327,
+              40.760595254995415
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 1.6471267808178816,
+          "prefill_speed_ratio": 1.2283567092703296
+        },
+        {
+          "device": "cuda",
+          "dtype": "f16",
+          "lumen": {
+            "samples": 10,
+            "prefill_ms": 32.38545,
+            "decode_tps": 65.63897905131984,
+            "total_ms": 1016.0535,
+            "prefill_range_ms": [
+              29.927100000000003,
+              38.058
+            ],
+            "decode_range_tps": [
+              40.976537474900276,
+              69.16532154525703
+            ]
+          },
+          "torch": {
+            "samples": 10,
+            "prefill_ms": 30.79285,
+            "decode_tps": 22.224012489895028,
+            "total_ms": 2937.8265999999994,
+            "prefill_range_ms": [
+              29.3499,
+              78.4123
+            ],
+            "decode_range_tps": [
+              13.190296929041251,
+              34.605455095799265
+            ]
+          },
+          "sdpa_predicted_matching": 64,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 2.9535161160103303,
+          "prefill_speed_ratio": 0.9508235951638777
+        },
+        {
+          "device": "cuda",
+          "dtype": "bf16",
+          "lumen": {
+            "samples": 10,
+            "prefill_ms": 31.119799999999998,
+            "decode_tps": 68.36165107914208,
+            "total_ms": 974.5177000000001,
+            "prefill_range_ms": [
+              29.8673,
+              42.5914
+            ],
+            "decode_range_tps": [
+              63.83233161454807,
+              69.80000335912516
+            ]
+          },
+          "torch": {
+            "samples": 10,
+            "prefill_ms": 30.20155,
+            "decode_tps": 24.845973405258288,
+            "total_ms": 2627.88075,
+            "prefill_range_ms": [
+              29.2108,
+              78.5217
+            ],
+            "decode_range_tps": [
+              13.922395090511015,
+              33.90349116962383
+            ]
+          },
+          "sdpa_predicted_matching": 63,
+          "sdpa_predicted_rows": 64,
+          "decode_speed_ratio": 2.7514177031467937,
+          "prefill_speed_ratio": 0.970493062294745
+        },
+        {
+          "device": "cuda",
+          "dtype": "i8",
+          "lumen": {
+            "samples": 5,
+            "prefill_ms": 32.1699,
+            "decode_tps": 92.83857721398974,
+            "total_ms": 729.0504,
+            "prefill_range_ms": [
+              31.952300000000005,
+              32.5766
+            ],
+            "decode_range_tps": [
+              91.99073998213656,
+              94.30356376114439
+            ]
+          }
+        }
+      ],
+      "runs": [
+        {
+          "id": "perf-cpu-f32-0-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "decode_us": 4034456.3000000003,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 164678.7,
+              "replay_tokens_match": true,
+              "total_us": 4209085.3,
+              "warmup": true
+            },
+            {
+              "decode_us": 3771530.8,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 165467.9,
+              "replay_tokens_match": true,
+              "total_us": 3946540.6999999997,
+              "warmup": true
+            },
+            {
+              "decode_us": 3629281.1,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 163533.5,
+              "replay_tokens_match": true,
+              "total_us": 3801880.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 3526690.1,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 150350.90000000002,
+              "replay_tokens_match": true,
+              "total_us": 3685791.7,
+              "warmup": false
+            },
+            {
+              "decode_us": 3583144.2,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 179301.9,
+              "replay_tokens_match": true,
+              "total_us": 3770928.8000000003,
+              "warmup": false
+            },
+            {
+              "decode_us": 3566715.9000000004,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 153081.2,
+              "replay_tokens_match": true,
+              "total_us": 3727903.6,
+              "warmup": false
+            },
+            {
+              "decode_us": 3610035.0,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 163848.1,
+              "replay_tokens_match": true,
+              "total_us": 3782127.7,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-f32-1-torch",
+          "engine": "PyTorch",
+          "device": "cpu",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 735603.4,
+              "decode_us": 5380381.399999998,
+              "total_us": 6118316.6
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 130091.0,
+              "decode_us": 5441093.999999999,
+              "total_us": 5573556.8
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 128822.6,
+              "decode_us": 5372299.799999998,
+              "total_us": 5503486.2
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 140023.2,
+              "decode_us": 5398285.1000000015,
+              "total_us": 5540761.6
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 130160.3,
+              "decode_us": 5419102.800000001,
+              "total_us": 5551664.7
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 146444.9,
+              "decode_us": 5420022.600000001,
+              "total_us": 5568770.3
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 131525.9,
+              "decode_us": 5409041.300000001,
+              "total_us": 5543091.0
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-f16-0-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "decode_us": 2340638.1,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 183202.1,
+              "replay_tokens_match": true,
+              "total_us": 2531909.5000000005,
+              "warmup": true
+            },
+            {
+              "decode_us": 2264004.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 189646.7,
+              "replay_tokens_match": true,
+              "total_us": 2461882.0,
+              "warmup": true
+            },
+            {
+              "decode_us": 2274921.6,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 189375.19999999998,
+              "replay_tokens_match": true,
+              "total_us": 2472337.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 2258734.0999999996,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 216034.8,
+              "replay_tokens_match": true,
+              "total_us": 2483435.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 2244349.3000000003,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 194521.59999999998,
+              "replay_tokens_match": true,
+              "total_us": 2446967.1,
+              "warmup": false
+            },
+            {
+              "decode_us": 2268939.3,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 186566.1,
+              "replay_tokens_match": true,
+              "total_us": 2463531.1999999997,
+              "warmup": false
+            },
+            {
+              "decode_us": 2249638.4,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 194188.69999999998,
+              "replay_tokens_match": true,
+              "total_us": 2452244.8,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-f16-1-torch",
+          "engine": "PyTorch",
+          "device": "cpu",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 648936.7,
+              "decode_us": 2695154.9999999986,
+              "total_us": 3346205.0
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 481547.1,
+              "decode_us": 2564620.999999999,
+              "total_us": 3048278.0
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 543895.5,
+              "decode_us": 2675153.1,
+              "total_us": 3221215.9
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 488894.2,
+              "decode_us": 2568249.7,
+              "total_us": 3059246.7
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 498204.0,
+              "decode_us": 2684830.8999999985,
+              "total_us": 3185165.9
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 457515.2,
+              "decode_us": 2544020.500000001,
+              "total_us": 3003545.2
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 478191.4,
+              "decode_us": 2637138.8000000007,
+              "total_us": 3117474.7
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-bf16-0-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "decode_us": 2315443.4999999995,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 139679.0,
+              "replay_tokens_match": true,
+              "total_us": 2463360.1999999997,
+              "warmup": true
+            },
+            {
+              "decode_us": 2382207.9,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 159039.90000000002,
+              "replay_tokens_match": true,
+              "total_us": 2549318.7,
+              "warmup": true
+            },
+            {
+              "decode_us": 2260337.8,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 142076.2,
+              "replay_tokens_match": true,
+              "total_us": 2410697.1,
+              "warmup": false
+            },
+            {
+              "decode_us": 2294116.3,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 145108.3,
+              "replay_tokens_match": true,
+              "total_us": 2447528.8000000003,
+              "warmup": false
+            },
+            {
+              "decode_us": 2310167.0,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 144150.9,
+              "replay_tokens_match": true,
+              "total_us": 2462801.1999999997,
+              "warmup": false
+            },
+            {
+              "decode_us": 2299459.5,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 147635.7,
+              "replay_tokens_match": true,
+              "total_us": 2455588.3000000003,
+              "warmup": false
+            },
+            {
+              "decode_us": 2283064.0999999996,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 167451.0,
+              "replay_tokens_match": true,
+              "total_us": 2459054.0,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-bf16-1-torch",
+          "engine": "PyTorch",
+          "device": "cpu",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 104649.3,
+              "decode_us": 2873569.3000000003,
+              "total_us": 2980097.3
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 63283.7,
+              "decode_us": 2869040.0000000014,
+              "total_us": 2934206.6
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 59835.1,
+              "decode_us": 2794055.6000000006,
+              "total_us": 2855647.2
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 64487.5,
+              "decode_us": 2837257.5000000005,
+              "total_us": 2903574.8
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 63875.3,
+              "decode_us": 2813936.1999999997,
+              "total_us": 2879538.0
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 64896.0,
+              "decode_us": 2789639.0,
+              "total_us": 2856319.9
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 69192.0,
+              "decode_us": 2835568.9000000004,
+              "total_us": 2906598.3
+            }
+          ]
+        },
+        {
+          "id": "perf-cpu-i8-single-lumen",
+          "engine": "Lumen",
+          "device": "cpu",
+          "parameter_dtype": "i8",
+          "samples": [
+            {
+              "decode_us": 1597538.4,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 132533.0,
+              "replay_tokens_match": true,
+              "total_us": 1738538.0000000002,
+              "warmup": true
+            },
+            {
+              "decode_us": 1557691.2,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 151851.19999999998,
+              "replay_tokens_match": true,
+              "total_us": 1717936.0,
+              "warmup": true
+            },
+            {
+              "decode_us": 1526482.0000000002,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 139261.69999999998,
+              "replay_tokens_match": true,
+              "total_us": 1673947.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 1528663.9,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 145367.5,
+              "replay_tokens_match": true,
+              "total_us": 1682340.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 1620398.4,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 145638.7,
+              "replay_tokens_match": true,
+              "total_us": 1774325.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 1607201.7999999998,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 139567.2,
+              "replay_tokens_match": true,
+              "total_us": 1755363.0999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 1540525.1,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 147942.0,
+              "replay_tokens_match": true,
+              "total_us": 1696761.2000000002,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f32-0-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "decode_us": 1129507.0,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 309028.8,
+              "replay_tokens_match": true,
+              "total_us": 1446899.7,
+              "warmup": true
+            },
+            {
+              "decode_us": 1118390.7,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 21677.100000000002,
+              "replay_tokens_match": true,
+              "total_us": 1148610.4,
+              "warmup": true
+            },
+            {
+              "decode_us": 1118039.4,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 21594.5,
+              "replay_tokens_match": true,
+              "total_us": 1147228.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 1117623.4000000001,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 21707.3,
+              "replay_tokens_match": true,
+              "total_us": 1147304.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 1135331.4000000001,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 21748.9,
+              "replay_tokens_match": true,
+              "total_us": 1165641.1,
+              "warmup": false
+            },
+            {
+              "decode_us": 1136947.4,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 21664.6,
+              "replay_tokens_match": true,
+              "total_us": 1166385.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 1135212.4,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 21684.9,
+              "replay_tokens_match": true,
+              "total_us": 1164619.6,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f32-1-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 717692.7,
+              "decode_us": 1816957.1,
+              "total_us": 2537946.8
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 64475.2,
+              "decode_us": 2708255.8,
+              "total_us": 2777022.2
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 26864.0,
+              "decode_us": 1855889.8,
+              "total_us": 1886674.7
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 37458.6,
+              "decode_us": 2859657.900000001,
+              "total_us": 2901604.7
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 27580.6,
+              "decode_us": 4021090.399999999,
+              "total_us": 4054050.9
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 38081.6,
+              "decode_us": 1873545.4,
+              "total_us": 1915253.8
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29696.2,
+              "decode_us": 1900821.6999999993,
+              "total_us": 1934343.8
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f16-0-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "decode_us": 1819967.4,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 858969.7,
+              "replay_tokens_match": true,
+              "total_us": 2686688.9,
+              "warmup": true
+            },
+            {
+              "decode_us": 1309654.3,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 44880.1,
+              "replay_tokens_match": true,
+              "total_us": 1362332.3,
+              "warmup": true
+            },
+            {
+              "decode_us": 1067895.1,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 38058.0,
+              "replay_tokens_match": true,
+              "total_us": 1113683.9000000001,
+              "warmup": false
+            },
+            {
+              "decode_us": 1031293.9000000001,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 31365.700000000004,
+              "replay_tokens_match": true,
+              "total_us": 1070516.7,
+              "warmup": false
+            },
+            {
+              "decode_us": 993934.2,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 31869.7,
+              "replay_tokens_match": true,
+              "total_us": 1033643.8999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 1561869.4,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 37807.2,
+              "replay_tokens_match": true,
+              "total_us": 1607268.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 1101673.0999999999,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 34809.399999999994,
+              "replay_tokens_match": true,
+              "total_us": 1143807.1,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f16-1-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1020208.0,
+              "decode_us": 2013215.4,
+              "total_us": 3036258.9
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 75113.7,
+              "decode_us": 2369268.099999999,
+              "total_us": 2447734.3
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29545.1,
+              "decode_us": 1849419.3999999994,
+              "total_us": 1881877.8
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30550.8,
+              "decode_us": 4139098.6,
+              "total_us": 4174364.1
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 77458.3,
+              "decode_us": 3295282.3000000007,
+              "total_us": 3376944.3
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29349.9,
+              "decode_us": 2211579.5000000005,
+              "total_us": 2244246.6
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 31034.9,
+              "decode_us": 4759967.000000001,
+              "total_us": 4796084.7
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-0-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "decode_us": 1129314.4,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 748632.3,
+              "replay_tokens_match": true,
+              "total_us": 1885039.7000000002,
+              "warmup": true
+            },
+            {
+              "decode_us": 914916.3,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 30502.600000000002,
+              "replay_tokens_match": true,
+              "total_us": 952571.2,
+              "warmup": true
+            },
+            {
+              "decode_us": 935062.6,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 30202.7,
+              "replay_tokens_match": true,
+              "total_us": 972511.5,
+              "warmup": false
+            },
+            {
+              "decode_us": 957178.7000000001,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 29989.2,
+              "replay_tokens_match": true,
+              "total_us": 994662.7999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 1002626.7,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 34070.0,
+              "replay_tokens_match": true,
+              "total_us": 1043892.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 934842.0,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 31812.300000000003,
+              "replay_tokens_match": true,
+              "total_us": 973857.3,
+              "warmup": false
+            },
+            {
+              "decode_us": 941633.1,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 29987.5,
+              "replay_tokens_match": true,
+              "total_us": 978997.8,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-1-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1050140.9,
+              "decode_us": 3719683.799999999,
+              "total_us": 4774941.7
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 77217.1,
+              "decode_us": 2102502.7,
+              "total_us": 2182856.8
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29210.8,
+              "decode_us": 2688254.4,
+              "total_us": 2721102.9
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 55523.7,
+              "decode_us": 4596910.199999999,
+              "total_us": 4657373.8
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 78521.7,
+              "decode_us": 2550876.1,
+              "total_us": 2632998.2
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30155.4,
+              "decode_us": 1887711.2000000002,
+              "total_us": 1920875.6
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30247.7,
+              "decode_us": 4363249.199999999,
+              "total_us": 4398730.1
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-i8-single-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "i8",
+          "samples": [
+            {
+              "decode_us": 709094.7,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 294871.7,
+              "replay_tokens_match": true,
+              "total_us": 1011436.2,
+              "warmup": true
+            },
+            {
+              "decode_us": 696266.6,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 32052.700000000004,
+              "replay_tokens_match": true,
+              "total_us": 736681.1,
+              "warmup": true
+            },
+            {
+              "decode_us": 689368.6,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 31994.0,
+              "replay_tokens_match": true,
+              "total_us": 729050.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 678659.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 32169.9,
+              "replay_tokens_match": true,
+              "total_us": 717984.9,
+              "warmup": false
+            },
+            {
+              "decode_us": 693167.3,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 31952.300000000003,
+              "replay_tokens_match": true,
+              "total_us": 732667.7999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 695722.2,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 32576.6,
+              "replay_tokens_match": true,
+              "total_us": 736171.2999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 683776.5,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 32398.6,
+              "replay_tokens_match": true,
+              "total_us": 723567.9,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f32-2-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 674061.4,
+              "decode_us": 1827618.1000000006,
+              "total_us": 2504732.5
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 32842.6,
+              "decode_us": 1623179.5999999994,
+              "total_us": 1659047.7
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 26294.5,
+              "decode_us": 1716165.9999999998,
+              "total_us": 1745482.6
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 26159.6,
+              "decode_us": 1869546.4999999995,
+              "total_us": 1898940.8
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 26007.9,
+              "decode_us": 1870327.0,
+              "total_us": 1899831.8
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 26437.1,
+              "decode_us": 1825779.7999999996,
+              "total_us": 1855433.8
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 25756.4,
+              "decode_us": 1570143.9000000001,
+              "total_us": 1598842.9
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f32-3-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "f32",
+          "samples": [
+            {
+              "decode_us": 1125182.2,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 308792.5,
+              "replay_tokens_match": true,
+              "total_us": 1441642.5,
+              "warmup": true
+            },
+            {
+              "decode_us": 1123630.3,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 21758.699999999997,
+              "replay_tokens_match": true,
+              "total_us": 1152947.4,
+              "warmup": true
+            },
+            {
+              "decode_us": 1124000.7999999998,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 21610.600000000002,
+              "replay_tokens_match": true,
+              "total_us": 1153956.8,
+              "warmup": false
+            },
+            {
+              "decode_us": 1119230.7,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 21563.100000000002,
+              "replay_tokens_match": true,
+              "total_us": 1148567.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 1146393.8,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 21762.7,
+              "replay_tokens_match": true,
+              "total_us": 1176231.2,
+              "warmup": false
+            },
+            {
+              "decode_us": 1138212.1,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 21767.2,
+              "replay_tokens_match": true,
+              "total_us": 1167690.7000000002,
+              "warmup": false
+            },
+            {
+              "decode_us": 1137399.4000000001,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 21763.5,
+              "replay_tokens_match": true,
+              "total_us": 1167100.1,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f16-2-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 1011736.0,
+              "decode_us": 2508453.8,
+              "total_us": 3523655.5
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29158.7,
+              "decode_us": 2138186.7,
+              "total_us": 2170580.6
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30046.1,
+              "decode_us": 2938958.5,
+              "total_us": 2972766.9
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 76383.0,
+              "decode_us": 4852051.5,
+              "total_us": 4933529.0
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 78412.3,
+              "decode_us": 2820577.4999999986,
+              "total_us": 2902886.3
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 41219.9,
+              "decode_us": 2468719.3,
+              "total_us": 2513449.1
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30219.5,
+              "decode_us": 2221537.7,
+              "total_us": 2255343.4
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-f16-3-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "f16",
+          "samples": [
+            {
+              "decode_us": 1166776.0,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 817230.2999999999,
+              "replay_tokens_match": true,
+              "total_us": 1991363.4,
+              "warmup": true
+            },
+            {
+              "decode_us": 943806.0,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 30146.0,
+              "replay_tokens_match": true,
+              "total_us": 981653.7,
+              "warmup": true
+            },
+            {
+              "decode_us": 928099.0,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 32252.6,
+              "replay_tokens_match": true,
+              "total_us": 968416.0,
+              "warmup": false
+            },
+            {
+              "decode_us": 928274.2000000001,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 30013.7,
+              "replay_tokens_match": true,
+              "total_us": 965652.6,
+              "warmup": false
+            },
+            {
+              "decode_us": 925319.2,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 29927.100000000002,
+              "replay_tokens_match": true,
+              "total_us": 962616.4,
+              "warmup": false
+            },
+            {
+              "decode_us": 947703.5,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 32518.3,
+              "replay_tokens_match": true,
+              "total_us": 987568.1,
+              "warmup": false
+            },
+            {
+              "decode_us": 956126.6000000001,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 34844.9,
+              "replay_tokens_match": true,
+              "total_us": 998463.1000000001,
+              "warmup": false
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-2-torch",
+          "engine": "PyTorch",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "warmup": true,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 957441.9,
+              "decode_us": 2357766.5999999996,
+              "total_us": 3318600.9
+            },
+            {
+              "warmup": true,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 74461.9,
+              "decode_us": 2758994.0999999987,
+              "total_us": 2837184.3
+            },
+            {
+              "warmup": false,
+              "index": 0,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29651.5,
+              "decode_us": 2188243.099999999,
+              "total_us": 2221125.3
+            },
+            {
+              "warmup": false,
+              "index": 1,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 29930.3,
+              "decode_us": 2562663.3,
+              "total_us": 2596005.3
+            },
+            {
+              "warmup": false,
+              "index": 2,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30625.6,
+              "decode_us": 3010294.7000000007,
+              "total_us": 3044871.3
+            },
+            {
+              "warmup": false,
+              "index": 3,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 61049.5,
+              "decode_us": 2237905.0,
+              "total_us": 2302203.7
+            },
+            {
+              "warmup": false,
+              "index": 4,
+              "generated_tokens": 64,
+              "replay_tokens_match": true,
+              "prefill_us": 30058.9,
+              "decode_us": 2589076.9,
+              "total_us": 2622763.3
+            }
+          ]
+        },
+        {
+          "id": "perf-cuda-bf16-3-lumen",
+          "engine": "Lumen",
+          "device": "cuda",
+          "parameter_dtype": "bf16",
+          "samples": [
+            {
+              "decode_us": 1168324.3,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 729410.8,
+              "replay_tokens_match": true,
+              "total_us": 1905175.9000000001,
+              "warmup": true
+            },
+            {
+              "decode_us": 920536.7,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 30785.1,
+              "replay_tokens_match": true,
+              "total_us": 958514.5,
+              "warmup": true
+            },
+            {
+              "decode_us": 917664.2999999999,
+              "generated_tokens": 64,
+              "index": 0,
+              "prefill_us": 39003.5,
+              "replay_tokens_match": true,
+              "total_us": 963810.9,
+              "warmup": false
+            },
+            {
+              "decode_us": 916905.4,
+              "generated_tokens": 64,
+              "index": 1,
+              "prefill_us": 42591.4,
+              "replay_tokens_match": true,
+              "total_us": 966671.3,
+              "warmup": false
+            },
+            {
+              "decode_us": 925797.1000000001,
+              "generated_tokens": 64,
+              "index": 2,
+              "prefill_us": 29867.3,
+              "replay_tokens_match": true,
+              "total_us": 963123.3999999999,
+              "warmup": false
+            },
+            {
+              "decode_us": 949586.9,
+              "generated_tokens": 64,
+              "index": 3,
+              "prefill_us": 31797.199999999997,
+              "replay_tokens_match": true,
+              "total_us": 989502.6,
+              "warmup": false
+            },
+            {
+              "decode_us": 937332.2,
+              "generated_tokens": 64,
+              "index": 4,
+              "prefill_us": 30442.4,
+              "replay_tokens_match": true,
+              "total_us": 975178.1000000001,
+              "warmup": false
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "long_prefill": {
+    "summaries": [
+      {
+        "model": "tiny",
+        "device": "cpu",
+        "dtype": "bf16",
+        "prompt_tokens": 360,
+        "reverse_repeat": false,
+        "initial_prefill_spread": {
+          "lumen": 0.11834269906888382,
+          "torch": 0.09531147980901053
+        },
+        "lumen": {
+          "prefill_ms": 1502.5515,
+          "prefill_range_ms": [
+            1413.1614,
+            1590.9774
+          ],
+          "formal_samples": 5
+        },
+        "torch": {
+          "prefill_ms": 646.1719,
+          "prefill_range_ms": [
+            617.5869,
+            679.1745
+          ],
+          "formal_samples": 5
+        },
+        "predicted_matching": true,
+        "prefill_vs_torch": 2.32531235109419
+      },
+      {
+        "model": "qwen",
+        "device": "cpu",
+        "dtype": "bf16",
+        "prompt_tokens": 350,
+        "reverse_repeat": false,
+        "initial_prefill_spread": {
+          "lumen": 0.0524636416688436,
+          "torch": 0.08869897065445428
+        },
+        "lumen": {
+          "prefill_ms": 939.3858,
+          "prefill_range_ms": [
+            923.7977000000001,
+            973.0813
+          ],
+          "formal_samples": 5
+        },
+        "torch": {
+          "prefill_ms": 370.2061,
+          "prefill_range_ms": [
+            357.4207,
+            390.25759999999997
+          ],
+          "formal_samples": 5
+        },
+        "predicted_matching": true,
+        "prefill_vs_torch": 2.537467102784098
+      }
+    ],
+    "runs": [
+      {
+        "id": "tiny-0-lumen",
+        "engine": "Lumen",
+        "model": "tiny",
+        "samples": [
+          {
+            "decode_us": 53812.6,
+            "generated_tokens": 1,
+            "index": 0,
+            "prefill_us": 1509318.4,
+            "replay_tokens_match": true,
+            "total_us": 1563207.6,
+            "warmup": true
+          },
+          {
+            "decode_us": 58207.299999999996,
+            "generated_tokens": 1,
+            "index": 1,
+            "prefill_us": 1442893.2,
+            "replay_tokens_match": true,
+            "total_us": 1501199.9000000001,
+            "warmup": true
+          },
+          {
+            "decode_us": 57713.9,
+            "generated_tokens": 1,
+            "index": 0,
+            "prefill_us": 1502551.5,
+            "replay_tokens_match": true,
+            "total_us": 1560370.2,
+            "warmup": false
+          },
+          {
+            "decode_us": 53186.200000000004,
+            "generated_tokens": 1,
+            "index": 1,
+            "prefill_us": 1413161.4,
+            "replay_tokens_match": true,
+            "total_us": 1466392.8,
+            "warmup": false
+          },
+          {
+            "decode_us": 54497.9,
+            "generated_tokens": 1,
+            "index": 2,
+            "prefill_us": 1590977.4,
+            "replay_tokens_match": true,
+            "total_us": 1645537.2000000002,
+            "warmup": false
+          },
+          {
+            "decode_us": 54648.0,
+            "generated_tokens": 1,
+            "index": 3,
+            "prefill_us": 1584265.4999999998,
+            "replay_tokens_match": true,
+            "total_us": 1638987.6,
+            "warmup": false
+          },
+          {
+            "decode_us": 57340.1,
+            "generated_tokens": 1,
+            "index": 4,
+            "prefill_us": 1444256.2,
+            "replay_tokens_match": true,
+            "total_us": 1501691.2,
+            "warmup": false
+          }
+        ]
+      },
+      {
+        "id": "tiny-0-torch",
+        "engine": "PyTorch",
+        "model": "tiny",
+        "samples": [
+          {
+            "warmup": true,
+            "index": 0,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 683313.2,
+            "decode_us": 62699.8,
+            "total_us": 746090.1
+          },
+          {
+            "warmup": true,
+            "index": 1,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 639843.0,
+            "decode_us": 66680.0,
+            "total_us": 706613.2
+          },
+          {
+            "warmup": false,
+            "index": 0,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 679174.5,
+            "decode_us": 65495.4,
+            "total_us": 744751.5
+          },
+          {
+            "warmup": false,
+            "index": 1,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 646171.9,
+            "decode_us": 64110.9,
+            "total_us": 710367.0
+          },
+          {
+            "warmup": false,
+            "index": 2,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 627390.2,
+            "decode_us": 63966.0,
+            "total_us": 691463.8
+          },
+          {
+            "warmup": false,
+            "index": 3,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 650157.0,
+            "decode_us": 61691.8,
+            "total_us": 711926.6
+          },
+          {
+            "warmup": false,
+            "index": 4,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 617586.9,
+            "decode_us": 63564.3,
+            "total_us": 681230.5
+          }
+        ]
+      },
+      {
+        "id": "qwen-0-lumen",
+        "engine": "Lumen",
+        "model": "qwen",
+        "samples": [
+          {
+            "decode_us": 50878.0,
+            "generated_tokens": 1,
+            "index": 0,
+            "prefill_us": 940798.2000000001,
+            "replay_tokens_match": true,
+            "total_us": 991925.3999999999,
+            "warmup": true
+          },
+          {
+            "decode_us": 47610.100000000006,
+            "generated_tokens": 1,
+            "index": 1,
+            "prefill_us": 996323.2,
+            "replay_tokens_match": true,
+            "total_us": 1044084.2,
+            "warmup": true
+          },
+          {
+            "decode_us": 48623.5,
+            "generated_tokens": 1,
+            "index": 0,
+            "prefill_us": 968988.7000000001,
+            "replay_tokens_match": true,
+            "total_us": 1017866.7999999999,
+            "warmup": false
+          },
+          {
+            "decode_us": 49703.299999999996,
+            "generated_tokens": 1,
+            "index": 1,
+            "prefill_us": 923797.7000000001,
+            "replay_tokens_match": true,
+            "total_us": 973645.4,
+            "warmup": false
+          },
+          {
+            "decode_us": 49854.0,
+            "generated_tokens": 1,
+            "index": 2,
+            "prefill_us": 973081.3,
+            "replay_tokens_match": true,
+            "total_us": 1023083.0,
+            "warmup": false
+          },
+          {
+            "decode_us": 49071.4,
+            "generated_tokens": 1,
+            "index": 3,
+            "prefill_us": 931425.1,
+            "replay_tokens_match": true,
+            "total_us": 980708.6000000001,
+            "warmup": false
+          },
+          {
+            "decode_us": 47284.8,
+            "generated_tokens": 1,
+            "index": 4,
+            "prefill_us": 939385.8,
+            "replay_tokens_match": true,
+            "total_us": 986911.8999999999,
+            "warmup": false
+          }
+        ]
+      },
+      {
+        "id": "qwen-0-torch",
+        "engine": "PyTorch",
+        "model": "qwen",
+        "samples": [
+          {
+            "warmup": true,
+            "index": 0,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 846204.4,
+            "decode_us": 54130.2,
+            "total_us": 900435.5
+          },
+          {
+            "warmup": true,
+            "index": 1,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 345187.1,
+            "decode_us": 51240.7,
+            "total_us": 396514.5
+          },
+          {
+            "warmup": false,
+            "index": 0,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 375046.3,
+            "decode_us": 51468.7,
+            "total_us": 426592.4
+          },
+          {
+            "warmup": false,
+            "index": 1,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 370206.1,
+            "decode_us": 52848.3,
+            "total_us": 423136.3
+          },
+          {
+            "warmup": false,
+            "index": 2,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 357420.7,
+            "decode_us": 52586.4,
+            "total_us": 410084.0
+          },
+          {
+            "warmup": false,
+            "index": 3,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 390257.6,
+            "decode_us": 53172.6,
+            "total_us": 443512.5
+          },
+          {
+            "warmup": false,
+            "index": 4,
+            "generated_tokens": 1,
+            "replay_tokens_match": true,
+            "prefill_us": 360163.7,
+            "decode_us": 51315.9,
+            "total_us": 411553.7
+          }
+        ]
+      }
+    ],
+    "tiny": {
+      "prompt": {
+        "system": "You are a helpful assistant.",
+        "prompt": "This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. What is the capital of France?"
+      },
+      "replay_token_ids": [
+        3247
+      ]
+    },
+    "qwen": {
+      "prompt": {
+        "system": "You are a helpful assistant.",
+        "prompt": "This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. This is a short note about a quiet day. What is the capital of France?"
+      },
+      "replay_token_ids": [
+        8813
+      ]
+    }
+  },
+  "operators": {
+    "protocol": "CPU 8 workers, task cap 8; 5 warmup samples and 7 measured samples, each containing 5 iterations. Forward is no_grad including output allocation. Backward reuses one prebuilt graph and times zero_grad, upstream-seed clone and backward_with_grad; forward and optimizer step excluded. No PyTorch operator speed ratio.",
+    "rows": [
+      {
+        "case": 1,
+        "dtype": "F32",
+        "input_dtype": "F32",
+        "layout": 1,
+        "op": "matmul",
+        "shape": [
+          129,
+          1024,
+          1536
+        ],
+        "phase": "forward",
+        "threads": 8,
+        "task_limit": 8,
+        "warmup": 5,
+        "iterations_per_sample": 5,
+        "samples_ms": [
+          1.9321000000000002,
+          2.02578,
+          2.0347,
+          2.08112,
+          2.11422,
+          2.06412,
+          2.08968
+        ],
+        "median_ms": 2.06412,
+        "fixture_source": "dev-tools/benchmarks/generic_prefill_bench.rs"
+      },
+      {
+        "case": 1,
+        "dtype": "BF16",
+        "input_dtype": "BF16",
+        "layout": 1,
+        "op": "matmul",
+        "shape": [
+          129,
+          1024,
+          1536
+        ],
+        "phase": "forward",
+        "threads": 8,
+        "task_limit": 8,
+        "warmup": 5,
+        "iterations_per_sample": 5,
+        "samples_ms": [
+          0.9673599999999999,
+          0.9828999999999999,
+          0.9951800000000001,
+          1.04236,
+          1.0309599999999999,
+          0.98668,
+          1.02698
+        ],
+        "median_ms": 0.9951800000000001,
+        "fixture_source": "dev-tools/benchmarks/generic_prefill_bench.rs"
+      },
+      {
+        "case": 1,
+        "causal": true,
+        "dtype": "F32",
+        "layout": 1,
+        "mask_kind": 1,
+        "offset": 31,
+        "op": "attention",
+        "shape": [
+          2,
+          6,
+          2,
+          129,
+          191,
+          65,
+          33
+        ],
+        "phase": "forward",
+        "threads": 8,
+        "task_limit": 8,
+        "warmup": 5,
+        "iterations_per_sample": 5,
+        "samples_ms": [
+          0.28358,
+          0.27566,
+          0.37950000000000006,
+          0.62962,
+          0.32561999999999997,
+          0.24115999999999999,
+          0.31784
+        ],
+        "median_ms": 0.31784,
+        "fixture_source": "dev-tools/benchmarks/generic_prefill_bench.rs",
+        "keep_mask": "Allow keys where key_index % 7 != 2; the last batch is fully masked when B > 1."
+      },
+      {
+        "case": 1,
+        "input_dtype": "F32",
+        "input_shape": [
+          193,
+          257
+        ],
+        "layout": 1,
+        "op": "matmul",
+        "weight_dtype": "F32",
+        "weight_shape": [
+          257,
+          257
+        ],
+        "phase": "backward",
+        "threads": 8,
+        "task_limit": 8,
+        "warmup": 5,
+        "iterations_per_sample": 5,
+        "samples_ms": [
+          1.3907,
+          1.43236,
+          1.38038,
+          1.40816,
+          1.3908,
+          1.3976600000000001,
+          1.37856
+        ],
+        "median_ms": 1.3908,
+        "fixture_source": "dev-tools/benchmarks/cpu_backward_bench.rs"
+      },
+      {
+        "case": 3,
+        "input_dtype": "F32",
+        "input_shape": [
+          2,
+          3,
+          65,
+          129
+        ],
+        "layout": 0,
+        "op": "batch_matmul",
+        "weight_dtype": "F32",
+        "weight_shape": [
+          2,
+          3,
+          129,
+          257
+        ],
+        "phase": "backward",
+        "threads": 8,
+        "task_limit": 8,
+        "warmup": 5,
+        "iterations_per_sample": 5,
+        "samples_ms": [
+          0.64416,
+          0.6426399999999999,
+          0.66634,
+          0.62348,
+          0.66806,
+          0.6782,
+          0.63972
+        ],
+        "median_ms": 0.64416,
+        "fixture_source": "dev-tools/benchmarks/cpu_backward_bench.rs"
+      }
+    ]
+  }
+}

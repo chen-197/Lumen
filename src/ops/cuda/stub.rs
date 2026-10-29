@@ -245,6 +245,19 @@ pub fn copy_f32_offset(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn round_kv_cache_rows_f32(
+    _buffer: &CudaBuffer,
+    _batch_size: usize,
+    _num_heads: usize,
+    _rows: usize,
+    _capacity: usize,
+    _dim: usize,
+    _start: usize,
+    _dtype: crate::precision::DType,
+) -> Result<(), String> {
+    Err("CUDA backend is disabled".into())
+}
+
 pub fn append_kv_cache_f32(
     _dst: &CudaBuffer,
     _src: &CudaBuffer,

@@ -2,8 +2,8 @@ use crate::autograd::{
     Device, StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
     assert_native_device_support, is_no_grad, is_strict_device_execution,
 };
-use crate::layers::Linear;
 use crate::layers::attention::encoding::RotaryEmbedding;
+use crate::layers::{Linear, RMSNorm};
 use crate::module::Module;
 use crate::ops::cuda;
 use crate::ops::fused::{
@@ -434,11 +434,20 @@ impl KVCacheInner {
     }
 }
 
+/// Optional attention geometry and normalization, independent of model family.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SelfAttentionOptions {
+    pub head_dim: Option<usize>,
+    pub qk_norm_eps: Option<f32>,
+}
+
 pub struct SelfAttention {
     pub w_q: Linear,
     pub w_k: Linear,
     pub w_v: Linear,
     pub w_o: Linear,
+    pub q_norm: Option<RMSNorm>,
+    pub k_norm: Option<RMSNorm>,
     rope: RotaryEmbedding,
     n_head: usize,
     pub n_kv_head: usize,
@@ -451,6 +460,7 @@ pub struct SelfAttention {
 }
 
 struct SelfAttentionInit {
+    options: SelfAttentionOptions,
     embed_dim: usize,
     n_head: usize,
     n_kv_head: usize,
@@ -475,6 +485,7 @@ impl SelfAttention {
 
     fn new_impl(init: SelfAttentionInit) -> Self {
         let SelfAttentionInit {
+            options,
             embed_dim,
             n_head,
             n_kv_head,
@@ -489,11 +500,13 @@ impl SelfAttention {
         assert!(n_head > 0, "n_head must be > 0");
         assert!(n_kv_head > 0, "n_kv_head must be > 0");
         assert!(max_seq_len > 0, "max_seq_len must be > 0");
-        assert_eq!(
-            embed_dim % n_head,
-            0,
-            "Embed dim must be divisible by n_head"
-        );
+        if options.head_dim.is_none() {
+            assert_eq!(
+                embed_dim % n_head,
+                0,
+                "Embed dim must be divisible by n_head"
+            );
+        }
         assert_eq!(
             n_head % n_kv_head,
             0,
@@ -505,17 +518,38 @@ impl SelfAttention {
             kv_cache_dtype
         );
 
-        let head_dim = embed_dim / n_head;
-        let kv_dim = n_kv_head * head_dim;
+        let head_dim = options.head_dim.unwrap_or(embed_dim / n_head);
+        assert!(
+            head_dim > 0 && head_dim.is_multiple_of(2),
+            "RoPE head_dim must be positive and even"
+        );
+        let q_dim = n_head
+            .checked_mul(head_dim)
+            .expect("Q projection size overflow");
+        let kv_dim = n_kv_head
+            .checked_mul(head_dim)
+            .expect("KV projection size overflow");
+        if let Some(eps) = options.qk_norm_eps {
+            assert!(
+                eps.is_finite() && eps > 0.0,
+                "Q/K norm epsilon must be finite and positive"
+            );
+        }
 
         let rope =
             RotaryEmbedding::new_with_dtype(head_dim, max_seq_len, rope_theta, activation_dtype);
 
         Self {
-            w_q: Linear::new_no_bias_with_dtype(embed_dim, embed_dim, parameter_dtype),
+            w_q: Linear::new_no_bias_with_dtype(embed_dim, q_dim, parameter_dtype),
             w_k: Linear::new_no_bias_with_dtype(embed_dim, kv_dim, parameter_dtype),
             w_v: Linear::new_no_bias_with_dtype(embed_dim, kv_dim, parameter_dtype),
-            w_o: Linear::new_no_bias_with_dtype(embed_dim, embed_dim, parameter_dtype),
+            w_o: Linear::new_no_bias_with_dtype(q_dim, embed_dim, parameter_dtype),
+            q_norm: options
+                .qk_norm_eps
+                .map(|eps| RMSNorm::new_with_dtype(head_dim, eps, parameter_dtype)),
+            k_norm: options
+                .qk_norm_eps
+                .map(|eps| RMSNorm::new_with_dtype(head_dim, eps, parameter_dtype)),
             rope,
             n_head,
             n_kv_head,
@@ -539,7 +573,34 @@ impl SelfAttention {
         activation_dtype: DType,
         kv_cache_dtype: DType,
     ) -> Self {
+        Self::new_with_options(
+            embed_dim,
+            n_head,
+            n_kv_head,
+            max_seq_len,
+            rope_theta,
+            causal,
+            parameter_dtype,
+            activation_dtype,
+            kv_cache_dtype,
+            SelfAttentionOptions::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        embed_dim: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        max_seq_len: usize,
+        rope_theta: f32,
+        causal: bool,
+        parameter_dtype: DType,
+        activation_dtype: DType,
+        kv_cache_dtype: DType,
+        options: SelfAttentionOptions,
+    ) -> Self {
         Self::new_impl(SelfAttentionInit {
+            options,
             embed_dim,
             n_head,
             n_kv_head,
@@ -584,6 +645,7 @@ impl SelfAttention {
         causal: bool,
     ) -> Self {
         Self::new_impl(SelfAttentionInit {
+            options: SelfAttentionOptions::default(),
             embed_dim,
             n_head,
             n_kv_head,
@@ -606,6 +668,7 @@ impl SelfAttention {
         dtype: DType,
     ) -> Self {
         Self::new_impl(SelfAttentionInit {
+            options: SelfAttentionOptions::default(),
             embed_dim,
             n_head,
             n_kv_head,
@@ -685,7 +748,7 @@ impl SelfAttention {
             }
 
             let past_len = cache_handle.borrow().len;
-            if s == 1 {
+            if s == 1 && self.q_norm.is_none() {
                 let q_proj_len = b * h * d;
                 let kv_proj_len = b * h_kv * d;
                 let q_batch_stride = h * d;
@@ -748,10 +811,30 @@ impl SelfAttention {
                             .unwrap_or_else(|err| {
                                 panic!("CUDA decode RoPE/cache append failed: {}", err)
                             });
-                        if caches_are_f32 {
-                            k.replace_cuda_f32_buffer_no_host_sync(k_cache_buf);
-                            v.replace_cuda_f32_buffer_no_host_sync(v_cache_buf);
-                        }
+                        cuda::round_kv_cache_rows_f32(
+                            &k_cache_buf,
+                            b,
+                            h_kv,
+                            1,
+                            self.max_seq,
+                            d,
+                            past_len,
+                            k.dtype(),
+                        )
+                        .unwrap_or_else(|err| panic!("CUDA K cache rounding failed: {err}"));
+                        cuda::round_kv_cache_rows_f32(
+                            &v_cache_buf,
+                            b,
+                            h_kv,
+                            1,
+                            self.max_seq,
+                            d,
+                            past_len,
+                            v.dtype(),
+                        )
+                        .unwrap_or_else(|err| panic!("CUDA V cache rounding failed: {err}"));
+                        k.mark_cuda_f32_buffer_modified();
+                        v.mark_cuda_f32_buffer_modified();
                         *len = new_len;
                         q_rot_buf
                     } else {
@@ -1229,6 +1312,14 @@ impl SelfAttention {
             // (cache_handle 已在上面创建)
 
             // 4) RoPE：offset = past_len（S>1 prefill 路径保持原实现）
+            let q = self
+                .q_norm
+                .as_ref()
+                .map_or(q.clone(), |norm| norm.forward(q));
+            let k = self
+                .k_norm
+                .as_ref()
+                .map_or(k.clone(), |norm| norm.forward(k));
             let q_rot = self.rope.forward(&q, past_len);
             let k_rot = self.rope.forward(&k, past_len);
             let k_rot_cuda_buf = if x_is_cuda {
@@ -1295,10 +1386,30 @@ impl SelfAttention {
                         past_len,
                     )
                     .unwrap_or_else(|err| panic!("CUDA KV cache V append failed: {}", err));
-                    if caches_are_f32 {
-                        c.k.replace_cuda_f32_buffer_no_host_sync(k_cache_buf);
-                        c.v.replace_cuda_f32_buffer_no_host_sync(v_cache_buf);
-                    }
+                    cuda::round_kv_cache_rows_f32(
+                        &k_cache_buf,
+                        b,
+                        h_kv,
+                        s,
+                        self.max_seq,
+                        d,
+                        past_len,
+                        c.k.dtype(),
+                    )
+                    .unwrap_or_else(|err| panic!("CUDA K cache rounding failed: {err}"));
+                    cuda::round_kv_cache_rows_f32(
+                        &v_cache_buf,
+                        b,
+                        h_kv,
+                        s,
+                        self.max_seq,
+                        d,
+                        past_len,
+                        c.v.dtype(),
+                    )
+                    .unwrap_or_else(|err| panic!("CUDA V cache rounding failed: {err}"));
+                    c.k.mark_cuda_f32_buffer_modified();
+                    c.v.mark_cuda_f32_buffer_modified();
                 } else {
                     for bb in 0..b {
                         for hk in 0..h_kv {
@@ -1605,6 +1716,14 @@ impl SelfAttention {
         }
 
         // 3) RoPE（训练全序列 offset=0）
+        let q = self
+            .q_norm
+            .as_ref()
+            .map_or(q.clone(), |norm| norm.forward(q));
+        let k = self
+            .k_norm
+            .as_ref()
+            .map_or(k.clone(), |norm| norm.forward(k));
         let q_rot = self.rope.forward(&q, 0);
         let k_rot = self.rope.forward(&k, 0);
 
@@ -1639,6 +1758,12 @@ impl Module for SelfAttention {
         p.extend(self.w_k.parameters());
         p.extend(self.w_v.parameters());
         p.extend(self.w_o.parameters());
+        if let Some(norm) = &self.q_norm {
+            p.extend(norm.parameters());
+        }
+        if let Some(norm) = &self.k_norm {
+            p.extend(norm.parameters());
+        }
         p
     }
 
@@ -1647,6 +1772,12 @@ impl Module for SelfAttention {
         self.w_k.to_device(device);
         self.w_v.to_device(device);
         self.w_o.to_device(device);
+        if let Some(norm) = &self.q_norm {
+            norm.to_device(device);
+        }
+        if let Some(norm) = &self.k_norm {
+            norm.to_device(device);
+        }
         self.rope.to_device(device);
     }
 }

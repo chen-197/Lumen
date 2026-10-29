@@ -234,6 +234,27 @@ impl Tensor {
         self.0.borrow().cuda_f32_data.clone()
     }
 
+    /// Invalidate host/native mirrors after a kernel writes the resident F32
+    /// buffer. Logical shape/dtype are retained; snapshots rebuild native values
+    /// lazily. This does not allocate or copy the full tensor on every update.
+    pub(crate) fn mark_cuda_f32_buffer_modified(&self) {
+        let mut inner = self.0.borrow_mut();
+        assert_eq!(inner.device, Device::Cuda);
+        assert!(
+            inner.cuda_f32_data.is_some(),
+            "Missing modified CUDA F32 buffer"
+        );
+        inner.has_f32_data = false;
+        // Keep stale host arrays for their logical shape. cache_dirty makes
+        // native views rebuild them from the authoritative device buffer.
+        inner.cuda_f16_data = None;
+        inner.cuda_bf16_data = None;
+        inner.cuda_i8_data = None;
+        inner.cache_dirty = inner.storage_dtype != DType::F32;
+        inner.grad = None;
+        inner.cuda_f32_grad = None;
+    }
+
     pub(crate) fn set_cuda_f32_buffer_inplace(&self, buffer: crate::ops::cuda::CudaBuffer) {
         let mut inner = self.0.borrow_mut();
         inner.device = Device::Cuda;

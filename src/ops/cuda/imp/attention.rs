@@ -1,5 +1,54 @@
 use super::*;
 
+pub fn round_kv_cache_rows_f32(
+    buffer: &CudaBuffer,
+    batch_size: usize,
+    num_heads: usize,
+    rows: usize,
+    capacity: usize,
+    dim: usize,
+    start: usize,
+    dtype: crate::precision::DType,
+) -> Result<(), String> {
+    if [batch_size, num_heads, rows, capacity, dim].contains(&0)
+        || start > capacity
+        || rows > capacity.saturating_sub(start)
+    {
+        return Err("Invalid CUDA KV rounding geometry".into());
+    }
+    let length = batch_size
+        .checked_mul(num_heads)
+        .and_then(|n| n.checked_mul(capacity))
+        .and_then(|n| n.checked_mul(dim))
+        .ok_or("CUDA KV rounding length overflow")?;
+    if length != buffer.len() {
+        return Err("CUDA KV rounding buffer length mismatch".into());
+    }
+    let dtype = match dtype {
+        crate::precision::DType::F32 => return Ok(()),
+        crate::precision::DType::F16 => 1,
+        crate::precision::DType::BF16 => 2,
+        crate::precision::DType::I8 => return Err("KV cache requires a floating dtype".into()),
+    };
+    let status = unsafe {
+        lumen_cuda_round_kv_cache_rows_f32_device(
+            buffer.handle(),
+            batch_size,
+            num_heads,
+            rows,
+            capacity,
+            dim,
+            start,
+            dtype,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(last_error_message())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn append_kv_cache_f32(
     dst: &CudaBuffer,

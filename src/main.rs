@@ -4,7 +4,7 @@ use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scope
 use lumen::cpu::CpuInferenceContext;
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
-use lumen::models::{LlamaConfig, LlamaModel};
+use lumen::models::{CausalLMConfig, LlamaModel};
 use lumen::module::Module;
 use lumen::ops::fp_kernels::active_float_backend_name;
 use lumen::ops::int8_kernels::active_int8_backend_name;
@@ -13,7 +13,7 @@ use lumen::precision::{
     with_inference_activation_quantization, with_parameter_quantization, with_precision_config,
     with_runtime_component_dtypes,
 };
-use lumen::tokenizer::LlamaTokenizer;
+use lumen::tokenizer::{ChatFormat, ModelTokenizer};
 
 use ndarray::{Array, Array1, Ix3, s};
 use ndarray_rand::RandomExt;
@@ -29,6 +29,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Clone)]
 struct Args {
+    config: Option<String>,
+    enable_thinking: bool,
     weights: String,
     tokenizer: String,
     system: String,
@@ -68,22 +70,8 @@ impl Args {
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --cpu-prefill-tasks N       Prefill CPU kernel task limit (default: unconstrained)\n  --cpu-decode-tasks N        Decode CPU kernel task limit (default: unconstrained)\n  --cpu-threads N             CPU workers (default: Rayon configuration / available CPUs)\n  --device DEVICE            cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --activation-quantization MODE  off/dynamic-i8 (default: off)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --config PATH              Model config (default: config.json beside weights)\n  --enable-thinking          Enable Qwen3 thinking (default: disabled)\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --cpu-prefill-tasks N       Prefill CPU kernel task limit (default: unconstrained)\n  --cpu-decode-tasks N        Decode CPU kernel task limit (default: unconstrained)\n  --cpu-threads N             CPU workers (default: Rayon configuration / available CPUs)\n  --device DEVICE            cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --activation-quantization MODE  off/dynamic-i8 (default: off)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
     );
-}
-
-fn model_config(max_seq_len: usize) -> LlamaConfig {
-    LlamaConfig {
-        vocab_size: 32000,
-        hidden_size: 2048,
-        intermediate_size: 5632,
-        num_hidden_layers: 22,
-        num_attention_heads: 32,
-        num_key_value_heads: 4,
-        rms_norm_eps: 1e-5,
-        max_seq_len,
-        rope_theta: 10000.0,
-    }
 }
 
 fn parse_dtype_flag(flag: &str, value: &str, allow_integer: bool) -> Result<DType, String> {
@@ -117,6 +105,8 @@ fn parse_args() -> Result<Args, String> {
     }
 
     let mut weights: Option<String> = None;
+    let mut config = None;
+    let mut enable_thinking = false;
     let mut tokenizer: Option<String> = None;
     let mut system = "You are a helpful AI assistant.".to_string();
     let mut temperature = 0.8f32;
@@ -143,6 +133,11 @@ fn parse_args() -> Result<Args, String> {
     let mut i = 1usize;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--config" => {
+                i += 1;
+                config = Some(argv.get(i).ok_or("--config requires a path")?.clone());
+            }
+            "--enable-thinking" => enable_thinking = true,
             "-h" | "--help" => {
                 usage(&program);
                 std::process::exit(0);
@@ -371,6 +366,8 @@ fn parse_args() -> Result<Args, String> {
     let kv_cache_dtype = kv_cache_dtype.unwrap_or(runtime_dtype);
 
     Ok(Args {
+        config,
+        enable_thinking,
         weights: weights.ok_or("必须提供 --weights")?,
         tokenizer: tokenizer.ok_or("必须提供 --tokenizer")?,
         system,
@@ -394,17 +391,6 @@ fn parse_args() -> Result<Args, String> {
         cpu_prefill_tasks,
         cpu_decode_tasks,
     })
-}
-
-fn build_first_turn_prompt(system: &str, user: &str) -> String {
-    format!(
-        "<|system|>\n{}\n</s>\n<|user|>\n{}\n</s>\n<|assistant|>\n",
-        system, user
-    )
-}
-
-fn build_next_turn_prompt(user: &str) -> String {
-    format!("</s>\n<|user|>\n{}\n</s>\n<|assistant|>\n", user)
 }
 
 fn lcp_char_boundary(prev: &str, cur: &str) -> usize {
@@ -563,7 +549,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cpu_threads={}", rayon::current_num_threads());
     }
     let cpu = args.cpu_context();
-    let config = model_config(args.max_seq_len);
+    let weights_path = Path::new(&args.weights);
+    let model_dir = if weights_path.is_dir() {
+        weights_path
+    } else {
+        weights_path.parent().unwrap_or(Path::new("."))
+    };
+    let config_path = args
+        .config
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| model_dir.join("config.json"));
+    let pretrained = CausalLMConfig::from_file(&config_path)?;
+    let chat_format = if pretrained.model_type == "qwen3" {
+        ChatFormat::Qwen3 {
+            enable_thinking: args.enable_thinking,
+        }
+    } else {
+        ChatFormat::TinyLlama
+    };
+    if args.enable_thinking && pretrained.model_type != "qwen3" {
+        return Err("--enable-thinking is only supported for Qwen3".into());
+    }
 
     if !Path::new(&args.tokenizer).exists() {
         return Err(format!("tokenizer 文件不存在: {}", args.tokenizer).into());
@@ -593,12 +600,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("activation_quantization={:?}", args.activation_quantization);
-    let tokenizer = LlamaTokenizer::from_file(&args.tokenizer)?;
-    if tokenizer.vocab_size() != config.vocab_size {
+    println!(
+        "  model_type={} config={}",
+        pretrained.model_type,
+        config_path.display()
+    );
+    let tokenizer = ModelTokenizer::from_file(&args.tokenizer)?;
+    if tokenizer.vocab_size() > pretrained.vocab_size {
         return Err(format!(
             "tokenizer vocab_size={} 与 model config vocab_size={} 不一致",
             tokenizer.vocab_size(),
-            config.vocab_size
+            pretrained.vocab_size
         )
         .into());
     }
@@ -619,12 +631,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || {
                 with_parameter_quantization(args.parameter_quantization, || {
                     let model = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
-                        LlamaModel::new(config.clone())
-                    });
+                        pretrained.build(
+                            args.max_seq_len,
+                            args.parameter_dtype,
+                            args.activation_dtype,
+                            args.kv_cache_dtype,
+                        )
+                    })?;
                     println!("  weights={}", args.weights);
-                    ModelLoader::load_llama_weights_with_options(
+                    ModelLoader::load_weights_with_options(
                         &args.weights,
-                        &model.named_parameters(),
+                        &model.checkpoint_parameters(),
                         load_options,
                     )?;
                     Ok::<LlamaModel, Box<dyn std::error::Error>>(model)
@@ -632,6 +649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
     })?;
+    let config = model.config.clone();
     let _cuda_enabled = lumen::ops::cuda::set_enabled_scoped(args.device == Device::Cuda);
     let _strict_device_execution = set_strict_device_execution_scoped(args.device == Device::Cuda);
     if args.device == Device::Cuda {
@@ -646,7 +664,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nReady. Commands: /reset  /exit");
 
     let mut stop_ids: Vec<usize> = Vec::new();
-    for t in ["</s>", "<|system|>", "<|user|>", "<|assistant|>"] {
+    for t in [
+        "</s>",
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+    ] {
         if let Some(id) = tokenizer.token_to_id(t) {
             stop_ids.push(id);
         }
@@ -656,6 +682,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(id) = tokenizer.eot_id() {
         stop_ids.push(id);
+    }
+    if let Some(ids) = &pretrained.eos_token_id {
+        stop_ids.extend(ids.values());
+    }
+    let generation_path = model_dir.join("generation_config.json");
+    if generation_path.exists() {
+        let generation: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(generation_path)?)?;
+        if let Some(value) = generation.get("eos_token_id")
+            && !value.is_null()
+        {
+            let ids: lumen::models::pretrained::TokenIds = serde_json::from_value(value.clone())?;
+            stop_ids.extend(ids.values());
+        }
+    }
+    if stop_ids.iter().any(|&id| id >= pretrained.vocab_size) {
+        return Err("Stop token ID outside model vocabulary".into());
     }
     stop_ids.sort_unstable();
     stop_ids.dedup();
@@ -676,7 +719,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().flush()?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        if io::stdin().read_line(&mut input)? == 0 {
+            break;
+        }
         let user_msg = input.trim();
 
         if user_msg.is_empty() {
@@ -699,9 +744,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         with_inference_activation_quantization(args.activation_quantization, || {
             no_grad(|| {
                 let turn_prompt = if first_turn {
-                    build_first_turn_prompt(&args.system, user_msg)
+                    chat_format.first_turn(&args.system, user_msg)
                 } else {
-                    build_next_turn_prompt(user_msg)
+                    chat_format.next_turn(user_msg)
                 };
 
                 let mut new_tokens = match tokenizer.encode(&turn_prompt, false) {
@@ -724,7 +769,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     all_tokens.clear();
                     model.reset_kv_caches(&mut kv_caches);
 
-                    let prompt2 = build_first_turn_prompt(&args.system, user_msg);
+                    let prompt2 = chat_format.first_turn(&args.system, user_msg);
                     new_tokens = match tokenizer.encode(&prompt2, false) {
                         Ok(tokens) => tokens,
                         Err(err) => {

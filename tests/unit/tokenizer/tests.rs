@@ -1,5 +1,66 @@
 use super::*;
 
+#[test]
+fn byte_level_incomplete_utf8_waits_for_complete_tokens() {
+    let specification = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+        "added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+        "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+        "model":{"type":"WordLevel","vocab":{"[UNK]":0,"prefix":1,"ä½":2,"ł":3,"ï¿½":4,"Ģ":5},"unk_token":"[UNK]"}});
+    let tokenizer = LlamaTokenizer::from_inner(
+        HFTokenizer::from_bytes(specification.to_string().as_bytes()).unwrap(),
+    );
+    assert_eq!(tokenizer.decode(&[1, 2], true), "prefix�");
+    let prefix = tokenizer.decode_complete_prefix(&[1, 2], true);
+    assert_eq!(prefix.text, "prefix");
+    assert_eq!(prefix.pending_token_ids, vec![2]);
+    assert_eq!(
+        tokenizer.decode_complete_prefix(&[1, 2, 3], true).text,
+        "prefix你"
+    );
+    assert!(
+        tokenizer
+            .decode_complete_prefix(&[1, 2, 3], true)
+            .pending_token_ids
+            .is_empty()
+    );
+    // A literal replacement character and genuinely invalid bytes stay visible.
+    assert_eq!(
+        tokenizer.decode_complete_prefix(&[1, 4], true).text,
+        "prefix�"
+    );
+    assert!(
+        tokenizer
+            .decode_complete_prefix(&[1, 5], true)
+            .pending_token_ids
+            .is_empty()
+    );
+}
+
+#[test]
+fn regression_byte_level_overlap_keeps_display_prefix_valid() {
+    let specification = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+        "added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+        "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+        "model":{"type":"WordLevel","vocab":{"[UNK]":0,"prefix":1,"ä½":2,"łå":3,"¥½":4},"unk_token":"[UNK]"}});
+    let tokenizer = LlamaTokenizer::from_inner(
+        HFTokenizer::from_bytes(specification.to_string().as_bytes()).unwrap(),
+    );
+    let ids = [1, 2, 3, 4];
+    let mut previous = String::new();
+    for n in 0..=ids.len() {
+        let output = tokenizer.decode_complete_prefix(&ids[..n], true);
+        assert!(
+            !output.text.contains('\u{fffd}'),
+            "n={n}: {:?}",
+            output.text
+        );
+        assert!(output.text.starts_with(&previous));
+        assert_eq!(output.pending_token_ids, ids[output.consumed_tokens..n]);
+        previous = output.text;
+    }
+    assert_eq!(previous, "prefix你好");
+}
+
 fn tokenizer() -> LlamaTokenizer {
     LlamaTokenizer::from_inner(HFTokenizer::from_bytes(br#"{
             "version":"1.0","truncation":null,"padding":null,

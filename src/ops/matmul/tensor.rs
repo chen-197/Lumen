@@ -331,6 +331,8 @@ pub(super) fn zero_matmul_output(
 /// Empty leading/output axes are supported. A zero-length reduction returns
 /// zeros; its operand gradients are shaped zeros as well.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
+    #[cfg(feature = "cpu-profiling")]
+    let _profile = crate::cpu::profiling::region("matmul.total");
     let output_device = assert_same_device(a, b, "matmul");
     let build_graph = !is_no_grad() && (a.requires_grad() || b.requires_grad());
     let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
@@ -471,7 +473,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         if let Some(cuda_out) = try_cuda_matmul(a, b, m_dim, n_dim, k_dim_a, output_dtype) {
             return cuda_out;
         }
-        let res_2d = matmul_forward_cpu_native(a, b, m_dim, k_dim_a, n_dim);
+        let res_2d = crate::cpu_profile!(
+            "matmul.kernel",
+            matmul_forward_cpu_native(a, b, m_dim, k_dim_a, n_dim)
+        );
 
         let mut out_shape = a_shape.clone();
         let last_idx = out_shape.len() - 1;

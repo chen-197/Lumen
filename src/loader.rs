@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+mod pretrained;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WeightLoadOptions {

@@ -7,6 +7,64 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn strict_pretrained_shards_validate_all_weights_before_loading() {
+    let first = write_safetensor(
+        "a",
+        safetensors::Dtype::F32,
+        vec![2],
+        &bytes_from_f32(&[1., 2.]),
+    );
+    let second = write_safetensor(
+        "b",
+        safetensors::Dtype::F32,
+        vec![2],
+        &bytes_from_f32(&[3., 4.]),
+    );
+    let index = first.with_extension("index.json");
+    let mapping = serde_json::json!({"weight_map":{"a":first.file_name().unwrap().to_str().unwrap(),"b":second.file_name().unwrap().to_str().unwrap()}});
+    fs::write(&index, mapping.to_string()).unwrap();
+    for stream_from_disk in [false, true] {
+        let a = Tensor::parameter(ArrayD::from_elem(IxDyn(&[2]), -1.));
+        let b = Tensor::parameter(ArrayD::from_elem(IxDyn(&[3]), -2.));
+        let params = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
+        let options = WeightLoadOptions {
+            stream_from_disk,
+            ..WeightLoadOptions::default()
+        };
+        assert!(ModelLoader::load_weights_with_options(&index, &params, options).is_err());
+        assert!(a.data_ref().iter().all(|&x| x == -1.));
+        b.set_array_f32_with_dtype(ArrayD::zeros(IxDyn(&[2])), DType::F32);
+        ModelLoader::load_weights_with_options(&index, &params, options).unwrap();
+        assert_eq!(
+            a.data_ref().iter().copied().collect::<Vec<_>>(),
+            vec![1., 2.]
+        );
+        assert_eq!(
+            b.data_ref().iter().copied().collect::<Vec<_>>(),
+            vec![3., 4.]
+        );
+        let missing = HashMap::from([("missing".to_string(), a.clone())]);
+        assert!(ModelLoader::load_weights_with_options(&first, &missing, options).is_err());
+        assert_eq!(
+            a.data_ref().iter().copied().collect::<Vec<_>>(),
+            vec![1., 2.]
+        );
+    }
+    fs::write(&index, r#"{"weight_map":{"a":"../escape.safetensors"}}"#).unwrap();
+    let params = HashMap::from([(
+        "a".to_string(),
+        Tensor::parameter(ArrayD::zeros(IxDyn(&[2]))),
+    )]);
+    assert!(
+        ModelLoader::load_weights_with_options(&index, &params, WeightLoadOptions::default())
+            .is_err()
+    );
+    fs::remove_file(first).unwrap();
+    fs::remove_file(second).unwrap();
+    fs::remove_file(index).unwrap();
+}
+
 fn bytes_from_f32(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for value in data {

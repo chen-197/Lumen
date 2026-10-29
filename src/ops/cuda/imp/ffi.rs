@@ -1,6 +1,16 @@
 use super::*;
 
 unsafe extern "C" {
+    pub(super) fn lumen_cuda_round_kv_cache_rows_f32_device(
+        handle: u64,
+        batch_size: usize,
+        num_heads: usize,
+        rows: usize,
+        capacity: usize,
+        dim: usize,
+        start: usize,
+        dtype: i32,
+    ) -> i32;
     pub(super) fn lumen_cuda_is_available() -> c_int;
     pub(super) fn lumen_cuda_alloc_f32(len: usize, out_handle: *mut u64) -> c_int;
     pub(super) fn lumen_cuda_upload_f32(handle: u64, src: *const f32, len: usize) -> c_int;

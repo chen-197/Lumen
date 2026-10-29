@@ -43,7 +43,9 @@ jobs:
         run: python3 dev-tools/check_generic_prefill.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/generic-prefill-comparison.json
       - name: Independent mixed-precision row matmul reference
         run: python3 dev-tools/check_row_matmul.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/row-matmul-comparison.json
-      - name: Static checks
+      - name: Independent Qwen3 forward and gradient reference
+        run: python3 dev-tools/check_qwen3.py target/operator-accuracy-ci/tests.log --output target/operator-accuracy-ci/qwen3-comparison.json
+      - name: Static analysis and formatting
         run: |
           cargo fmt --all --check
           cargo clippy --release --locked --all-targets --no-default-features --features dev-tools -- -D warnings -A clippy::chunks_exact_to_as_chunks

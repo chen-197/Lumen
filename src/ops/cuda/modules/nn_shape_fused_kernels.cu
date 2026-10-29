@@ -1254,6 +1254,21 @@ __global__ void slice_lastdim_backward_kernel(
     }
 }
 
+__global__ void round_kv_cache_rows_kernel(
+    float* cache, size_t total, size_t rows, size_t capacity,
+    size_t dim, size_t start, int dtype) {
+    const size_t begin = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t index = begin; index < total; index += stride) {
+        const size_t column = index % dim;
+        const size_t row = index / dim;
+        const size_t offset = ((row / rows) * capacity + start + row % rows) * dim + column;
+        const float value = cache[offset];
+        cache[offset] = dtype == 1 ? __half2float(__float2half_rn(value))
+            : __bfloat162float(__float2bfloat16_rn(value));
+    }
+}
+
 __global__ void append_kv_cache_kernel(
     float* dst,
     const float* src,

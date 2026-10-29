@@ -45,50 +45,43 @@ pub(super) fn prefill_gemm_panels<A: DotElem, B: DotElem>(
         .to_owned()
 }
 
-pub(super) fn prefill_bf16_rows<A: DotElem>(
+pub(super) fn prefill_bf16_panels<A: DotElem>(
     a: ndarray::ArrayViewD<'_, A>,
     b: ndarray::ArrayViewD<'_, bf16>,
     dims: (usize, usize, usize),
 ) -> Array2<f32> {
     let (m, k, n) = dims;
-    let input = a
-        .iter()
-        .map(|x| bf16::from_f32(x.to_f32()))
-        .collect::<Vec<_>>();
+    let pairs = k.div_ceil(2);
+    let mut input = vec![0u32; m * pairs];
+    for (i, value) in a.iter().enumerate() {
+        let token = i / k;
+        let column = i % k;
+        input[token * pairs + column / 2] |=
+            (bf16::from_f32(value.to_f32()).to_bits() as u32) << ((column % 2) * 16);
+    }
     let weights = b.as_standard_layout();
     let weights = weights.as_slice().unwrap();
-    let mut transposed = vec![0.0f32; n * m];
+    const CHANNELS: usize = super::cpu_gemm::CHANNELS;
+    let mut output = vec![0.; n.div_ceil(CHANNELS) * CHANNELS * m];
     crate::cpu::for_each_chunk_mut(
-        &mut transposed,
-        16 * m,
-        k.saturating_mul(16).saturating_mul(m),
-        |(block, output)| {
-            for (row, output) in output.chunks_mut(m).enumerate() {
-                let weight = &weights[(block * 16 + row) * k..(block * 16 + row + 1) * k];
-                let mut token = 0;
-                while token + 3 <= m {
-                    let (a, b, c) = dot3_bf16_bf16_arch(
-                        weight,
-                        &input[token * k..(token + 1) * k],
-                        &input[(token + 1) * k..(token + 2) * k],
-                        &input[(token + 2) * k..(token + 3) * k],
-                    )
-                    .unwrap();
-                    output[token..token + 3].copy_from_slice(&[a, b, c]);
-                    token += 3;
-                }
-                for (token, value) in output.iter_mut().enumerate().skip(token) {
-                    *value =
-                        dot_bf16_bf16_arch(weight, &input[token * k..(token + 1) * k]).unwrap();
-                }
-            }
+        &mut output,
+        CHANNELS * m,
+        k.saturating_mul(CHANNELS).saturating_mul(m),
+        |(panel, output)| {
+            super::cpu_gemm::bf16_panel(&input, weights, k, n, panel * CHANNELS, output);
         },
     );
-    Array2::from_shape_vec((n, m), transposed)
-        .unwrap()
-        .reversed_axes()
-        .as_standard_layout()
-        .to_owned()
+    let mut result = Array2::zeros((m, n));
+    let destination = result.as_slice_mut().unwrap();
+    for (panel, source) in output.chunks(CHANNELS * m).enumerate() {
+        let first = panel * CHANNELS;
+        let count = (n - first).min(CHANNELS);
+        for (token, row) in destination.chunks_mut(n).enumerate() {
+            row[first..first + count]
+                .copy_from_slice(&source[token * CHANNELS..token * CHANNELS + count]);
+        }
+    }
+    result
 }
 
 pub(super) fn prefill_lowp_panels<A: DotElem>(
@@ -147,7 +140,10 @@ pub(super) fn try_prefill_gemm(
     if !is_no_grad()
         || !a.is_cpu()
         || !b.is_cpu()
-        || !(8..=256).contains(&m)
+        || m < 8
+        // BF16 panels reuse weights across arbitrary row counts. Retain the
+        // established crossover for the other storage routes.
+        || (m > 256 && b.dtype() != DType::BF16)
         || k < 512
         || n < 512
         || a.dtype() == DType::I8
@@ -230,7 +226,21 @@ pub(super) fn try_prefill_gemm(
                         if crate::arch::x86_avx512_bf16_kernel_runtime_available()
                             && a.dtype() == DType::BF16 =>
                     {
-                        Some(prefill_bf16_rows($input, weights, (m, k, n)))
+                        Some(prefill_bf16_panels($input, weights, (m, k, n)))
+                    }
+                    TensorStorageView::BF16(weights)
+                        if m >= 16
+                            && k >= 1024
+                            && super::cpu_gemm::available(SliceRef::BF16(&[])) =>
+                    {
+                        // Expand weight bits exactly; F32/F16 activations
+                        // retain their represented precision through F32 FMA.
+                        let weights = weights.as_standard_layout();
+                        Some(prefill_lowp_panels(
+                            $input,
+                            SliceRef::BF16(weights.as_slice().unwrap()),
+                            (m, k, n),
+                        ))
                     }
                     TensorStorageView::BF16(weights) => {
                         // F32/F16 inputs must not be rounded again to BF16.

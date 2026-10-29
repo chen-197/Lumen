@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Keep ByteLevel streaming prefixes valid when one BPE token finishes a UTF-8
+  character and begins another; pending token IDs remain unchanged.
+- Return a configuration error for integer KV storage before constructing a
+  pretrained decoder, instead of panicking in the underlying constructor.
+- Keep CUDA KV cache snapshots and device migration consistent after resident
+  writes. Round only newly appended F16/BF16 rows to their declared storage
+  precision and invalidate stale host/native mirrors without scanning or
+  reallocating the full cache on each token.
+
+### Added
+
+- Dense Qwen3 model/configuration support with explicit attention head dimensions,
+  per-head Q/K RMSNorm, tied embedding/output parameters and shared decoder kernels.
+- Configuration-driven CLI and model benchmarks, text-only Qwen3 ChatML with optional
+  thinking, and strict single-file/sharded safetensors loading.
+- Independent PyTorch FP64 Qwen3 logits and complete parameter-gradient references,
+  cache partition/reset checks and shared-weight SGD/Adam training regressions.
+
+### Changed
+
+- Pack native CPU BF16 weight panels with an integer SIMD transpose, preserving
+  weight bits, padded tails and the existing F32 accumulation order.
+- Keep BF16 prefill on the tiled path for long inputs beyond the former
+  256-row cutoff, preserving native and mixed activation precision.
+- Add inclusive matrix multiplication and RMSNorm regions to CPU profiling.
+- Tile CPU BF16 prefill across input rows and output channels. Native BF16 dot
+  products accumulate in F32; mixed F32/F16 activations use exact BF16 weight
+  expansion with AVX2/FMA or AVX-512, preserving activation precision and caller
+  task budgets without retaining a full F32 weight copy.
+- Upgrade tokenizers to 0.23 for official modern BPE tokenizer files. Streaming
+  ByteLevel decoding waits for complete UTF-8 characters while preserving raw IDs
+  and genuinely invalid bytes. Existing ByteFallback handling remains supported.
+- CLI model dimensions now come from a required adjacent `config.json` or explicit
+  `--config`; Qwen3 thinking is disabled by default and enabled with `--enable-thinking`.
+
 ## 0.1.7 — 2026-10-28
 
 ### Added

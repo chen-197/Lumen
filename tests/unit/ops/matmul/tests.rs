@@ -164,6 +164,81 @@ fn prefill_panels_match_scalar_for_tail_and_strided_weights() {
         2e-4,
     );
 }
+
+#[test]
+fn bf16_prefill_mixed_inputs_match_f64_at_block_dispatch_boundary() {
+    let (m, k, n) = (17, 1025, 515);
+    for input_dtype in [DType::F32, DType::F16, DType::BF16] {
+        let a = Tensor::from_array_no_grad(
+            Array2::from_shape_vec((k, m), sample_f32(m * k))
+                .unwrap()
+                .reversed_axes()
+                .into_dyn(),
+        );
+        a.cast_inplace(input_dtype);
+        let b = Tensor::from_array_no_grad(
+            Array2::from_shape_vec((k, n), sample_f32(n * k))
+                .unwrap()
+                .reversed_axes()
+                .into_dyn(),
+        );
+        b.cast_inplace(DType::BF16);
+        let x = a.detach().data().into_shape((m, k)).unwrap();
+        let w = b.detach().data().into_shape((n, k)).unwrap();
+        let output = no_grad(|| try_prefill_gemm(&a, &b, m, k, n).unwrap());
+        for row in 0..m {
+            for col in 0..n {
+                let reference: f64 = (0..k)
+                    .map(|j| x[[row, j]] as f64 * w[[col, j]] as f64)
+                    .sum();
+                let actual = output[[row, col]] as f64;
+                assert!(
+                    (actual - reference).abs() <= 8e-6 + 8e-6 * reference.abs(),
+                    "{input_dtype:?} x BF16 row={row} col={col}: {actual} vs {reference}"
+                );
+            }
+        }
+        assert_eq!(a.dtype(), input_dtype);
+        assert_eq!(b.dtype(), DType::BF16);
+    }
+}
+
+#[test]
+fn bf16_prefill_large_row_counts_keep_native_and_mixed_precision() {
+    for (m, k, n) in [(257, 513, 515), (513, 1025, 519)] {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let a = make_tensor(&[m, k], sample_f32(m * k), dtype);
+            let b = make_tensor(&[n, k], sample_f32(n * k), DType::BF16);
+            let x = a.detach().data().into_shape((m, k)).unwrap();
+            let w = b.detach().data().into_shape((n, k)).unwrap();
+            for tasks in [1, 3] {
+                let policy = crate::cpu::CpuKernelContext::default()
+                    .with_task_limit(std::num::NonZeroUsize::new(tasks).unwrap());
+                let output = policy
+                    .scope(|| no_grad(|| try_prefill_gemm(&a, &b, m, k, n)))
+                    .expect("large BF16 matrices must retain the prefill dispatcher");
+                assert_eq!(output.dim(), (m, n));
+                assert!(output.iter().all(|v| v.is_finite()));
+                // Probe both sides of the former boundary, multiple row tiles
+                // and the last partial row/channel against represented FP64.
+                for row in [0, 7, 8, 255, 256, m - 1] {
+                    for col in 0..n {
+                        let expected: f64 = (0..k)
+                            .map(|j| x[[row, j]] as f64 * w[[col, j]] as f64)
+                            .sum();
+                        let actual = output[[row, col]] as f64;
+                        assert!(
+                            (actual - expected).abs() <= 8e-6 + 8e-6 * expected.abs(),
+                            "{dtype:?} large BF16 tasks={tasks} M={m} K={k} row={row} col={col}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(a.dtype(), dtype);
+            assert_eq!(b.dtype(), DType::BF16);
+        }
+    }
+}
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
 use crate::autograd::set_strict_device_execution;

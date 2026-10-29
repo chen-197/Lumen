@@ -1,5 +1,20 @@
 use super::*;
 
+pub fn round_kv_cache_rows_f32(
+    buffer: &CudaBuffer,
+    batch_size: usize,
+    num_heads: usize,
+    rows: usize,
+    capacity: usize,
+    dim: usize,
+    start: usize,
+    dtype: crate::precision::DType,
+) -> Result<(), String> {
+    imp::round_kv_cache_rows_f32(
+        buffer, batch_size, num_heads, rows, capacity, dim, start, dtype,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn append_kv_cache_f32(
     dst: &CudaBuffer,

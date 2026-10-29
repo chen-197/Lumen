@@ -48,7 +48,7 @@ pub(super) use attention::{
     kv_cache_prefix_typed_buffer, prefill_attention_f32_buffer, repeat_kv_backward_f32,
     repeat_kv_backward_f32_buffer, repeat_kv_f32, repeat_kv_f32_buffer, repeat_kv_typed_buffer,
     rope_backward_f32, rope_backward_f32_buffer, rope_f32, rope_f32_buffer, rope_typed_buffer,
-    rope_typed_i8_dynamic_buffer,
+    rope_typed_i8_dynamic_buffer, round_kv_cache_rows_f32,
 };
 mod elementwise;
 pub(super) use elementwise::{

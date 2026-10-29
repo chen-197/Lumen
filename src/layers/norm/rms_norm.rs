@@ -180,6 +180,8 @@ fn try_cuda_rms_norm_backward_typed_buffers(
 
 impl Module for RMSNorm {
     fn forward(&self, input: Tensor) -> Tensor {
+        #[cfg(feature = "cpu-profiling")]
+        let _profile = crate::cpu::profiling::region("rms_norm");
         let output_device = input.device();
         let build_graph = !is_no_grad() && (input.requires_grad() || self.weight.requires_grad());
         assert_native_device_support(
