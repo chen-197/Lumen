@@ -14,6 +14,214 @@ fn make_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {
 }
 
 #[test]
+fn rms_forward_rows_observe_pool_budget_grain_and_nested_execution() {
+    use crate::cpu::CpuKernelContext;
+    use std::{num::NonZeroUsize, sync::Arc};
+    let workers = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap(),
+    );
+    let caller = std::thread::current().id();
+    for budget in [1, 2, 7] {
+        let context = CpuKernelContext::with_pool(workers.clone())
+            .with_task_limit(NonZeroUsize::new(budget).unwrap());
+        context.scope(|| {
+            for (rows, dim) in [(0, 513), (2, 129), (65, 513)] {
+                let input = Array2::from_shape_fn((rows, dim), |(r, c)| (r * dim + c) as f32);
+                let mut output = Array2::zeros((rows, dim));
+                let parallel = crate::cpu::should_parallelize(rows, dim * 4);
+                let active = std::sync::atomic::AtomicUsize::new(0);
+                let peak = std::sync::atomic::AtomicUsize::new(0);
+                for_each_forward_row(&mut output, input.view(), |mut out, row| {
+                    use std::sync::atomic::Ordering;
+                    if parallel {
+                        assert!(workers.current_thread_index().is_some());
+                    } else {
+                        assert_eq!(std::thread::current().id(), caller);
+                    }
+                    assert_eq!(crate::cpu::parallelism(), 1);
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    let thread = std::thread::current().id();
+                    let mut inner = Array2::<f32>::zeros((2, 129));
+                    for_each_forward_row(
+                        &mut inner,
+                        input.slice(ndarray::s![..2, ..129]),
+                        |_, _| {
+                            assert_eq!(std::thread::current().id(), thread);
+                        },
+                    );
+                    out.assign(&row);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+                assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= budget.min(3));
+                assert_eq!(output, input);
+            }
+        });
+    }
+}
+
+#[test]
+fn rms_forward_policy_preserves_mixed_storage_layouts_and_fp64_accuracy() {
+    use crate::cpu::CpuKernelContext;
+    use std::{num::NonZeroUsize, sync::Arc};
+    let _cpu = cuda::set_enabled_scoped(false);
+    let workers = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap(),
+    );
+    fn ordered<T: Clone + Default>(
+        array: &ndarray::ArrayD<T>,
+        strided: bool,
+    ) -> ndarray::ArrayD<T> {
+        if !strided {
+            array.clone()
+        } else if array.ndim() == 1 {
+            let values = array.iter().cloned().collect::<Vec<_>>();
+            ndarray::Array1::from_shape_fn(values.len() * 2, |i| values[i / 2].clone())
+                .slice_move(ndarray::s![..;2])
+                .into_dyn()
+        } else {
+            array
+                .view()
+                .reversed_axes()
+                .as_standard_layout()
+                .to_owned()
+                .reversed_axes()
+        }
+    }
+    fn tensor(shape: &[usize], values: Vec<f32>, dtype: DType, strided: bool) -> Tensor {
+        let t = make_tensor(shape, values, dtype);
+        match t.native_storage_owned() {
+            TensorStorageOwned::F32(a) => {
+                t.set_array_f32_with_dtype(ordered(&a.to_owned(), strided), dtype)
+            }
+            TensorStorageOwned::F16(a) => {
+                t.set_array_f16_with_dtype(ordered(&a.to_owned(), strided), dtype)
+            }
+            TensorStorageOwned::BF16(a) => {
+                t.set_array_bf16_with_dtype(ordered(&a.to_owned(), strided), dtype)
+            }
+            TensorStorageOwned::I8(a, scale) => {
+                t.set_array_i8_with_dtype(ordered(&a.to_owned(), strided), scale, dtype)
+            }
+        }
+        t
+    }
+    with_precision_config(
+        PrecisionConfig {
+            parameter_dtype: DType::F32,
+            runtime_dtype: DType::F32,
+            allow_parameter_dtype_copies: false,
+        },
+        || {
+            for input_dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
+                for weight_dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
+                    for strided in [false, true] {
+                        for graph in [false, true] {
+                            if graph && input_dtype != DType::BF16 {
+                                continue;
+                            }
+                            let (rows, dim) = (43, 513);
+                            let input = tensor(
+                                &[1, rows, dim],
+                                (0..rows * dim)
+                                    .map(|i| ((i * 17 + 3) % 251) as f32 * 0.013 - 1.625)
+                                    .collect(),
+                                input_dtype,
+                                strided,
+                            );
+                            let norm = RMSNorm {
+                                weight: tensor(
+                                    &[dim],
+                                    (0..dim)
+                                        .map(|i| ((i * 13 + 11) % 97) as f32 * 0.017 - 0.816)
+                                        .collect(),
+                                    weight_dtype,
+                                    strided,
+                                ),
+                                eps: 1e-5,
+                            };
+                            norm.weight.0.borrow_mut().requires_grad = graph;
+                            let x = input.detach().data().iter().copied().collect::<Vec<_>>();
+                            let w = norm
+                                .weight
+                                .detach()
+                                .data()
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>();
+                            let mut previous = None;
+                            for budget in [1, 3] {
+                                let context = CpuKernelContext::with_pool(workers.clone())
+                                    .with_task_limit(NonZeroUsize::new(budget).unwrap());
+                                let output = context.scope(|| {
+                                    if graph {
+                                        norm.forward(input.clone())
+                                    } else {
+                                        no_grad(|| norm.forward(input.clone()))
+                                    }
+                                });
+                                assert_eq!(output.shape_vec(), vec![1, rows, dim]);
+                                assert_eq!(
+                                    output.dtype(),
+                                    if graph { DType::F32 } else { input_dtype }
+                                );
+                                assert_eq!(input.dtype(), input_dtype);
+                                assert_eq!(norm.weight.dtype(), weight_dtype);
+                                let raw = bincode::serialize(&output.export_raw()).unwrap();
+                                if let Some(old) = &previous {
+                                    assert_eq!(&raw, old);
+                                }
+                                previous = Some(raw);
+                                let actual = output.detach().data();
+                                let scale = output.quantization_scale().unwrap_or(0.);
+                                for r in 0..rows {
+                                    let row = &x[r * dim..(r + 1) * dim];
+                                    let inv =
+                                        (row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+                                            / dim as f64
+                                            + f64::from(norm.eps))
+                                        .sqrt()
+                                        .recip();
+                                    for c in 0..dim {
+                                        let expected = f64::from(row[c]) * inv * f64::from(w[c]);
+                                        let relative = match output.dtype() {
+                                            DType::F32 => 2e-5,
+                                            DType::F16 => 1. / 1024.,
+                                            DType::BF16 => 1. / 128.,
+                                            DType::I8 => 0.,
+                                        };
+                                        let error = (f64::from(actual[[0, r, c]]) - expected).abs();
+                                        assert!(
+                                            error
+                                                <= 2e-5
+                                                    + relative * expected.abs()
+                                                    + f64::from(scale) * 0.501,
+                                            "{input_dtype:?}/{weight_dtype:?}/{strided}/{graph}/{budget}: {error} vs {expected}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
+                let input = make_tensor(&[0, 129], vec![], dtype);
+                let output = no_grad(|| RMSNorm::new(129, 1e-5).forward(input));
+                assert_eq!(output.shape_vec(), vec![0, 129]);
+                assert_eq!(output.dtype(), dtype);
+            }
+        },
+    );
+}
+
+#[test]
 fn rms_norm_training_preserves_cpu_native_input_and_parameter_storage() {
     with_precision_config(
         PrecisionConfig {
@@ -59,7 +267,7 @@ fn rms_norm_training_preserves_cpu_native_input_and_parameter_storage() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_rms_norm_cooperative_training_loss_decreases_across_parameter_types() {
-    use crate::autograd::{Device, set_strict_device_execution_scoped};
+    use crate::device::{Device, set_strict_device_execution_scoped};
     use crate::loss::MSELoss;
     use crate::optim::{Adam, Optimizer, SGD};
     if !cuda::is_available() {
@@ -237,9 +445,9 @@ fn cuda_rms_norm_matches_cpu_reference_in_strict_mode() {
     assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| norm.forward(input.clone()));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
@@ -286,9 +494,9 @@ fn cuda_empty_rms_norm_stays_on_cuda_in_strict_mode() {
     let input = make_tensor(&[0, 4], vec![], DType::BF16).to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| norm.forward(input.clone()));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -332,7 +540,7 @@ fn cuda_rms_norm_backward_matches_cpu_reference_in_strict_mode() {
     let coeff_cuda = coeff_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = norm_cuda.forward(input_cuda.clone());
     let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
     cuda_loss.backward();
@@ -340,7 +548,7 @@ fn cuda_rms_norm_backward_matches_cpu_reference_in_strict_mode() {
     assert!(norm_cuda.weight.cloned_cuda_f32_grad().is_some());
     assert!(!input_cuda.has_host_grad());
     assert!(!norm_cuda.weight.has_host_grad());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let norm_cpu = RMSNorm::new(4, 1e-5);
@@ -412,11 +620,11 @@ fn cuda_rms_norm_lowp_backward_uses_resident_inputs_and_f32_grads() {
     assert!(norm_cuda.weight.0.borrow().cuda_f32_data.is_none());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = norm_cuda.forward(input_cuda.clone());
     let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
     cuda_loss.backward();
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(input_cuda.0.borrow().cuda_f32_data.is_none());
@@ -502,9 +710,9 @@ fn cuda_rms_norm_preserves_i8_dtype_in_strict_mode() {
     assert!(norm.weight.0.borrow().cuda_f32_data.is_none());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| norm.forward(input.clone()));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(norm.weight.0.borrow().cuda_f32_data.is_none());

@@ -1,6 +1,7 @@
 use super::*;
 use crate::accuracy_gate::{check, run, tensor, values};
-use crate::autograd::{Device, no_grad};
+use crate::autograd::no_grad;
+use crate::device::Device;
 
 fn case(device: Device, xd: DType, td: DType, order: usize, pattern: usize, flags: usize) {
     let labels = [

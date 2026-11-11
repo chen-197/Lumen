@@ -273,7 +273,7 @@ impl Tensor {
         inner.grad = None;
     }
 
-    pub(super) fn materialize_cuda_grad_to_host(&self) {
+    pub(crate) fn materialize_cuda_grad_to_host(&self) {
         let (shape, buffer) = {
             let inner = self.0.borrow();
             let Some(buffer) = inner.cuda_f32_grad.clone() else {

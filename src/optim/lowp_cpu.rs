@@ -1,6 +1,7 @@
 //! Fused CPU updates: native state storage, F32 arithmetic, one rounding on store.
 use super::*;
-use crate::autograd::{Device, TensorStorageViewMut};
+use crate::autograd::TensorStorageViewMut;
+use crate::device::Device;
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 
 // Keep small tensors on the caller; amortize scheduling over sizable chunks.

@@ -1,9 +1,8 @@
-//! Tensor storage, device state, and dynamic reverse-mode differentiation.
+//! Tensor storage and dynamic reverse-mode differentiation.
 
 mod backward;
 mod checkpoint;
 mod creation;
-mod device;
 mod diagnostics;
 mod operations;
 mod optimizer;
@@ -26,6 +25,12 @@ use half::{bf16, f16, slice::HalfFloatSliceExt};
 use ndarray::Zip;
 use ndarray::prelude::*;
 pub use ndarray::{ArcArray, IxDyn};
+// Compatibility paths; device policy is owned by crate::device.
+pub use crate::device::{
+    Device, StrictDeviceExecutionGuard, assert_native_device_support, assert_same_device,
+    is_strict_device_execution, set_strict_device_execution, set_strict_device_execution_scoped,
+};
+
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashSet;
@@ -54,7 +59,6 @@ thread_local! {
     static INFERENCE_MODE: Cell<bool> = const { Cell::new(false) };
     static NO_GRAD_DEPTH: Cell<usize> = const { Cell::new(0) };
     static F32_COMPUTE_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-    static STRICT_DEVICE_EXECUTION: Cell<bool> = Cell::new(env_strict_device_execution());
 }
 
 /// Caller-thread no-grad scope, restored when the guard is dropped.
@@ -106,52 +110,6 @@ pub fn no_grad<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-fn env_strict_device_execution() -> bool {
-    std::env::var("LUMEN_STRICT_DEVICE")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-pub fn set_strict_device_execution(enabled: bool) {
-    STRICT_DEVICE_EXECUTION.with(|flag| flag.set(enabled));
-}
-
-pub fn is_strict_device_execution() -> bool {
-    STRICT_DEVICE_EXECUTION.with(|flag| flag.get())
-}
-
-/// Caller-thread strict-device scope; the guard must stay on this thread.
-///
-/// ```compile_fail
-/// let guard = lumen::autograd::set_strict_device_execution_scoped(true);
-/// std::thread::spawn(move || drop(guard));
-/// ```
-pub struct StrictDeviceExecutionGuard {
-    previous: bool,
-    _caller_thread: PhantomData<Rc<()>>,
-}
-
-pub fn set_strict_device_execution_scoped(enabled: bool) -> StrictDeviceExecutionGuard {
-    let previous = is_strict_device_execution();
-    set_strict_device_execution(enabled);
-    StrictDeviceExecutionGuard {
-        previous,
-        _caller_thread: PhantomData,
-    }
-}
-
-impl Drop for StrictDeviceExecutionGuard {
-    fn drop(&mut self) {
-        set_strict_device_execution(self.previous);
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TensorRawData {
     F32(Vec<f32>),
@@ -178,12 +136,6 @@ pub(crate) enum TensorStorageOwned {
     F16(ArcArray<f16, IxDyn>),
     BF16(ArcArray<bf16, IxDyn>),
     I8(ArcArray<i8, IxDyn>, f32),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Device {
-    Cpu,
-    Cuda,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,32 +240,6 @@ pub struct Tensor(pub(crate) Rc<RefCell<TensorData>>);
 // 切断梯度流（等价于 t.detach()）
 pub fn detach(t: &Tensor) -> Tensor {
     t.detach()
-}
-
-pub fn assert_same_device(lhs: &Tensor, rhs: &Tensor, op_name: &str) -> Device {
-    let lhs_device = lhs.device();
-    let rhs_device = rhs.device();
-    assert!(
-        lhs_device == rhs_device,
-        "{op_name} expects tensors on the same device, got lhs={lhs_device:?}, rhs={rhs_device:?}. Move them with to_cuda()/to_cpu() before combining them."
-    );
-    lhs_device
-}
-
-pub fn assert_native_device_support(device: Device, op_name: &str, cuda_supported: bool) {
-    if !is_strict_device_execution() {
-        return;
-    }
-
-    match device {
-        Device::Cpu => {}
-        Device::Cuda => {
-            assert!(
-                cuda_supported,
-                "{op_name} does not have a native CUDA implementation yet. This operation would fall back through CPU semantics, which is disallowed while strict device execution is enabled."
-            );
-        }
-    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 use crate::autograd::{Tensor, TensorStorageOwned, TensorStorageView, is_no_grad};
 use crate::init::{InitType, tensor_init, tensor_init_with_dtype}; // 引入 Init
 use crate::module::Module;
-use crate::ops::matmul::{SliceRef, matmul, matvec_rowmajor_parallel_mixed};
+use crate::ops::matmul::{SliceRef, matmul_transposed_rhs, matvec_rowmajor_parallel_mixed};
 use crate::precision::{DType, allow_parameter_dtype_copies};
 use half::f16;
 use ndarray::{ArrayD, Axis, Ix1, IxDyn};
@@ -252,7 +252,7 @@ impl Linear {
 
 impl Module for Linear {
     fn forward(&self, input: Tensor) -> Tensor {
-        let y = matmul(&input, &self.weight);
+        let y = matmul_transposed_rhs(&input, &self.weight);
 
         if let Some(bias) = &self.bias {
             if is_no_grad() {

@@ -46,7 +46,7 @@ rayon = "1.7"
 ```rust
 use lumen::autograd::Tensor;
 use lumen::loss::MSELoss;
-use lumen::ops::matmul::matmul;
+use lumen::ops::matmul::matmul_transposed_rhs;
 use lumen::optim::{Optimizer, SGD};
 use lumen::precision::DType;
 use ndarray::arr2;
@@ -59,20 +59,24 @@ fn main() {
 
     for _ in 0..100 {
         optimizer.zero_grad();
-        let prediction = matmul(&input, &weight);
+        let prediction = matmul_transposed_rhs(&input, &weight);
         let loss = MSELoss::apply(&prediction, &target);
         loss.backward();
         optimizer.step();
     }
 
-    let loss = MSELoss::apply(&matmul(&input, &weight), &target);
+    let loss = MSELoss::apply(&matmul_transposed_rhs(&input, &weight), &target);
     let value = *loss.data().first().unwrap();
     println!("loss = {value:.6}");
     assert!(value < 1e-6);
 }
 ```
 
-`matmul` 的语义是 `A[..., K] @ B[N, K]ᵀ`，输出为 `[..., N]`。
+`matmul(A, B)` 计算标准矩阵乘法 `A[..., K] @ B[K, N] → [..., N]`；
+`matmul_transposed_rhs(A, W)` 计算 `A[..., K] @ W[N, K]ᵀ → [..., N]`，适用于按输出通道存储的线性层权重。
+
+旧版的 `matmul(x, weight)` 调用应迁移为 `matmul_transposed_rhs(x, weight)`。
+即使权重是方阵，也需要迁移，因为两种运算的结果通常不同。`Linear` 已在内部使用明确的转置右矩阵接口。
 参数更新后应重新执行前向并构建计算图，并在下一批次前调用 `zero_grad()`。
 多次反向传播会累积叶子梯度。
 需要自定义上游梯度时，使用 `backward_with_grad(seed)`。
@@ -128,7 +132,8 @@ assert_eq!(output.shape_vec(), vec![2, 4, 3, 6]);
 
 | 模块 | 提供的功能 |
 | --- | --- |
-| [`autograd`](./src/autograd/) | `Tensor`、`Device`、计算图、梯度、存储与设备迁移 |
+| [`device`](./src/device.rs) | `Device`、CPU/CUDA 放置与迁移、严格设备执行策略 |
+| [`autograd`](./src/autograd/) | `Tensor`、计算图、梯度与存储 |
 | [`ops`](./src/ops/) | 逐元素算术、形状操作、矩阵乘、卷积、池化与融合算子 |
 | [`layers`](./src/layers/) | 通用层、激活函数、归一化与注意力 |
 | [`module`](./src/module.rs) | `Module`、`Sequential`、`sequential!`、检查点与参数转换 |
@@ -167,7 +172,7 @@ F32 数据读取会物化数据、可能发生设备传输，也可能把原 Ten
 
 ```rust
 use lumen::autograd::Tensor;
-use lumen::ops::{matmul::{batch_matmul, matmul}, shape::cat};
+use lumen::ops::{matmul::{batch_matmul, matmul, matmul_transposed_rhs}, shape::cat};
 use ndarray::{ArrayD, IxDyn, arr1, arr2};
 
 fn main() {
@@ -183,8 +188,11 @@ fn main() {
     let joined = cat(&[flat.clone(), flat], 0);
     assert_eq!(joined.shape_vec(), vec![2, 4]);
 
+    let rhs = Tensor::from_array_no_grad(arr2(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).into_dyn());
+    assert_eq!(matmul(&x, &rhs).shape_vec(), vec![2, 3]);
+
     let weight = Tensor::parameter(arr2(&[[1.0, 0.0], [0.0, 1.0]]).into_dyn());
-    assert_eq!(matmul(&x, &weight).shape_vec(), vec![2, 2]);
+    assert_eq!(matmul_transposed_rhs(&x, &weight).shape_vec(), vec![2, 2]);
 
     let a = Tensor::from_array_no_grad(ArrayD::ones(IxDyn(&[1, 2, 3, 4])));
     let b = Tensor::from_array_no_grad(ArrayD::ones(IxDyn(&[1, 2, 4, 5])));
@@ -202,7 +210,8 @@ fn main() {
 | `x.permute(axes)`、`x.transpose(i, j)` | 重排维度 |
 | `ops::shape::cat(&tensors, axis)` | 沿指定轴拼接 |
 | `ops::shape::slice_last_dim(&x, start, end)` | 对最后一维取 `[start, end)` |
-| `ops::matmul::matmul(&a, &weights)` | `[..., K] × [N, K]ᵀ → [..., N]`，权重按输出通道排列 |
+| `ops::matmul::matmul(&a, &b)` | 标准乘法：`[..., K] × [K, N] → [..., N]`，右矩阵为二维，保留左侧前导维度 |
+| `ops::matmul::matmul_transposed_rhs(&a, &weights)` | `[..., K] × [N, K]ᵀ → [..., N]`，权重按输出通道排列 |
 | `ops::matmul::batch_matmul(&a, &b)` | `[B,H,M,K] × [B,H,K,N] → [B,H,M,N]`，右侧已按乘法次序排列 |
 | `ops::convolution::{conv2d, max_pool2d}` | NCHW 卷积和池化，也可使用更方便的层构造器 |
 | `ops::fused::fused_softmax(&x, scale, causal)` | 缩放 softmax，可选因果 mask |
@@ -375,7 +384,8 @@ fn main() {
 CUDA 当前面向单设备，不同算子/类型的覆盖与 CPU 存在差异。
 
 ```rust
-use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
+use lumen::device::{Device, set_strict_device_execution_scoped};
+use lumen::autograd::{Tensor, no_grad};
 use lumen::layers::Linear;
 use lumen::module::Module;
 use lumen::ops::cuda;
@@ -509,7 +519,7 @@ fn main() {
 ```rust
 use lumen::autograd::{Tensor, no_grad};
 use lumen::cpu::{CpuInferenceContext, CpuKernelContext};
-use lumen::ops::matmul::matmul;
+use lumen::ops::matmul::matmul_transposed_rhs;
 use ndarray::arr2;
 use std::{num::NonZeroUsize, sync::Arc};
 
@@ -519,33 +529,54 @@ fn main() {
         .with_task_limit(NonZeroUsize::new(2).unwrap());
     let input = Tensor::from_array_no_grad(arr2(&[[1.0, 2.0]]).into_dyn());
     let weight = Tensor::parameter(arr2(&[[0.5, 0.5]]).into_dyn());
-    context.scope(|| matmul(&input, &weight).sum().backward());
+    context.scope(|| matmul_transposed_rhs(&input, &weight).sum().backward());
     assert!(weight.grad().is_some());
 
     let inference = CpuInferenceContext::new(context)
         .with_prefill_task_limit(NonZeroUsize::new(2).unwrap())
         .with_decode_task_limit(NonZeroUsize::new(1).unwrap());
-    let prefill = inference.prefill(|| no_grad(|| matmul(&input, &weight)));
-    let decode = inference.decode(|| no_grad(|| matmul(&input, &weight)));
+    let prefill = inference.prefill(|| no_grad(|| matmul_transposed_rhs(&input, &weight)));
+    let decode = inference.decode(|| no_grad(|| matmul_transposed_rhs(&input, &weight)));
     assert_eq!(prefill.data(), decode.data());
 }
 ```
 
 在计算循环外创建线程池，并让多个调用方复用。`scope` 保持 Tensor 和
 自动微分状态位于调用线程，仅将数组计算派发到池。预算约束单个已接入内核，
-不是进程线程总数；小任务和嵌套数组计算串行执行。库不配置全局线程池、不绑定
+不是进程线程总数。显式限制任务数时，索引遍历将计算块均衡分配到选定的任务组，
+避免固定宽度分组造成任务组不足，且不创建临时视图列表。小任务和嵌套数组计算串行执行。
+库不配置全局线程池、不绑定
 线程，也不根据某颗 CPU 的型号固定调度。
 
-MatVec、普通/批量矩阵乘前向与反向、融合投影、argmax、prefill、推理注意力及
+MatVec、普通/批量矩阵乘前向与反向、融合投影、argmax、prefill、推理注意力、RMSNorm 前向行计算及
 原生低精度优化器状态内核使用这些上下文。**前向和反向都应进入作用域**；
 仅在其中构建计算图，不会将策略绑定到之后的反向遍历。
+LayerNorm 前向同样使用这些上下文。CPU LayerNorm 推理按行计算，省去反向所需的
+中间数组，并保持输入和参数的存储精度；中心化统计量使用 F64，输出仍为 F32。
+RMSNorm 反向的输入梯度独立行计算和权重梯度归约也使用这些上下文；行内运算
+顺序保持不变，权重梯度分组求和可能改变浮点舍入。LayerNorm 反向也遵守这些上下文：
+小任务保留串行融合遍历，大任务将输入和参数梯度融合到分组行计算中，并使用 F64
+累加。冻结的输入或参数跳过对应梯度数组和计算；参数求和分组可能改变浮点舍入。
 `CpuInferenceContext` 可为共享池配置独立的 prefill/decode 预算。
 Tensor 句柄使用 `Rc<RefCell<_>>`，不是 `Send`/`Sync`；不同调用方各自持有
 模型和 Tensor 句柄，共享的是数组计算线程池。
 CPU BF16 prefill 通过临时权重分块复用多行输入，长 prompt 同样使用分块路径。
+BF16 权重元素对在完整分块上使用 AVX2 整数转置打包，小分块及其他 CPU
+保留 SSE2 或标量回退。
+双输入均为 BF16 的原生分块矩阵乘直接写入最终输出，省去整块临时结果及其复制重排。
+相邻列块在同一任务中处理，并遵守调用方线程池容量和任务预算。
+较窄的 BF16 输出投影也会依据输入规模和调用方任务容量复用原生分块；
+不适合打包的小型并行计算保留逐行内核，单行解码继续使用原路径。
 支持相应指令的 CPU 使用
 BF16 点积和 F32 累加；混合 F32/F16 激活保留原精度，配合精确权重展开及
 AVX2/FMA 或 AVX-512 计算。其他 CPU 使用通用回退路径，公开 API 保持一致。
+标准 `matmul` 在支持的 x86 CPU 上也会直接按原始跨步打包 F16/BF16/I8
+右矩阵的小块，避免完整 F32 右矩阵副本或整体转置。输入与右矩阵均为 BF16 时
+可使用 AVX-512 BF16 并以 F32 累加；其他原生小块在 F32 计算中展开权重。
+向量和少量输入行可通过 AVX2/FMA 或 AVX-512 直接读取行主序右矩阵的
+F32/F16/BF16/I8 列块，省去打包。小工作量留在调用线程，较大工作量遵守
+调用方的线程池和任务预算。多行窄输出 F32、跨步右矩阵及未覆盖的小形状
+保留通用 GEMM。CPU 矩阵乘法反向会跳过冻结输入的梯度计算。
 no-grad、精度、初始化和设备选择 guard 同样不是 `Send`/`Sync`。
 应在执行计算的线程内创建和销毁这些作用域，以正确恢复线程局部设置。
 
@@ -698,7 +729,7 @@ cargo run --release --bin quantize_safetensors -- \
 | `cpu_backward_bench` | 普通及批量矩阵乘反向 |
 | `cpu_projection_bench` | 投影、QKV 与门控 MLP |
 | `cpu_decode_bench` | 解码工作集与词表 argmax |
-| `cpu_scaling_bench` | 线程池、任务预算与并发调用 |
+| `cpu_scaling_bench` | 线程池、任务预算、并发调用与归一化 |
 | `cuda_cpu_bench` | CPU/CUDA 算子与训练路径 |
 | `prefill_decode_bench` | 真实权重 prefill/decode、回放与采样 |
 | `manual_state_check` | 公开 API、检查点与状态检查 |
@@ -729,83 +760,76 @@ python dev-tools/check_performance.py --threads 8 \
 每次使用新的输出目录；计时应串行执行，避免与构建、独立参考检查争抢资源。
 输出及运行库要求见[基准 runner 文档](./dev-tools/README.md#bounded-performance-runs)。
 
-### 通用算子实测（2026-10-29）
+### 通用算子实测（2026-11-04）
 
-Ryzen 9 8945HX，8 workers，单算子任务上限 8；构建条件同下方模型测量。
-每项预热 5 组、正式测量 7 组，每组 5 次调用，表中为单次调用中位数。
-前向为 no-grad，包含输出分配；反向使用已构建的计算图，计入清梯度、seed 复制和 VJP，
-不含前向与优化器 step。原始样本见[测量明细](./dev-tools/benchmarks/results/2026-10-29.json)。
+Windows x86-64、Ryzen 9 8945HX、8 个工作线程。矩阵乘和注意力的单算子任务上限为 8，
+预热 5 组、正式测量 7 组，每组调用 5 次。前向在 no-grad 下计入输出分配。
+反向复用已构建的计算图，计入清零梯度、复制上游梯度和 VJP。
+`matmul` 计算 `A @ B`，`matmul_transposed_rhs` 计算 `A @ Wᵀ`。
+数据文件记录了被测存储精度下的矩阵步长。[原始样本与构建参数](./dev-tools/benchmarks/results/2026-11-04.json)
 
-| 操作 | 输入 / 权重形状或参数 | 类型 | 布局 | 中位数 ms |
+| 操作 | 形状或参数 | 类型 | 布局 | 中位数 ms |
 | --- | --- | --- | --- | ---: |
-| matmul 前向 | A=[129,1024], W=[1536,1024] | F32 | 跨步 | 2.06412 |
-| matmul 前向 | A=[129,1024], W=[1536,1024] | BF16 | 跨步 | 0.99518 |
-| GQA 前向 | 2 条序列；6 个查询头 / 2 个键值头；查询长度 129 / 键值长度 191；每头查询/键特征 65、值特征 33；因果遮罩，查询偏移 31，最后一条序列全遮挡 | F32 | 跨步 | 0.31784 |
-| matmul 反向 VJP | A=[193,257], W=[257,257] | F32 | 跨步 | 1.39080 |
-| batch_matmul 反向 VJP | A=[2,3,65,129], B=[2,3,129,257] | F32 | 连续 | 0.64416 |
+| `matmul` 前向 | `A=[129,1024]`, `B=[1024,1536]` | F32 | 跨步 | 2.85434 |
+| `matmul` 前向 | `A=[129,1024]`, `B=[1024,1536]` | BF16 | 跨步 | 0.91118 |
+| `matmul_transposed_rhs` 前向 | `A=[129,1024]`, `W=[1536,1024]` | F32 | 跨步 | 2.45120 |
+| `matmul_transposed_rhs` 前向 | `A=[129,1024]`, `W=[1536,1024]` | BF16 | 跨步 | 2.76784 |
+| GQA 前向 | 2 条序列，6 个查询头、2 个键值头，查询长度 129、键值长度 191，每头查询和键特征 65、值特征 33，因果遮罩，查询偏移 31，末条序列全遮挡 | F32 | 跨步 | 0.33592 |
+| `matmul_transposed_rhs` 反向 VJP | `A=[193,257]`, `W=[257,257]` | F32 | 跨步 | 1.43494 |
+| `batch_matmul` 反向 VJP | `A=[2,3,65,129]`, `B=[2,3,129,257]` | F32 | 连续 | 0.67626 |
 
-### 模型实测（2026-10-29）
+归一化使用自动任务分组，预热调用 5 次，正式测量 7 组，每组调用 30 次。
+形状为 `[行数, 归一化特征数]`。反向测量完整 VJP，并计入清零梯度和复制上游梯度。
 
-环境：Windows/x86-64、Ryzen 9 8945HX、RTX 5070 Laptop（8 GB），CPU 使用八个计算线程。
-Rust 1.98.1 release 构建使用 `target-cpu=native`，启用
+| 算子 | 形状 | F32 中位数 µs | BF16 中位数 µs |
+| --- | --- | ---: | ---: |
+| `rms_norm` | `[65,513]` | 56.593 | 51.633 |
+| `rms_norm_backward` | `[65,513]` | 96.607 | 116.770 |
+| `rms_norm_backward` | `[512,2048]` | 1876.883 | — |
+| `layer_norm` | `[65,513]` | 66.163 | 79.343 |
+| `layer_norm_backward` | `[65,513]` | 230.740 | 226.287 |
+| `layer_norm_backward` | `[512,2048]` | 4398.540 | — |
+
+### 模型实测（2026-11-04）
+
+Windows x86-64、Ryzen 9 8945HX、RTX 5070 Laptop GPU（8 GB），CPU 使用 8 个工作线程。
+Lumen 使用 Rust 1.98.1、`--release`、`-C target-cpu=native` 和
 `dev-tools,cuda,x86-fp-kernels,x86-int8-kernels`。
-[测量明细](./dev-tools/benchmarks/results/2026-10-29.json) 包含被测代码指纹、构建参数、
-权重哈希、提示、回放 ID、逐轮预热/正式样本、范围和中位数。
+PyTorch 2.14.0+cu130 与 Transformers 5.17.0 使用 SDPA 和 DynamicCache，
+CPU 计算线程数为 8，interop 线程数为 1，关闭 TF32、低精度归约和图编译。
+Lumen 预分配容量为 1024 的 KV 缓存。[源码指纹、模型资产和样本](./dev-tools/benchmarks/results/2026-11-04.json)
 
-参考为 PyTorch 2.14.0+cu130 / Transformers 5.17.0、SDPA + DynamicCache，
-八个 CPU 计算线程、一个 interop 线程，关闭 TF32、低精度归约和图编译。
-每进程预热两轮、正式测量五轮，串行执行，不与编译或参考检查争抢资源。
-双方使用相同模型、浮点存储精度、提示和固定 64-token decode 回放。
-浮点行的权重/激活/KV 类型对应一致。I8 使用 BF16 runtime/激活/KV，关闭动态激活 I8，
-不据此计算 PyTorch I8 倍速。
+每行是各引擎预热 2 次、正式测量 5 次的中位数。两边使用相同提示、固定 64 步解码，
+浮点配置的权重、激活与 KV 精度一致。前向计时包含 argmax，模型加载与输入构建在计时外。
+I8 行使用 I8 权重、BF16 激活与 KV，仅列 Lumen 实测值。
 
-表中为中位数，不计模型加载和外部输入构建，包含 forward、argmax、主机 token 完成及
-最后一次 decode forward。Lumen 使用预分配 KV，PyTorch 使用 DynamicCache。
-各行每个引擎五个正式样本；TinyLlama CUDA BF16、Qwen3 CUDA F32/F16/BF16 因任一
-引擎首轮 prefill 极差/中位数超过 25%，追加一次逆序配对，各有十个正式样本。
-所有样本均保留。
+#### TinyLlama-1.1B（46 token 提示）
 
-#### TinyLlama-1.1B (46 token 提示)
-
-| 设备 / 权重 | Lumen prefill ms | PyTorch prefill ms | Lumen decode token/s | PyTorch decode token/s |
+| 设备 / 权重 | Lumen 预填充 ms | PyTorch 预填充 ms | Lumen 解码 step/s | PyTorch 解码 step/s |
 | --- | ---: | ---: | ---: | ---: |
-| cpu / F32 | 291.398 | 275.976 | 11.51 | 8.65 |
-| cpu / F16 | 291.338 | 1162.755 | 21.01 | 18.80 |
-| cpu / BF16 | 248.226 | 97.590 | 21.11 | 16.93 |
-| cpu / I8 (BF16 runtime/KV) | 256.487 | — | 35.90 | — |
-| cuda / F32 | 31.670 | 22.482 | 49.55 | 60.44 |
-| cuda / F16 | 19.992 | 16.739 | 85.82 | 63.34 |
-| cuda / BF16 | 19.677 | 19.381 | 88.43 | 54.55 |
-| cuda / I8 (BF16 runtime/KV) | 38.883 | — | 148.03 | — |
+| cpu / F32 | 441.550 | 410.303 | 11.51 | 7.62 |
+| cpu / F16 | 267.890 | 1767.148 | 20.27 | 16.06 |
+| cpu / BF16 | 245.308 | 158.047 | 18.96 | 14.87 |
+| cpu / I8 | 315.466 | — | 32.70 | — |
+| cuda / F32 | 37.014 | 28.952 | 48.31 | 50.66 |
+| cuda / F16 | 25.185 | 23.569 | 76.54 | 45.83 |
+| cuda / BF16 | 25.929 | 23.275 | 75.37 | 44.98 |
+| cuda / I8 | 51.057 | — | 127.01 | — |
 
-#### Qwen3-0.6B (36 token 提示)
+#### Qwen3-0.6B（36 token 提示）
 
-| 设备 / 权重 | Lumen prefill ms | PyTorch prefill ms | Lumen decode token/s | PyTorch decode token/s |
+| 设备 / 权重 | Lumen 预填充 ms | PyTorch 预填充 ms | Lumen 解码 step/s | PyTorch 解码 step/s |
 | --- | ---: | ---: | ---: | ---: |
-| cpu / F32 | 163.534 | 131.526 | 17.86 | 11.83 |
-| cpu / F16 | 194.189 | 488.894 | 28.33 | 24.27 |
-| cpu / BF16 | 145.108 | 64.487 | 27.90 | 22.74 |
-| cpu / I8 (BF16 runtime/KV) | 145.368 | — | 41.54 | — |
-| cuda / F32 | 21.696 | 26.651 | 56.37 | 34.23 |
-| cuda / F16 | 32.385 | 30.793 | 65.64 | 22.22 |
-| cuda / BF16 | 31.120 | 30.202 | 68.36 | 24.85 |
-| cuda / I8 (BF16 runtime/KV) | 32.170 | — | 92.84 | — |
+| cpu / F32 | 216.199 | 232.537 | 17.65 | 10.35 |
+| cpu / F16 | 242.245 | 613.837 | 27.24 | 20.69 |
+| cpu / BF16 | 131.692 | 94.021 | 26.09 | 18.45 |
+| cpu / I8 | 213.505 | — | 34.48 | — |
+| cuda / F32 | 33.181 | 35.572 | 44.67 | 29.02 |
+| cuda / F16 | 56.987 | 39.096 | 50.68 | 26.48 |
+| cuda / BF16 | 55.199 | 38.331 | 51.43 | 26.96 |
+| cuda / I8 | 54.523 | — | 75.00 | — |
 
-#### CPU BF16 长输入
-
-| 模型 | 输入 token | Lumen prefill ms | PyTorch prefill ms |
-| --- | ---: | ---: | ---: |
-| TinyLlama-1.1B | 360 | 1502.552 | 646.172 |
-| Qwen3-0.6B | 350 | 939.386 | 370.206 |
-
-长输入使用 BF16 权重/激活/KV、2048 上下文容量，每个引擎预热两次、测量五次。
-仅用一次固定 decode forward 完成回放，此处只解释 prefill；短输入上下文容量为 512。
-固定回放是计时控制，不是自由生成质量测试。
-
-TinyLlama/Qwen3 的 CPU BF16 短输入 prefill 耗时分别约为 PyTorch 的 2.54/2.25 倍；
-TinyLlama CUDA F32 decode 为 49.55 对 60.44 token/s。
-GPU 样本存在波动，范围保存在明细中。结果依赖形状、精度、缓存策略和硬件，
-不代表编译图、StaticCache 或专用推理引擎，也不能用不同日期或代码快照直接推断版本加速。
+较早的数据还包含 CPU BF16 长提示预填充实测。[2026-10-29 测量数据](./dev-tools/benchmarks/results/2026-10-29.json)
 
 ## 测试
 
@@ -847,6 +871,11 @@ I8 scale/舍入/饱和边界、空输出及梯度、VJP、冻结输入、计算�
 长时测试需显式选择，缺少真实模型资产时会报告跳过。
 CI 配置见[便携 CPU 工作流](./.github/workflows/operator-accuracy.yml)。
 
+2026-11-04 的验证通过了 685 项本机 CPU/CUDA 和 408 项便携库测试。
+两套配置各通过 17 项工具测试与 7 项文档测试。72 条 1000 步训练曲线均整体下降。
+TinyLlama 和 Qwen3 的真实权重 logits 与 PyTorch 对照通过，简单英文生成未见显著乱码。
+[验证与测量数据](./dev-tools/benchmarks/results/2026-11-04.json)
+
 ## 仓库结构
 
 主要目录与入口：
@@ -862,6 +891,7 @@ Lumen/
 │   ├── lib.rs
 │   ├── main.rs
 │   ├── bin/quantize_safetensors.rs
+│   ├── device.rs
 │   ├── autograd/
 │   ├── cpu/
 │   ├── arch.rs
@@ -884,6 +914,8 @@ Lumen/
 │   │   ├── arithmetic.rs
 │   │   ├── shape.rs
 │   │   ├── matmul/
+│   │   ├── cpu_gemm.rs
+│   │   ├── cpu_gemm/
 │   │   └── cuda/
 │   └── models/
 │       ├── llama.rs
@@ -897,7 +929,7 @@ Lumen/
     ├── README.md
     ├── bin/
     ├── benchmarks/
-    │   └── results/2026-10-29.json
+    │   └── results/
     ├── check_release.ps1
     ├── check_operator_accuracy.ps1
     ├── check_performance.py
@@ -905,9 +937,11 @@ Lumen/
 ```
 
 `src/` 只放库与正式命令行程序的实现。`cpu/mod.rs` 负责 CPU 调度和执行上下文，
-`cpu/profiling.rs` 是它的可选性能采样子模块；CPU 数值算子仍归入 `ops/`。
+`cpu/profiling.rs` 是它的可选性能采样子模块；CPU 数值算子归入 `ops/`。
+`ops/cpu_gemm.rs` 管理 CPU 矩阵内核入口，`ops/cpu_gemm/` 包含打包和计算实现。
 
-`autograd/` 按 Tensor 构造、存储、量化、视图、设备迁移、梯度执行和优化器更新拆分。
+`device.rs` 统一设备类型、严格执行策略以及 Tensor 的设备迁移和同步；旧的 `autograd::Device` 等导入仍兼容。
+`autograd/` 按 Tensor 构造、存储、量化、视图、梯度执行和优化器更新拆分。
 `ops/matmul/` 按点积、MatVec、融合投影、prefill、反向计算和 CUDA 路由分组。
 `ops/cuda/api/` 放算子接口封装，私有 `imp/` 目录放参数校验、内存与调度及独立的 FFI 声明。
 Tensor 和算子的公共访问路径由模块入口保留。

@@ -63,7 +63,7 @@ fn lowp_batch_triplets_keep_native_storage_and_strided_inputs() {
                 if input_dtype == DType::F16 && dtype == DType::F16 {
                     expected.mapv_inplace(|x| f16::from_f32(x).to_f32());
                 }
-                let got = no_grad(|| matmul(&a, &b));
+                let got = no_grad(|| matmul_transposed_rhs(&a, &b));
                 for (&actual, &reference) in got.data().iter().zip(expected.iter()) {
                     // F32 summation orders can straddle an F16 rounding
                     // midpoint. Permit one F16 ULP only for F16 output.
@@ -92,7 +92,7 @@ fn cuda_matmul_backward_outputs_release_without_reference_cycles() {
         return;
     }
     cuda::set_enabled(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for batched in [false, true] {
         let (a_shape, b_shape) = if batched {
             (vec![1, 1, 2, 3], vec![1, 1, 3, 2])
@@ -104,7 +104,7 @@ fn cuda_matmul_backward_outputs_release_without_reference_cycles() {
         let output = if batched {
             batch_matmul(&a, &b)
         } else {
-            matmul(&a, &b)
+            matmul_transposed_rhs(&a, &b)
         };
         let weak = Rc::downgrade(&output.0);
         output.backward();
@@ -241,7 +241,7 @@ fn bf16_prefill_large_row_counts_keep_native_and_mixed_precision() {
 }
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution;
+use crate::device::set_strict_device_execution;
 use crate::ops::arithmetic::sum;
 use crate::precision::{PrecisionConfig, with_precision_config};
 #[cfg(feature = "cuda")]
@@ -376,7 +376,7 @@ fn compute_conversion_buffers_bound_retention_and_survive_nested_calls() {
 #[test]
 fn reused_compute_views_refresh_mutated_mixed_precision_inputs_and_gradients() {
     use crate::accuracy_gate::{check, ordered, tensor, values};
-    use crate::autograd::Device;
+    use crate::device::Device;
     let (m, k, n) = (7, 5, 3);
     for xd in [DType::F16, DType::BF16] {
         for wd in [DType::F32, DType::F16, DType::BF16] {
@@ -1062,7 +1062,7 @@ fn matmul_training_forward_keeps_low_precision_storage_until_backward() {
                     assert!(!a.has_host_f32_data());
                     assert!(!b.has_host_f32_data());
 
-                    let out = matmul(&a, &b);
+                    let out = matmul_transposed_rhs(&a, &b);
                     assert_eq!(out.dtype(), DType::F32);
                     assert_eq!(out.shape_vec(), vec![2, 3]);
                     assert!(
@@ -1378,7 +1378,7 @@ fn matmul_no_grad_preserves_bf16_output_dtype() {
     );
 
     let ref_out = no_grad(|| {
-        matmul(
+        matmul_transposed_rhs(
             &make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::F32),
             &make_tensor(
                 &[3, 4],
@@ -1389,7 +1389,7 @@ fn matmul_no_grad_preserves_bf16_output_dtype() {
             ),
         )
     });
-    let out = no_grad(|| matmul(&a, &b));
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
 
     assert_eq!(a.dtype(), DType::BF16);
     assert_eq!(b.dtype(), DType::BF16);
@@ -1440,7 +1440,7 @@ fn matmul_same_dtype_bf16_parameter_uses_native_storage_for_generic_gemm() {
                 );
             }
 
-            let out = no_grad(|| matmul(&a, &b));
+            let out = no_grad(|| matmul_transposed_rhs(&a, &b));
             assert_eq!(out.dtype(), DType::BF16);
 
             let inner = b.0.borrow();
@@ -1482,7 +1482,7 @@ fn matmul_mixed_f32_input_uses_native_low_precision_parameter_storage() {
                 );
             }
 
-            let out = no_grad(|| matmul(&a, &b));
+            let out = no_grad(|| matmul_transposed_rhs(&a, &b));
             assert_eq!(out.dtype(), DType::F32);
 
             let inner = b.0.borrow();
@@ -1558,7 +1558,7 @@ fn matmul_no_grad_preserves_f16_output_dtype() {
     );
 
     let ref_out = no_grad(|| {
-        matmul(
+        matmul_transposed_rhs(
             &make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::F32),
             &make_tensor(
                 &[3, 4],
@@ -1569,7 +1569,7 @@ fn matmul_no_grad_preserves_f16_output_dtype() {
             ),
         )
     });
-    let out = no_grad(|| matmul(&a, &b));
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
 
     assert_eq!(a.dtype(), DType::F16);
     assert_eq!(b.dtype(), DType::F16);
@@ -1612,12 +1612,12 @@ fn matmul_no_grad_preserves_i8_output_dtype() {
     let a_q = ref_a_q.data_ref().iter().copied().collect::<Vec<_>>();
     let b_q = ref_b_q.data_ref().iter().copied().collect::<Vec<_>>();
     let ref_out = no_grad(|| {
-        matmul(
+        matmul_transposed_rhs(
             &make_tensor(&[1, 4], a_q, DType::F32),
             &make_tensor(&[3, 4], b_q, DType::F32),
         )
     });
-    let out = no_grad(|| matmul(&a, &b));
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
 
     assert_eq!(out.dtype(), DType::I8);
 
@@ -1648,9 +1648,9 @@ fn cuda_matmul_matches_cpu_reference() {
     let a = make_tensor(&[8, 32], sample_f32(8 * 32), DType::F32);
     let b = make_tensor(&[6, 32], sample_f32(6 * 32), DType::F32);
 
-    let out = no_grad(|| matmul(&a, &b));
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
     crate::ops::cuda::set_enabled(false);
-    let reference = no_grad(|| matmul(&a, &b));
+    let reference = no_grad(|| matmul_transposed_rhs(&a, &b));
 
     let out_vals = out.data_ref().iter().copied().collect::<Vec<_>>();
     let ref_vals = reference.data_ref().iter().copied().collect::<Vec<_>>();
@@ -1705,12 +1705,12 @@ fn cuda_matmul_preserves_bf16_dtype_in_strict_mode() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
-    let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+    let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
     assert!(out.is_cuda());
     assert_eq!(out.dtype(), DType::BF16);
     assert!(
@@ -1755,12 +1755,12 @@ fn cuda_matmul_preserves_f16_dtype_in_strict_mode() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
-    let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+    let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
     assert!(out.is_cuda());
     assert_eq!(out.dtype(), DType::F16);
     assert!(
@@ -1805,9 +1805,9 @@ fn cuda_bf16_matmul_native_view_materializes_cuda_values() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -1856,12 +1856,12 @@ fn cuda_matmul_preserves_i8_dtype_in_strict_mode() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
-    let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+    let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
     assert!(out.is_cuda());
     assert_eq!(out.dtype(), DType::I8);
     {
@@ -2072,7 +2072,7 @@ fn cuda_resident_f32_i8_gemm_unpacks_signed_bytes_and_partial_vectors_exactly() 
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_resident_f32_i8_gemm_training_updates_tiled_weights_and_decreases_loss() {
-    use crate::autograd::set_strict_device_execution_scoped;
+    use crate::device::set_strict_device_execution_scoped;
     use crate::loss::MSELoss;
     use crate::optim::{Optimizer, SGD};
     use crate::precision::ParameterQuantization;
@@ -2113,7 +2113,7 @@ fn cuda_resident_f32_i8_gemm_training_updates_tiled_weights_and_decreases_loss()
             .with_dynamic_i8_master_weights();
         let mut losses = Vec::new();
         for _ in 0..32 {
-            let output = matmul(&input, &weight);
+            let output = matmul_transposed_rhs(&input, &weight);
             let loss = MSELoss::apply(&output, &target);
             losses.push(loss.data_ref().iter().copied().next().unwrap());
             loss.backward();
@@ -2305,11 +2305,11 @@ fn cuda_training_bf16_i8_matmul_uses_direct_forward_for_f32_backward_consistency
     let b_cuda = b_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out_cuda = matmul(&a_cuda, &b_cuda);
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out_cuda = matmul_transposed_rhs(&a_cuda, &b_cuda);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
-    let out_cpu = matmul(&a_cpu, &b_cpu);
+    let out_cpu = matmul_transposed_rhs(&a_cpu, &b_cpu);
 
     for (got, expected) in out_cuda.data_ref().iter().zip(out_cpu.data_ref().iter()) {
         assert!(
@@ -2353,9 +2353,9 @@ fn cuda_resident_bf16_i8_matmul_matches_cpu_reference_without_host_f32() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -2376,7 +2376,7 @@ fn cuda_resident_bf16_i8_matmul_matches_cpu_reference_without_host_f32() {
         assert!(inner.cuda_i8_data.is_none());
     }
 
-    let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+    let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
     for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
         assert!(
             (got - expect).abs() < 3e-2,
@@ -2402,9 +2402,9 @@ fn cuda_resident_f16_i8_matmul_matches_cpu_reference_without_host_f32() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -2419,7 +2419,7 @@ fn cuda_resident_f16_i8_matmul_matches_cpu_reference_without_host_f32() {
         "mixed F16xI8 CUDA matmul should keep f32 output resident until requested"
     );
 
-    let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+    let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
     for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
         assert!(
             (got - expect).abs() < 3e-2,
@@ -2452,9 +2452,9 @@ fn cuda_resident_f32_i8_matmul_matches_cpu_reference_without_host_f32_weight() {
     assert!(!b.has_host_f32_data());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
-    let out = no_grad(|| matmul(&a, &b));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(true);
+    let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -2467,7 +2467,7 @@ fn cuda_resident_f32_i8_matmul_matches_cpu_reference_without_host_f32_weight() {
         !out.has_host_f32_data(),
         "F32xI8 CUDA matmul should keep f32 output resident until requested"
     );
-    let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+    let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
     for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
         assert!(
             (got - expect).abs() < 3e-2,
@@ -2503,9 +2503,9 @@ fn cuda_resident_i8_floatlike_matmul_matches_cpu_reference_without_host_f32_inpu
         }
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
-        let out = no_grad(|| matmul(&a, &b));
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(true);
+        let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+        crate::device::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
 
         assert!(out.is_cuda());
@@ -2519,7 +2519,7 @@ fn cuda_resident_i8_floatlike_matmul_matches_cpu_reference_without_host_f32_inpu
             "I8x{rhs_dtype:?} CUDA matmul should keep f32 output resident until requested"
         );
 
-        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
         for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
             assert!(
                 (got - expect).abs() < 5e-2,
@@ -2547,9 +2547,9 @@ fn cuda_resident_single_row_float_i8_matvec_matches_cpu_reference_without_host_f
         assert!(!b.has_host_f32_data());
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
-        let out = no_grad(|| matmul(&a, &b));
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(true);
+        let out = no_grad(|| matmul_transposed_rhs(&a, &b));
+        crate::device::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
 
         assert!(out.is_cuda());
@@ -2558,7 +2558,7 @@ fn cuda_resident_single_row_float_i8_matvec_matches_cpu_reference_without_host_f
             !b.has_host_f32_data(),
             "{dtype:?}xI8 CUDA matvec should not materialize I8 weights as host f32"
         );
-        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
         for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
             assert!(
                 (got - expect).abs() < 5e-2,
@@ -2642,7 +2642,7 @@ fn cuda_resident_mixed_i8_argmax_matches_cpu_logits_argmax_without_host_f32_weig
         }
         .expect("CUDA mixed argmax");
 
-        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        let reference = no_grad(|| matmul_transposed_rhs(&a.to_cpu(), &b.to_cpu()));
         let logits = reference.data_ref();
         let expected = (0..batch)
             .map(|row| {
@@ -3002,9 +3002,9 @@ fn cuda_batch_matmul_preserves_bf16_dtype_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| batch_matmul(&lhs, &rhs));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let reference = no_grad(|| batch_matmul(&lhs.to_cpu(), &rhs.to_cpu()));
@@ -3050,9 +3050,9 @@ fn cuda_batch_matmul_mixed_i8_matches_cpu_reference_without_host_f32_rhs() {
         assert!(!rhs.has_host_f32_data());
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
+        crate::device::set_strict_device_execution(true);
         let out = no_grad(|| batch_matmul(&lhs, &rhs));
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
 
         assert!(out.is_cuda());
@@ -3102,9 +3102,9 @@ fn cuda_batch_matmul_i8_floatlike_matches_cpu_reference_without_host_f32_lhs() {
         }
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
+        crate::device::set_strict_device_execution(true);
         let out = no_grad(|| batch_matmul(&lhs, &rhs));
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
 
         assert!(out.is_cuda());
@@ -3136,7 +3136,7 @@ fn cuda_batch_matmul_lowp_uses_resident_forward_buffer_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let lhs = make_tensor(&[1, 1, 2, 3], vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0], dtype).to_cuda();
@@ -3180,7 +3180,7 @@ fn cuda_batch_matmul_lowp_uses_resident_forward_buffer_in_strict_mode() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3192,7 +3192,7 @@ fn cuda_batch_matmul_lowp_backward_outputs_f32_grads() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let lhs = make_grad_tensor(&[1, 1, 2, 3], vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0]);
@@ -3225,7 +3225,7 @@ fn cuda_batch_matmul_lowp_backward_outputs_f32_grads() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3240,7 +3240,7 @@ fn cuda_batch_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
     let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75];
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for lhs_dtype in [DType::F16, DType::F32, DType::BF16] {
         let lhs_cpu = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
@@ -3285,7 +3285,7 @@ fn cuda_batch_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3300,7 +3300,7 @@ fn cuda_batch_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads
     let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75];
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for rhs_dtype in [DType::F16, DType::F32, DType::BF16] {
         let lhs_cpu = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
@@ -3353,7 +3353,7 @@ fn cuda_batch_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3365,7 +3365,7 @@ fn cuda_batch_matmul_lowp_backward_handles_asymmetric_gradient_sizes() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for (m, n, lhs_dtype, rhs_dtype) in [
         (2, 5, DType::BF16, DType::BF16),
@@ -3416,7 +3416,7 @@ fn cuda_batch_matmul_lowp_backward_handles_asymmetric_gradient_sizes() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3431,7 +3431,7 @@ fn cuda_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
     let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75, 1.25, -0.5, 0.75];
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for lhs_dtype in [DType::F16, DType::F32, DType::BF16] {
         let lhs_cpu = make_grad_tensor(&[2, 3], lhs_data.clone());
@@ -3446,10 +3446,10 @@ fn cuda_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
         rhs_cuda.cast_inplace(DType::I8);
         let rhs_cuda = rhs_cuda.to_cuda();
 
-        let loss_cuda = sum(&matmul(&lhs_cuda, &rhs_cuda));
+        let loss_cuda = sum(&matmul_transposed_rhs(&lhs_cuda, &rhs_cuda));
         loss_cuda.backward();
 
-        let loss_cpu = sum(&matmul(&lhs_cpu, &rhs_cpu));
+        let loss_cpu = sum(&matmul_transposed_rhs(&lhs_cpu, &rhs_cpu));
         loss_cpu.backward();
 
         assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
@@ -3476,7 +3476,7 @@ fn cuda_matmul_mixed_i8_backward_reads_typed_data_and_writes_f32_grads() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3491,7 +3491,7 @@ fn cuda_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads() {
     let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75, 1.25, -0.5, 0.75];
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for rhs_dtype in [DType::F16, DType::F32, DType::BF16] {
         let lhs_cpu = make_grad_tensor(&[2, 3], lhs_data.clone());
@@ -3506,10 +3506,10 @@ fn cuda_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads() {
         rhs_cuda.cast_inplace(rhs_dtype);
         let rhs_cuda = rhs_cuda.to_cuda();
 
-        let loss_cuda = sum(&matmul(&lhs_cuda, &rhs_cuda));
+        let loss_cuda = sum(&matmul_transposed_rhs(&lhs_cuda, &rhs_cuda));
         loss_cuda.backward();
 
-        let loss_cpu = sum(&matmul(&lhs_cpu, &rhs_cpu));
+        let loss_cpu = sum(&matmul_transposed_rhs(&lhs_cpu, &rhs_cpu));
         loss_cpu.backward();
 
         assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
@@ -3536,7 +3536,7 @@ fn cuda_matmul_i8_floatlike_backward_reads_typed_data_and_writes_f32_grads() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3556,12 +3556,12 @@ fn cuda_matmul_backward_matches_cpu_reference_in_strict_mode() {
 
     crate::ops::cuda::set_enabled(true);
     set_strict_device_execution(true);
-    let loss_cuda = sum(&matmul(&a_cuda, &b_cuda));
+    let loss_cuda = sum(&matmul_transposed_rhs(&a_cuda, &b_cuda));
     loss_cuda.backward();
     set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
-    let loss_cpu = sum(&matmul(&a_cpu, &b_cpu));
+    let loss_cpu = sum(&matmul_transposed_rhs(&a_cpu, &b_cpu));
     loss_cpu.backward();
 
     assert!(!a_cuda.has_host_grad());

@@ -1,6 +1,101 @@
 use super::*;
 
 #[test]
+fn standard_rhs_packing_preserves_bits_strides_and_overwrites_padding() {
+    use ndarray::{Array2, s};
+    for (k, n) in [(257, 257), (129, 67), (33, 17), (8, 9), (1, 1)] {
+        let weights = Array2::from_shape_fn((k, n), |(kk, col)| {
+            bf16::from_bits(((kk * n + col) as u16).wrapping_mul(197))
+        });
+        let strided = weights.t().as_standard_layout().to_owned().reversed_axes();
+        let row = weights.slice(s![0..1, ..]);
+        for view in [
+            weights.view(),
+            strided.view(),
+            weights.slice(s![..;-1, ..;-1]),
+            row.broadcast((k, n)).unwrap(),
+        ] {
+            for lanes in [8, 16] {
+                let mut packed = vec![bf16::from_bits(u16::MAX); k * lanes];
+                for first in (0..n.div_ceil(CHANNELS) * CHANNELS).step_by(lanes) {
+                    pack_standard_panel(view, first, lanes, &mut packed);
+                    for kk in 0..k {
+                        for c in 0..lanes {
+                            let expected = if first + c < n {
+                                view[(kk, first + c)].to_bits()
+                            } else {
+                                0
+                            };
+                            assert_eq!(packed[kk * lanes + c].to_bits(), expected);
+                        }
+                    }
+                }
+            }
+            let mut pairs = vec![u32::MAX; k.div_ceil(2) * CHANNELS];
+            for first in (0..n).step_by(CHANNELS) {
+                pack_bf16_standard(view, first, &mut pairs);
+                for pair in 0..k.div_ceil(2) {
+                    for c in 0..CHANNELS {
+                        for half in 0..2 {
+                            let expected = if first + c < n && pair * 2 + half < k {
+                                view[(pair * 2 + half, first + c)].to_bits()
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                (pairs[pair * CHANNELS + c] >> (half * 16)) as u16,
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn half_panel_packing_preserves_all_bits_and_reused_tails() {
+    fn check<T: Copy + Default>(from_bits: fn(u16) -> T, to_bits: fn(T) -> u16) {
+        let mut packed = Vec::new();
+        let cases = std::iter::once((257usize, 257usize)).chain(
+            [513usize, 129, 33, 32, 31, 17, 16, 15, 9, 8, 7, 2, 1]
+                .into_iter()
+                .flat_map(|k| [25usize, 17, 16, 15, 9, 8, 7, 1].map(|n| (k, n))),
+        );
+        for (k, n) in cases {
+            // The 257x257 case covers every 16-bit representation, including
+            // signed zero, subnormals, infinities and all NaN payloads.
+            let weights: Vec<T> = (0..n * k)
+                .map(|i| from_bits((i as u16).wrapping_mul(197)))
+                .collect();
+            for lanes in [16, 8] {
+                packed.resize(k * lanes, from_bits(u16::MAX));
+                for first in (0..n.div_ceil(CHANNELS) * CHANNELS).step_by(lanes) {
+                    pack_native_panel(&weights, k, n, first, lanes, &mut packed);
+                    for kk in 0..k {
+                        for c in 0..lanes {
+                            let expected = if first + c < n {
+                                to_bits(weights[(first + c) * k + kk])
+                            } else {
+                                to_bits(T::default())
+                            };
+                            assert_eq!(
+                                to_bits(packed[kk * lanes + c]),
+                                expected,
+                                "K={k} N={n} first={first} lanes={lanes} k={kk} channel={c}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    check(f16::from_bits, f16::to_bits);
+    check(bf16::from_bits, bf16::to_bits);
+}
+
+#[test]
 fn bf16_weight_panels_preserve_f32_inputs_on_avx2_and_avx512() {
     for wide in [false, true] {
         let supported = if wide {

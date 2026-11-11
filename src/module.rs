@@ -1,5 +1,6 @@
 // src/module.rs
-use crate::autograd::{Device, Tensor, TensorRawData, set_inference_mode};
+use crate::autograd::{Tensor, TensorRawData, set_inference_mode};
+use crate::device::Device;
 use crate::precision::{DType, ParameterQuantization, default_parameter_quantization};
 use serde::{Deserialize, Serialize};
 use std::fs::File;

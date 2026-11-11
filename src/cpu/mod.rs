@@ -4,7 +4,10 @@
 //! global pool or moves a Tensor/graph to another thread. A scoped policy applies
 //! to integrated MatVec, CPU matmul/batch-matmul forward and backward, fused
 //! projections, argmax, prefill/inference attention and native low-precision
-//! optimizer-state kernels; other operators retain their existing scheduling.
+//! optimizer-state kernels, plus RMSNorm/LayerNorm forward rows and RMSNorm
+//! backward rows/reductions, including LayerNorm backward. Other operators
+//! retain their existing scheduling.
+use rayon::iter::plumbing::{Producer, ProducerCallback};
 use rayon::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
@@ -215,6 +218,55 @@ fn dispatch<R: Send>(units: usize, work: usize, f: impl FnOnce(usize) -> R + Sen
     }
 }
 
+// Split existing tiles into exactly `tasks` nonempty, balanced groups. Splitting
+// the producer transfers ownership of disjoint views/slices without collecting
+// them into temporary Vecs. Only leaf groups enter the numerical kernel region.
+struct BalancedGroups<'a, F> {
+    units: usize,
+    tasks: usize,
+    f: &'a F,
+}
+
+impl<T, F> ProducerCallback<T> for BalancedGroups<'_, F>
+where
+    F: Fn(T) + Sync,
+{
+    type Output = ();
+
+    fn callback<P: Producer<Item = T>>(self, producer: P) {
+        fn run<P, F>(producer: P, units: usize, tasks: usize, f: &F)
+        where
+            P: Producer,
+            F: Fn(P::Item) + Sync,
+        {
+            if tasks == 1 {
+                kernel(|| producer.into_iter().for_each(f));
+                return;
+            }
+            let left_tasks = tasks / 2;
+            // Each group gets units/tasks tiles, with one extra tile for the
+            // first units%tasks groups. This avoids overflow from units*tasks.
+            let left_units = (units / tasks) * left_tasks + (units % tasks).min(left_tasks);
+            let (left, right) = producer.split_at(left_units);
+            rayon::join(
+                || run(left, left_units, left_tasks, f),
+                || run(right, units - left_units, tasks - left_tasks, f),
+            );
+        }
+        debug_assert!(self.tasks > 0 && self.tasks <= self.units);
+        run(producer, self.units, self.tasks, self.f);
+    }
+}
+
+fn for_each_balanced<I, F>(iter: I, tasks: usize, f: &F)
+where
+    I: IndexedParallelIterator,
+    F: Fn(I::Item) + Sync,
+{
+    let units = iter.len();
+    iter.with_producer(BalancedGroups { units, tasks, f });
+}
+
 // Group existing microkernel tiles without changing their numerical order or
 // tail handling. At most `tasks` groups execute concurrently. Each group marks
 // itself as a kernel region, so recursively scheduled numerical work is serial.
@@ -234,15 +286,7 @@ where
                 .enumerate()
                 .for_each(|item| kernel(|| f(item)));
         } else {
-            // A capped group owns its iterator items, including disjoint mutable
-            // ndarray views. No caller-side list is needed on the native path.
-            let per_group = units.div_ceil(tasks);
-            iter.into_par_iter()
-                .enumerate()
-                .chunks(per_group)
-                .for_each(|items| {
-                    kernel(|| items.into_iter().for_each(&f));
-                });
+            for_each_balanced(iter.into_par_iter().enumerate(), tasks, &f);
         }
     });
 }
@@ -397,6 +441,138 @@ pub(crate) fn map_reduce<R: Send>(
                 })
             })
             .reduce(&identity, &reduce)
+    })
+}
+
+// Reuse one accumulator per row group rather than allocating one per item.
+// Grouping may change floating-point reductions; callers validate numerically.
+pub(crate) fn fold_reduce<R: Send>(
+    units: usize,
+    work: usize,
+    identity: impl Fn() -> R + Send + Sync,
+    fold: impl Fn(R, usize) -> R + Send + Sync,
+    reduce: impl Fn(R, R) -> R + Send + Sync,
+) -> R {
+    dispatch(units, work, |tasks| {
+        if tasks == 1 {
+            return (0..units).fold(identity(), fold);
+        }
+        if tasks >= units {
+            return (0..units)
+                .into_par_iter()
+                .fold(|| kernel(&identity), |acc, i| kernel(|| fold(acc, i)))
+                .reduce(|| kernel(&identity), |a, b| kernel(|| reduce(a, b)));
+        }
+        let per_group = units.div_ceil(tasks);
+        (0..units.div_ceil(per_group))
+            .into_par_iter()
+            .map(|group| {
+                kernel(|| {
+                    let start = group * per_group;
+                    (start..start.saturating_add(per_group).min(units)).fold(identity(), &fold)
+                })
+            })
+            .reduce(|| kernel(&identity), |a, b| kernel(|| reduce(a, b)))
+    })
+}
+
+// Own disjoint iterator items while retaining one accumulator per group.
+struct FoldGroups<'a, R, Identity, F, Reduce> {
+    units: usize,
+    tasks: usize,
+    identity: &'a Identity,
+    fold: &'a F,
+    reduce: &'a Reduce,
+    result: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<T: Send, R: Send, Identity, F, Reduce> ProducerCallback<T>
+    for FoldGroups<'_, R, Identity, F, Reduce>
+where
+    Identity: Fn() -> R + Sync,
+    F: Fn(R, T) -> R + Sync,
+    Reduce: Fn(R, R) -> R + Sync,
+{
+    type Output = R;
+
+    fn callback<P: Producer<Item = T>>(self, producer: P) -> R {
+        fn run<P, R, Identity, F, Reduce>(
+            producer: P,
+            units: usize,
+            tasks: usize,
+            identity: &Identity,
+            fold: &F,
+            reduce: &Reduce,
+        ) -> R
+        where
+            P: Producer,
+            R: Send,
+            Identity: Fn() -> R + Sync,
+            F: Fn(R, P::Item) -> R + Sync,
+            Reduce: Fn(R, R) -> R + Sync,
+        {
+            if tasks == 1 || units == 0 {
+                return kernel(|| producer.into_iter().fold(identity(), fold));
+            }
+            let left_tasks = tasks / 2;
+            let left_units = (units / tasks) * left_tasks + (units % tasks).min(left_tasks);
+            let (left, right) = producer.split_at(left_units);
+            let (a, b) = rayon::join(
+                || run(left, left_units, left_tasks, identity, fold, reduce),
+                || {
+                    run(
+                        right,
+                        units - left_units,
+                        tasks - left_tasks,
+                        identity,
+                        fold,
+                        reduce,
+                    )
+                },
+            );
+            kernel(|| reduce(a, b))
+        }
+        run(
+            producer,
+            self.units,
+            self.tasks,
+            self.identity,
+            self.fold,
+            self.reduce,
+        )
+    }
+}
+
+pub(crate) fn fold_reduce_indexed<I, R: Send>(
+    iter: I,
+    work: usize,
+    identity: impl Fn() -> R + Send + Sync,
+    fold: impl Fn(R, (usize, I::Item)) -> R + Send + Sync,
+    reduce: impl Fn(R, R) -> R + Send + Sync,
+) -> R
+where
+    I: IndexedParallelIterator,
+{
+    let units = iter.len();
+    // Array-valued accumulators add initialization and merge work. Amortize
+    // those costs with a coarser portable grain than independent traversal.
+    let work = (work / 4).max(1);
+    dispatch(units, work, |tasks| {
+        // A stateful fold can own large arrays. Bound accumulator count by
+        // useful work and worker capacity even without an explicit task limit.
+        let tasks = if tasks == 1 {
+            1
+        } else {
+            task_count(units, work, rayon::current_num_threads(), tasks)
+        };
+        iter.enumerate().with_producer(FoldGroups {
+            units,
+            tasks,
+            identity: &identity,
+            fold: &fold,
+            reduce: &reduce,
+            result: std::marker::PhantomData,
+        })
     })
 }
 

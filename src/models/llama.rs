@@ -1,7 +1,7 @@
 use crate::autograd::{
-    Device, KernelRouteClass, StoragePreference, Tensor, TensorStorageOwned, TensorStorageView,
-    is_no_grad, is_strict_device_execution,
+    KernelRouteClass, StoragePreference, Tensor, TensorStorageOwned, TensorStorageView, is_no_grad,
 };
+use crate::device::{Device, is_strict_device_execution};
 use crate::layers::attention::self_attention::KVCacheInner;
 use crate::layers::attention::self_attention::SelfAttentionOptions;
 use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};

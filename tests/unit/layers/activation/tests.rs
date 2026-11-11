@@ -8,7 +8,7 @@ fn cuda_f32_unary_inference_keeps_inputs_resident() {
         "CUDA activation check requires a working runtime"
     );
     let _cuda = cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for len in [7, 16385] {
         let data = (0..len)
             .map(|i| (i % 97) as f32 / 12. - 4.)
@@ -105,7 +105,7 @@ fn assert_cuda_activation_backward_matches_cpu<M: Module>(
     tolerance: f32,
 ) {
     crate::ops::cuda::set_enabled(false);
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     let cpu_input = make_training_tensor(&[64, 256], input_values.to_vec());
     let cpu_out = make_module().forward(cpu_input.clone());
     cpu_out.backward();
@@ -114,7 +114,7 @@ fn assert_cuda_activation_backward_matches_cpu<M: Module>(
         .expect("CPU activation backward should populate input grad");
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_input = make_training_tensor(&[64, 256], input_values.to_vec()).to_cuda();
     let cuda_out = make_module().forward(cuda_input.clone());
     assert!(cuda_out.is_cuda());
@@ -125,7 +125,7 @@ fn assert_cuda_activation_backward_matches_cpu<M: Module>(
         .grad()
         .expect("CUDA activation backward should populate input grad");
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     for (idx, (got, expect)) in cuda_grad.iter().zip(cpu_grad.iter()).enumerate() {
@@ -256,7 +256,7 @@ fn cuda_lowp_relu_uses_resident_forward_buffer_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let input = make_tensor(&[2, 2], vec![-1.0, 0.0, 0.5, 2.0], dtype).to_cuda();
@@ -297,7 +297,7 @@ fn cuda_lowp_relu_uses_resident_forward_buffer_in_strict_mode() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -309,7 +309,7 @@ fn cuda_lowp_softmax_uses_resident_forward_buffer_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let values = (0..(64 * 256))
@@ -351,7 +351,7 @@ fn cuda_lowp_softmax_uses_resident_forward_buffer_in_strict_mode() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -363,7 +363,7 @@ fn cuda_lowp_relu_backward_keeps_f32_grad_and_no_operand_f32_materialization() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let input =
@@ -384,7 +384,7 @@ fn cuda_lowp_relu_backward_keeps_f32_grad_and_no_operand_f32_materialization() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -396,7 +396,7 @@ fn cuda_empty_activation_forward_backward_stays_stable_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let relu_input = make_tensor(&[0, 4], vec![], DType::BF16).to_cuda();
     let relu_out = no_grad(|| ReLU::new().forward(relu_input.clone()));
@@ -427,7 +427,7 @@ fn cuda_empty_activation_forward_backward_stays_stable_in_strict_mode() {
         .expect("empty CUDA softmax grad should be recorded");
     assert_eq!(softmax_grad.len(), 0);
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -471,7 +471,7 @@ fn cuda_softmax_backward_matches_cpu_reference_in_strict_mode() {
         .into_dyn();
 
     crate::ops::cuda::set_enabled(false);
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     let cpu_input = make_training_tensor(&shape, values.clone());
     let cpu_out = Softmax::new(1).forward(cpu_input.clone());
     cpu_out.add_grad(upstream_grad.clone());
@@ -481,7 +481,7 @@ fn cuda_softmax_backward_matches_cpu_reference_in_strict_mode() {
         .expect("CPU softmax backward should populate input grad");
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_input = make_training_tensor(&shape, values).to_cuda();
     let cuda_out = Softmax::new(1).forward(cuda_input.clone());
     assert!(cuda_out.is_cuda());
@@ -493,7 +493,7 @@ fn cuda_softmax_backward_matches_cpu_reference_in_strict_mode() {
         .grad()
         .expect("CUDA softmax backward should populate input grad");
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     for (idx, (got, expect)) in cuda_grad.iter().zip(cpu_grad.iter()).enumerate() {

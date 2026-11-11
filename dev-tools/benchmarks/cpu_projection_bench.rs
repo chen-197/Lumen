@@ -2,7 +2,7 @@
 use half::{bf16, f16};
 use lumen::autograd::{Tensor, no_grad};
 use lumen::ops::fused::{fused_gate_up_silu_infer_into, fused_qkv_decode_infer_into};
-use lumen::ops::matmul::{SliceRef, matmul, matvec_rowmajor_parallel_mixed};
+use lumen::ops::matmul::{SliceRef, matmul_transposed_rhs, matvec_rowmajor_parallel_mixed};
 use lumen::precision::{DType, set_allow_parameter_dtype_copies};
 use std::{hint::black_box, time::Instant};
 
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => Ok(default.to_string()),
         }
     };
-    let kind = value("--kind", "matmul")?;
+    let kind = value("--kind", "matmul_transposed_rhs")?;
     let dtype = value("--dtype", "f16")?;
     let m = value("--m", "46")?.parse::<usize>()?;
     let k = value("--k", "2048")?.parse::<usize>()?;
@@ -29,10 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if [m, k, n, threads, iters, samples].contains(&0) {
         return Err("dimensions, threads, iters and samples must be positive".into());
     }
-    if !["matmul", "matvec", "qkv", "gate"].contains(&kind.as_str()) {
+    if !["matmul_transposed_rhs", "matvec", "qkv", "gate"].contains(&kind.as_str()) {
         return Err("unknown kind".into());
     }
-    if kind != "matmul" && m != 1 {
+    if kind != "matmul_transposed_rhs" && m != 1 {
         return Err("decode cases require --m 1".into());
     }
     let dt = match dtype.as_str() {
@@ -92,8 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vo = out.clone();
     no_grad(|| {
         let mut run = || match kind.as_str() {
-            "matmul" => {
-                black_box(matmul(&a, &b));
+            "matmul_transposed_rhs" => {
+                black_box(matmul_transposed_rhs(&a, &b));
             }
             "matvec" => {
                 matvec_rowmajor_parallel_mixed(lhs, rhs, n, k, &mut out);

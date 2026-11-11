@@ -51,37 +51,53 @@ pub(super) fn prefill_bf16_panels<A: DotElem>(
     dims: (usize, usize, usize),
 ) -> Array2<f32> {
     let (m, k, n) = dims;
-    let pairs = k.div_ceil(2);
-    let mut input = vec![0u32; m * pairs];
-    for (i, value) in a.iter().enumerate() {
-        let token = i / k;
-        let column = i % k;
-        input[token * pairs + column / 2] |=
-            (bf16::from_f32(value.to_f32()).to_bits() as u32) << ((column % 2) * 16);
-    }
+    let input = pack_bf16_inputs(a, m, k);
     let weights = b.as_standard_layout();
     let weights = weights.as_slice().unwrap();
-    const CHANNELS: usize = super::cpu_gemm::CHANNELS;
-    let mut output = vec![0.; n.div_ceil(CHANNELS) * CHANNELS * m];
-    crate::cpu::for_each_chunk_mut(
-        &mut output,
-        CHANNELS * m,
-        k.saturating_mul(CHANNELS).saturating_mul(m),
-        |(panel, output)| {
-            super::cpu_gemm::bf16_panel(&input, weights, k, n, panel * CHANNELS, output);
-        },
-    );
-    let mut result = Array2::zeros((m, n));
-    let destination = result.as_slice_mut().unwrap();
-    for (panel, source) in output.chunks(CHANNELS * m).enumerate() {
-        let first = panel * CHANNELS;
-        let count = (n - first).min(CHANNELS);
-        for (token, row) in destination.chunks_mut(n).enumerate() {
-            row[first..first + count]
-                .copy_from_slice(&source[token * CHANNELS..token * CHANNELS + count]);
+    super::cpu_gemm::bf16_matmul(&input, weights, k, n)
+}
+
+// Walk complete rows/pairs so the hot loop does not divide every element's
+// index by K. Keep the existing conversion, including its handling of NaNs.
+pub(super) fn pack_bf16_inputs<A: DotElem>(
+    input: ndarray::ArrayViewD<'_, A>,
+    m: usize,
+    k: usize,
+) -> Vec<u32> {
+    assert!(k > 0);
+    assert_eq!(input.len(), m * k);
+    assert_eq!(input.shape().last(), Some(&k));
+    let pairs = k.div_ceil(2);
+    let mut packed = vec![0u32; m * pairs];
+    let bits = |value: A| bf16::from_f32(value.to_f32()).to_bits() as u32;
+    if let Some(values) = input.as_slice() {
+        for (row, output) in values.chunks_exact(k).zip(packed.chunks_exact_mut(pairs)) {
+            let mut values = row.chunks_exact(2);
+            for (target, pair) in output.iter_mut().zip(values.by_ref()) {
+                *target = bits(pair[0]) | (bits(pair[1]) << 16);
+            }
+            if let Some(&last) = values.remainder().first() {
+                output[pairs - 1] = bits(last);
+            }
+        }
+    } else {
+        for (row, output) in input
+            .lanes(ndarray::Axis(input.ndim() - 1))
+            .into_iter()
+            .zip(packed.chunks_exact_mut(pairs))
+        {
+            let mut values = row.iter();
+            for target in output.iter_mut().take(k / 2) {
+                let low = bits(*values.next().expect("BF16 input row length"));
+                let high = bits(*values.next().expect("BF16 input row length"));
+                *target = low | (high << 16);
+            }
+            if !k.is_multiple_of(2) {
+                output[pairs - 1] = bits(*values.next().expect("BF16 input row tail"));
+            }
         }
     }
-    result
+    packed
 }
 
 pub(super) fn prefill_lowp_panels<A: DotElem>(
@@ -145,10 +161,31 @@ pub(super) fn try_prefill_gemm(
         // established crossover for the other storage routes.
         || (m > 256 && b.dtype() != DType::BF16)
         || k < 512
-        || n < 512
         || a.dtype() == DType::I8
     {
         return None;
+    }
+    if n < 512 {
+        // Narrow projections benefit from weight reuse, but packing/wakeup
+        // costs dominate small parallel products. Preserve those row routes.
+        if n < 128
+            || a.dtype() != DType::BF16
+            || b.dtype() != DType::BF16
+            || !crate::arch::x86_avx512_bf16_kernel_runtime_available()
+        {
+            return None;
+        }
+        let capacity = crate::cpu::parallelism();
+        if capacity > 1
+            && (m < 64
+                || k < 2048
+                || n < 256
+                || !n
+                    .div_ceil(super::cpu_gemm::CHANNELS)
+                    .is_multiple_of(capacity))
+        {
+            return None;
+        }
     }
     if a.dtype() == DType::F32 && b.dtype() == DType::F32 {
         // Retain the prefill dispatcher contract without packing a complete
@@ -263,3 +300,7 @@ pub(super) fn try_prefill_gemm(
         }
     })
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/ops/matmul/prefill.rs"]
+mod tests;

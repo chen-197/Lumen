@@ -1,7 +1,7 @@
 use crate::autograd::{
-    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    assert_native_device_support, is_no_grad, is_strict_device_execution,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
 };
+use crate::device::{assert_native_device_support, is_strict_device_execution};
 use crate::ops::cuda;
 use crate::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel_mixed, dual_matvec_silu_mul_rowmajor_parallel_f32_bf16,
@@ -54,7 +54,7 @@ fn cuda_fused_storage_buffer(tensor: &Tensor) -> Option<(DType, cuda::CudaBuffer
 fn cuda_tensor_from_f32_buffer_no_host_with_output_dtype(
     shape: &[usize],
     buffer: cuda::CudaBuffer,
-    device: crate::autograd::Device,
+    device: crate::device::Device,
     dtype: DType,
     op_name: &str,
 ) -> Tensor {
@@ -1192,7 +1192,7 @@ fn run_gate_up_slice(
 pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
     let output_device = input.device();
     let build_graph = !is_no_grad() && input.requires_grad();
-    let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+    let cuda_native_supported = output_device == crate::device::Device::Cuda;
     assert_native_device_support(output_device, "fused_softmax", cuda_native_supported);
 
     if !build_graph {
@@ -1209,7 +1209,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
             shape[3] > 0,
             "Fused Softmax key dimension must be greater than zero"
         );
-        if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        if output_device == crate::device::Device::Cuda && !input.is_empty() {
             let batch_heads = shape[0]
                 .checked_mul(shape[1])
                 .expect("fused_softmax batch_heads overflow");
@@ -1459,7 +1459,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
         );
     }
 
-    if output_device == crate::autograd::Device::Cuda {
+    if output_device == crate::device::Device::Cuda {
         let shape = input.shape_vec();
         if shape.len() != 4 {
             panic!("Fused Softmax expects 4D input [B, H, Q, K]");
@@ -1685,7 +1685,7 @@ pub(crate) fn fused_softmax_with_past_infer(
         DType::F32 | DType::I8 => DType::F32,
     };
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() {
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             cuda::fused_softmax_f32_with_past_no_host(
                 input_buf,
@@ -1900,7 +1900,7 @@ pub fn fused_gate_up_silu_infer(
     assert_native_device_support(
         output_device,
         "fused_gate_up_silu_infer",
-        output_device == crate::autograd::Device::Cuda,
+        output_device == crate::device::Device::Cuda,
     );
     assert_eq!(
         gate_weight.device(),
@@ -1925,7 +1925,7 @@ pub fn fused_gate_up_silu_infer(
     } else {
         DType::F32
     };
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() {
         if let Some(cuda_native_out) = try_cuda_fused_gate_up_silu_typed_output(
             input,
             gate_weight,
@@ -2156,7 +2156,7 @@ pub(crate) fn fused_gate_up_silu_decode_f32(
     assert_native_device_support(
         output_device,
         "fused_gate_up_silu_decode_f32",
-        output_device == crate::autograd::Device::Cuda,
+        output_device == crate::device::Device::Cuda,
     );
     assert_eq!(
         gate_weight.device(),
@@ -2178,7 +2178,7 @@ pub(crate) fn fused_gate_up_silu_decode_f32(
         "fused_gate_up_silu_decode_f32 expects single-token decode input"
     );
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() {
         let cuda_out = try_cuda_same_lowp_gate_up_silu_matmul(
             input,
             gate_weight,
@@ -2242,7 +2242,7 @@ pub fn fused_gate_up_silu_infer_into(
     assert_native_device_support(
         compute_device,
         "fused_gate_up_silu_infer_into",
-        compute_device == crate::autograd::Device::Cuda,
+        compute_device == crate::device::Device::Cuda,
     );
     assert_eq!(
         gate_weight.device(),
@@ -2264,7 +2264,7 @@ pub fn fused_gate_up_silu_infer_into(
         "fused_gate_up_silu_infer_into currently expects single-token decode input"
     );
     assert_eq!(out.len(), n_dim, "output size mismatch");
-    if compute_device == crate::autograd::Device::Cuda {
+    if compute_device == crate::device::Device::Cuda {
         let cuda_out = try_cuda_fused_gate_up_silu_typed_host(
             input,
             gate_weight,
@@ -2437,7 +2437,7 @@ pub fn fused_qkv_decode_infer_into(
     assert_native_device_support(
         compute_device,
         "fused_qkv_decode_infer_into",
-        compute_device == crate::autograd::Device::Cuda,
+        compute_device == crate::device::Device::Cuda,
     );
     assert_eq!(
         q_weight.device(),
@@ -2463,7 +2463,7 @@ pub fn fused_qkv_decode_infer_into(
     assert_eq!(q_out.len(), b * q_n, "Q output size mismatch");
     assert_eq!(k_out.len(), b * k_n, "K output size mismatch");
     assert_eq!(v_out.len(), b * v_n, "V output size mismatch");
-    if compute_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if compute_device == crate::device::Device::Cuda && !input.is_empty() {
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             q_weight.with_cuda_f32_buffer(|q_buf| {
                 k_weight.with_cuda_f32_buffer(|k_buf| {
@@ -2619,7 +2619,7 @@ pub fn fused_qkv_decode_infer(
     assert_native_device_support(
         compute_device,
         "fused_qkv_decode_infer",
-        compute_device == crate::autograd::Device::Cuda,
+        compute_device == crate::device::Device::Cuda,
     );
     assert_eq!(
         q_weight.device(),
@@ -2650,7 +2650,7 @@ pub fn fused_qkv_decode_infer(
     let d = q_n / n_head;
     assert_eq!(k_n / n_kv_head, d, "Q/K head dim mismatch");
 
-    if compute_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if compute_device == crate::device::Device::Cuda && !input.is_empty() {
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             q_weight.with_cuda_f32_buffer(|q_buf| {
                 k_weight.with_cuda_f32_buffer(|k_buf| {
@@ -3016,7 +3016,7 @@ pub fn fused_qkv_decode_infer_tensors(
     assert_eq!(v_n / n_kv_head, d, "V/K head dim mismatch");
     let output_dtype = fused_qkv_tensor_output_dtype(input, q_weight, k_weight, v_weight);
 
-    if compute_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if compute_device == crate::device::Device::Cuda && !input.is_empty() {
         if let Some(cuda_native_out) = try_cuda_fused_qkv_typed_output_buffer(
             input,
             q_weight,
@@ -3145,7 +3145,7 @@ pub fn fused_qkv_prefill_infer_tensors(
         "fused_qkv_prefill_infer_tensors is inference-only"
     );
     let compute_device = input.device();
-    if compute_device != crate::autograd::Device::Cuda {
+    if compute_device != crate::device::Device::Cuda {
         return None;
     }
     if q_weight.device() != compute_device
@@ -3545,7 +3545,7 @@ fn fused_qkv_training_projection_tensor(
             }
         })),
         requires_grad: true,
-        device: crate::autograd::Device::Cuda,
+        device: crate::device::Device::Cuda,
     })));
     *output_self.borrow_mut() = Rc::downgrade(&tensor.0);
     tensor
@@ -3562,13 +3562,13 @@ pub(crate) fn fused_qkv_train_tensors(
     n_head: usize,
     n_kv_head: usize,
 ) -> Option<(Tensor, Tensor, Tensor)> {
-    if input.device() != crate::autograd::Device::Cuda
-        || q_weight.device() != crate::autograd::Device::Cuda
-        || k_weight.device() != crate::autograd::Device::Cuda
-        || v_weight.device() != crate::autograd::Device::Cuda
-        || q_bias.is_some_and(|bias| bias.device() != crate::autograd::Device::Cuda)
-        || k_bias.is_some_and(|bias| bias.device() != crate::autograd::Device::Cuda)
-        || v_bias.is_some_and(|bias| bias.device() != crate::autograd::Device::Cuda)
+    if input.device() != crate::device::Device::Cuda
+        || q_weight.device() != crate::device::Device::Cuda
+        || k_weight.device() != crate::device::Device::Cuda
+        || v_weight.device() != crate::device::Device::Cuda
+        || q_bias.is_some_and(|bias| bias.device() != crate::device::Device::Cuda)
+        || k_bias.is_some_and(|bias| bias.device() != crate::device::Device::Cuda)
+        || v_bias.is_some_and(|bias| bias.device() != crate::device::Device::Cuda)
     {
         return None;
     }

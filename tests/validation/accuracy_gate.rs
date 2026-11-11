@@ -1,7 +1,6 @@
 //! Independent logical-index/F64 references, included in ordinary cargo test.
-use crate::autograd::{
-    Device, Tensor, TensorStorageOwned, no_grad, set_strict_device_execution_scoped,
-};
+use crate::autograd::{Tensor, TensorStorageOwned, no_grad};
+use crate::device::{Device, set_strict_device_execution_scoped};
 use crate::layers::{activation::Softmax, norm::rms_norm::RMSNorm};
 use crate::loss::CrossEntropyLoss;
 use crate::module::Module;

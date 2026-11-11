@@ -1,7 +1,5 @@
-use crate::autograd::{
-    ArcArray, IxDyn, Tensor, TensorData, TensorStorageOwned, assert_native_device_support,
-    is_no_grad, is_strict_device_execution,
-};
+use crate::autograd::{ArcArray, IxDyn, Tensor, TensorData, TensorStorageOwned, is_no_grad};
+use crate::device::{assert_native_device_support, is_strict_device_execution};
 use crate::ops::cuda;
 use crate::precision::DType;
 use ndarray::Array;
@@ -102,12 +100,12 @@ fn cat_output_shape(shapes: &[Vec<usize>], axis: usize) -> Vec<usize> {
 
 fn preserve_device_after_view(
     tensor: Tensor,
-    output_device: crate::autograd::Device,
+    output_device: crate::device::Device,
     source: &Tensor,
 ) -> Tensor {
     match output_device {
-        crate::autograd::Device::Cpu => tensor,
-        crate::autograd::Device::Cuda => {
+        crate::device::Device::Cpu => tensor,
+        crate::device::Device::Cuda => {
             if let Some((dtype, buffer, scale)) = source.cloned_cuda_native_lowp_buffer() {
                 let shape = tensor.shape_vec();
                 return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
@@ -234,7 +232,7 @@ fn try_cuda_permute_graph(
             input_clone.add_backward_grad(grad_restored);
         })),
         requires_grad: true,
-        device: crate::autograd::Device::Cuda,
+        device: crate::device::Device::Cuda,
     })));
     *output_self.borrow_mut() = Rc::downgrade(&tensor.0);
     Some(tensor)
@@ -300,7 +298,7 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
     }
 
     if is_no_grad() || !input.requires_grad() {
-        if output_device == crate::autograd::Device::Cuda {
+        if output_device == crate::device::Device::Cuda {
             if let Some((dtype, buffer, scale)) = input.cloned_cuda_native_lowp_buffer() {
                 return Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
                     &new_shape,
@@ -340,7 +338,7 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
         };
     }
 
-    if output_device == crate::autograd::Device::Cuda
+    if output_device == crate::device::Device::Cuda
         && let Some(cuda_buffer) = input.cloned_cuda_f32_buffer()
     {
         let input_clone = input.clone();
@@ -412,7 +410,7 @@ pub fn reshape(input: &Tensor, shape: Vec<i32>) -> Tensor {
     let reshaped = reshape_shared(data, &new_shape);
 
     let input_clone = input.clone();
-    let cuda_buffer = if output_device == crate::autograd::Device::Cuda {
+    let cuda_buffer = if output_device == crate::device::Device::Cuda {
         input.cloned_cuda_f32_buffer()
     } else {
         None
@@ -472,10 +470,10 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
     assert_native_device_support(
         output_device,
         "permute",
-        output_device == crate::autograd::Device::Cuda,
+        output_device == crate::device::Device::Cuda,
     );
 
-    if !build_graph && output_device == crate::autograd::Device::Cuda && input.is_empty() {
+    if !build_graph && output_device == crate::device::Device::Cuda && input.is_empty() {
         return match input.native_storage_owned() {
             TensorStorageOwned::F32(data) => Tensor::from_shared_f32_no_grad_with_device(
                 data.permuted_axes(axes.clone()).into_dyn(),
@@ -497,7 +495,7 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
         };
     }
 
-    if !build_graph && output_device == crate::autograd::Device::Cuda {
+    if !build_graph && output_device == crate::device::Device::Cuda {
         let out_shape = axes
             .iter()
             .map(|&axis| input.shape_vec()[axis])
@@ -571,7 +569,7 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
         .iter()
         .map(|&axis| input_shape[axis])
         .collect::<Vec<_>>();
-    if output_device == crate::autograd::Device::Cuda
+    if output_device == crate::device::Device::Cuda
         && let Some(tensor) = try_cuda_permute_graph(input, &axes, &input_shape, &out_shape)
     {
         return tensor;
@@ -581,7 +579,7 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
     let permuted: ArcArray<f32, IxDyn> = data.permuted_axes(axes.clone()).into_dyn();
 
     let input_clone = input.clone();
-    let cuda_buffer = if output_device == crate::autograd::Device::Cuda {
+    let cuda_buffer = if output_device == crate::device::Device::Cuda {
         input
             .cloned_cuda_f32_buffer()
             .and_then(|input_buf| cuda::permute_f32_buffer(&input_buf, &out_shape, &axes).ok())
@@ -676,7 +674,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
     assert_native_device_support(
         output_device,
         "cat",
-        output_device == crate::autograd::Device::Cuda,
+        output_device == crate::device::Device::Cuda,
     );
     for tensor in tensors.iter().skip(1) {
         assert_eq!(
@@ -693,7 +691,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
     }
 
     if !build_graph {
-        if output_device == crate::autograd::Device::Cuda {
+        if output_device == crate::device::Device::Cuda {
             let same_dtype = tensors
                 .iter()
                 .all(|tensor| tensor.dtype() == tensors[0].dtype());
@@ -946,7 +944,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
         return Tensor::from_shared_f32_no_grad_with_device(result, output_device);
     }
 
-    if output_device == crate::autograd::Device::Cuda && !out_shape.contains(&0) {
+    if output_device == crate::device::Device::Cuda && !out_shape.contains(&0) {
         let cuda_out = cuda_cat_nonempty_f32(tensors, &shapes, axis);
         match cuda_out {
             Ok(buffer) => {
@@ -1130,7 +1128,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
     let tensors_clone: Vec<Tensor> = tensors.to_vec();
     let out_shape_for_cuda = out_shape;
     let has_output = !out_shape_for_cuda.contains(&0);
-    let cuda_buffer = if output_device == crate::autograd::Device::Cuda && has_output {
+    let cuda_buffer = if output_device == crate::device::Device::Cuda && has_output {
         let cuda_out = cuda_cat_nonempty_f32(tensors, &shapes, axis);
         match cuda_out {
             Ok(buffer) => Some(buffer),
@@ -1166,7 +1164,7 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
         cuda_f32_grad: None,
         parents: tensors.to_vec(),
         backward_op: Some(std::rc::Rc::new(move |grad| {
-            if output_device == crate::autograd::Device::Cuda && !grad.is_empty() {
+            if output_device == crate::device::Device::Cuda && !grad.is_empty() {
                 let grad_host = grad.iter().copied().collect::<Vec<_>>();
                 let cuda_result = cuda::upload_f32(&grad_host).and_then(|grad_buf| {
                     let mut axis_start = 0usize;
@@ -1246,7 +1244,7 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
     assert_native_device_support(
         output_device,
         "slice_last_dim",
-        output_device == crate::autograd::Device::Cuda,
+        output_device == crate::device::Device::Cuda,
     );
 
     if !build_graph && !input.requires_grad() && start == 0 && end == last_len {
@@ -1271,7 +1269,7 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
         return tensor;
     }
 
-    if !build_graph && output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if !build_graph && output_device == crate::device::Device::Cuda && !input.is_empty() {
         let slice_len = end - start;
         let outer = input.len() / last_len;
         let mut out_shape = input_shape.clone();
@@ -1342,7 +1340,7 @@ pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
         };
     }
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() && start < end {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() && start < end {
         let slice_len = end - start;
         let outer = input.len() / last_len;
         let mut out_shape = input_shape.clone();

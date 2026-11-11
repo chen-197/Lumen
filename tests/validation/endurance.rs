@@ -1,12 +1,13 @@
 //! Explicitly selected long checks; no timing assertions or external downloads.
 use crate::accuracy_gate::{check, ordered, run, tensor, values};
-use crate::autograd::{Device, Tensor, TensorData, no_grad};
+use crate::autograd::{Tensor, TensorData, no_grad};
+use crate::device::Device;
 use crate::init::{ParameterInitMode, with_parameter_init_mode};
 use crate::layers::attention::self_attention::KVCache;
 use crate::loss::MSELoss;
 use crate::models::{LlamaConfig, LlamaModel};
 use crate::module::Module;
-use crate::ops::{cuda, matmul::matmul};
+use crate::ops::{cuda, matmul::matmul_transposed_rhs};
 use crate::optim::{Adam, Optimizer, SGD};
 use crate::precision::DType;
 use ndarray::{ArrayD, IxDyn};
@@ -70,7 +71,7 @@ impl Module for Pair {
     }
 
     fn forward(&self, input: Tensor) -> Tensor {
-        &matmul(&input, &self.weight) + &self.bias
+        &matmul_transposed_rhs(&input, &self.weight) + &self.bias
     }
 }
 

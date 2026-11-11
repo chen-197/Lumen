@@ -33,7 +33,7 @@ fn cuda_flatten_empty_batch_preserves_device_and_gradient_shape() {
         return;
     }
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     let input = Tensor::from_data_with_grad_flag(Array::zeros(IxDyn(&[0, 3, 4])), true).to_cuda();
     let output = Flatten::new().forward(input.clone());
     assert!(output.is_cuda());

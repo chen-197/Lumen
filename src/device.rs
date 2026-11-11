@@ -1,4 +1,95 @@
-use super::*;
+//! CPU/CUDA device placement, transfer and strict execution policy.
+//!
+//! Tensor differentiation and no-grad state live in [`crate::autograd`].
+use crate::autograd::{Tensor, TensorStorageOwned};
+use crate::precision::DType;
+use half::{bf16, f16};
+use ndarray::{Array, ArrayD, IxDyn};
+use serde::{Deserialize, Serialize};
+use std::{cell::Cell, marker::PhantomData, rc::Rc};
+
+/// Execution placement for a Tensor. Variant order is part of checkpoint data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Device {
+    Cpu,
+    Cuda,
+}
+
+thread_local! {
+    static STRICT_DEVICE_EXECUTION: Cell<bool> = Cell::new(env_strict_device_execution());
+}
+
+fn env_strict_device_execution() -> bool {
+    std::env::var("LUMEN_STRICT_DEVICE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub fn set_strict_device_execution(enabled: bool) {
+    STRICT_DEVICE_EXECUTION.with(|flag| flag.set(enabled));
+}
+
+pub fn is_strict_device_execution() -> bool {
+    STRICT_DEVICE_EXECUTION.with(|flag| flag.get())
+}
+
+/// Caller-thread strict-device scope; the guard must stay on this thread.
+///
+/// ```compile_fail
+/// let guard = lumen::device::set_strict_device_execution_scoped(true);
+/// std::thread::spawn(move || drop(guard));
+/// ```
+pub struct StrictDeviceExecutionGuard {
+    previous: bool,
+    _caller_thread: PhantomData<Rc<()>>,
+}
+
+pub fn set_strict_device_execution_scoped(enabled: bool) -> StrictDeviceExecutionGuard {
+    let previous = is_strict_device_execution();
+    set_strict_device_execution(enabled);
+    StrictDeviceExecutionGuard {
+        previous,
+        _caller_thread: PhantomData,
+    }
+}
+
+impl Drop for StrictDeviceExecutionGuard {
+    fn drop(&mut self) {
+        set_strict_device_execution(self.previous);
+    }
+}
+
+pub fn assert_same_device(lhs: &Tensor, rhs: &Tensor, op_name: &str) -> Device {
+    let lhs_device = lhs.device();
+    let rhs_device = rhs.device();
+    assert!(
+        lhs_device == rhs_device,
+        "{op_name} expects tensors on the same device, got lhs={lhs_device:?}, rhs={rhs_device:?}. Move them with to_cuda()/to_cpu() before combining them."
+    );
+    lhs_device
+}
+
+pub fn assert_native_device_support(device: Device, op_name: &str, cuda_supported: bool) {
+    if !is_strict_device_execution() {
+        return;
+    }
+
+    match device {
+        Device::Cpu => {}
+        Device::Cuda => {
+            assert!(
+                cuda_supported,
+                "{op_name} does not have a native CUDA implementation yet. This operation would fall back through CPU semantics, which is disallowed while strict device execution is enabled."
+            );
+        }
+    }
+}
 
 impl Tensor {
     pub(super) fn ensure_cuda_f32_data(&self) {
@@ -795,3 +886,7 @@ impl Tensor {
         self.clone_storage_with_device(self.device(), false)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/device.rs"]
+mod tests;

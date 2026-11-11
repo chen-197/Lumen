@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    autograd::{Device, Tensor, no_grad},
+    autograd::{Tensor, no_grad},
+    device::Device,
     module::Module,
 };
 use ndarray::{ArrayD, IxDyn};
@@ -68,7 +69,7 @@ fn regression_qwen3_cuda_lowp_cache_native_snapshot_is_current() {
         return;
     }
     let _enabled = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for dtype in [DType::F16, DType::BF16] {
         let model = config().build(16, DType::F32, DType::F32, dtype).unwrap();
         model.to_cuda();
@@ -153,7 +154,7 @@ fn cuda_kv_rounding_only_touches_appended_rows() {
 
 fn cache_and_gradients(device: Device) {
     let _enabled = crate::ops::cuda::set_enabled_scoped(device == Device::Cuda);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(device == Device::Cuda);
+    let _strict = crate::device::set_strict_device_execution_scoped(device == Device::Cuda);
     for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
         let model = config().build(16, dtype, DType::F32, DType::F32).unwrap();
         for (name, p) in model.checkpoint_parameters() {
@@ -277,7 +278,7 @@ fn descending_training(device: Device) {
         optim::{Adam, Optimizer, SGD},
     };
     let _enabled = crate::ops::cuda::set_enabled_scoped(device == Device::Cuda);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(device == Device::Cuda);
+    let _strict = crate::device::set_strict_device_execution_scoped(device == Device::Cuda);
     for adam in [false, true] {
         let model = config()
             .build(16, DType::F32, DType::F32, DType::F32)

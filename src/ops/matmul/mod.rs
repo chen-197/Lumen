@@ -34,16 +34,18 @@ pub(crate) use projection::{
 mod argmax;
 pub use argmax::{matvec_argmax_rowmajor_parallel, matvec_argmax_rowmajor_parallel_mixed};
 mod cuda_route;
+mod layout;
 mod prefill;
 mod rows;
+mod standard_cpu;
 mod tensor;
-pub use tensor::{batch_matmul, matmul};
+pub use tensor::{batch_matmul, matmul, matmul_transposed_rhs};
 mod backward;
 
 use crate::autograd::{
-    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    assert_native_device_support, assert_same_device, is_no_grad, is_strict_device_execution,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
 };
+use crate::device::{assert_native_device_support, assert_same_device, is_strict_device_execution};
 use crate::ops::fp_kernels::{
     dot_bf16_bf16_arch, dot_f16_f16_arch, dot_f32_arch, dot_f32_bf16_arch, dot_f32_f16_arch,
     dot2_bf16_bf16_arch, dot2_f16_f16_arch, dot2_f32_arch, dot2_f32_bf16_arch, dot2_f32_f16_arch,
@@ -225,3 +227,7 @@ mod backward_tests;
 #[cfg(test)]
 #[path = "../../../tests/unit/ops/matmul/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/ops/matmul/standard.rs"]
+mod standard_tests;

@@ -1,7 +1,9 @@
 // src/ops/arithmetic.rs
 use crate::autograd::{
-    Device, StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    assert_native_device_support, assert_same_device, is_no_grad, is_strict_device_execution,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
+};
+use crate::device::{
+    Device, assert_native_device_support, assert_same_device, is_strict_device_execution,
 };
 use crate::ops::cuda;
 use crate::ops::fp_kernels::{
@@ -3412,7 +3414,7 @@ fn binary_no_grad(lhs: &Tensor, rhs: &Tensor, op: BinaryOp) -> Tensor {
 
             if let Some(out_shape) = broadcast_shape(lhs_f32.shape(), rhs_f32.shape()) {
                 let out_len = out_shape.iter().product::<usize>();
-                if output_device == crate::autograd::Device::Cuda
+                if output_device == crate::device::Device::Cuda
                 && out_len > 0
                 && (cuda::should_accelerate_elementwise(
                     out_len,

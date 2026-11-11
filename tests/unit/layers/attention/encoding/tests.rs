@@ -1,7 +1,7 @@
 use super::*;
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution_scoped;
+use crate::device::set_strict_device_execution_scoped;
 use crate::precision::{PrecisionConfig, with_precision_config};
 use ndarray::{Array, IxDyn};
 #[cfg(feature = "cuda")]

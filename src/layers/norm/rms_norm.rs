@@ -1,13 +1,12 @@
 use crate::autograd::{
-    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    assert_native_device_support, is_no_grad, is_strict_device_execution,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
 };
+use crate::device::{assert_native_device_support, is_strict_device_execution};
 use crate::module::Module;
 use crate::ops::cuda;
 use crate::precision::DType;
 use half::{bf16, f16};
-use ndarray::{Array1, Array2, Zip};
-use rayon::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -178,6 +177,38 @@ fn try_cuda_rms_norm_backward_typed_buffers(
     ))
 }
 
+// Keep each row's arithmetic order, and schedule only independent rows. Small
+// normalizations (including per-head decode) should not wake worker threads.
+fn for_each_forward_row<X: Sync, Y: Send + Sync>(
+    output: &mut Array2<Y>,
+    input: ArrayView2<'_, X>,
+    compute: impl Fn(ArrayViewMut1<'_, Y>, ArrayView1<'_, X>) + Send + Sync,
+) {
+    debug_assert_eq!(output.dim(), input.dim());
+    crate::cpu::for_each_indexed(
+        output.outer_iter_mut(),
+        input.ncols().saturating_mul(4),
+        |(row, out)| compute(out, input.row(row)),
+    );
+}
+
+// Each input-gradient row is independent; only parameter-gradient grouping can
+// change the reduction association when applying a caller's task budget.
+fn for_each_input_grad_row(
+    output: &mut Array2<f32>,
+    input: ArrayView2<'_, f32>,
+    grad: ArrayView2<'_, f32>,
+    compute: impl Fn(ArrayViewMut1<'_, f32>, ArrayView1<'_, f32>, ArrayView1<'_, f32>) + Send + Sync,
+) {
+    debug_assert_eq!(output.dim(), input.dim());
+    debug_assert_eq!(output.dim(), grad.dim());
+    crate::cpu::for_each_indexed(
+        output.outer_iter_mut(),
+        input.ncols().saturating_mul(8),
+        |(row, out)| compute(out, input.row(row), grad.row(row)),
+    );
+}
+
 impl Module for RMSNorm {
     fn forward(&self, input: Tensor) -> Tensor {
         #[cfg(feature = "cpu-profiling")]
@@ -187,7 +218,7 @@ impl Module for RMSNorm {
         assert_native_device_support(
             output_device,
             "rms_norm",
-            output_device == crate::autograd::Device::Cuda,
+            output_device == crate::device::Device::Cuda,
         );
         assert_eq!(
             self.weight.device(),
@@ -208,7 +239,7 @@ impl Module for RMSNorm {
         );
 
         if !build_graph {
-            if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+            if output_device == crate::device::Device::Cuda && !input.is_empty() {
                 let shape = input.shape_vec();
                 let dim = shape[shape.len() - 1];
                 let rows = input.len() / dim;
@@ -321,9 +352,10 @@ impl Module for RMSNorm {
                                             .as_slice()
                                             .expect("RMSNorm weight should be contiguous");
 
-                                        Zip::from(output_flat.outer_iter_mut())
-                                            .and(x_2d.outer_iter())
-                                            .par_for_each(|mut out_row, x_row| {
+                                        for_each_forward_row(
+                                            &mut output_flat,
+                                            x_2d,
+                                            |mut out_row, x_row| {
                                                 let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                     let v = val as f32 * input_scale;
                                                     acc + v * v
@@ -337,16 +369,18 @@ impl Module for RMSNorm {
                                                 {
                                                     *o = (xi as f32 * input_scale) * inv_rms * wi;
                                                 }
-                                            });
+                                            },
+                                        );
                                     }
                                     TensorStorageView::F16(weight_view) => {
                                         let weight_view = weight_view.as_standard_layout();
                                         let w_1d = weight_view
                                             .into_dimensionality::<ndarray::Ix1>()
                                             .expect("RMSNorm weight must be 1D");
-                                        Zip::from(output_flat.outer_iter_mut())
-                                            .and(x_2d.outer_iter())
-                                            .par_for_each(|mut out_row, x_row| {
+                                        for_each_forward_row(
+                                            &mut output_flat,
+                                            x_2d,
+                                            |mut out_row, x_row| {
                                                 let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                     let v = val as f32 * input_scale;
                                                     acc + v * v
@@ -362,16 +396,18 @@ impl Module for RMSNorm {
                                                         * inv_rms
                                                         * wi.to_f32();
                                                 }
-                                            });
+                                            },
+                                        );
                                     }
                                     TensorStorageView::BF16(weight_view) => {
                                         let weight_view = weight_view.as_standard_layout();
                                         let w_1d = weight_view
                                             .into_dimensionality::<ndarray::Ix1>()
                                             .expect("RMSNorm weight must be 1D");
-                                        Zip::from(output_flat.outer_iter_mut())
-                                            .and(x_2d.outer_iter())
-                                            .par_for_each(|mut out_row, x_row| {
+                                        for_each_forward_row(
+                                            &mut output_flat,
+                                            x_2d,
+                                            |mut out_row, x_row| {
                                                 let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                     let v = val as f32 * input_scale;
                                                     acc + v * v
@@ -387,7 +423,8 @@ impl Module for RMSNorm {
                                                         * inv_rms
                                                         * wi.to_f32();
                                                 }
-                                            });
+                                            },
+                                        );
                                     }
                                 }
 
@@ -434,9 +471,10 @@ impl Module for RMSNorm {
                                         .as_slice()
                                         .expect("RMSNorm weight should be contiguous");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq =
                                                 x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                             let rms = (sum_sq / dim as f32 + eps).sqrt();
@@ -447,7 +485,8 @@ impl Module for RMSNorm {
                                             {
                                                 *o = xi * inv_rms * wi;
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                                 TensorStorageView::F16(weight_view) => {
                                     let weight_view = weight_view.as_standard_layout();
@@ -455,9 +494,10 @@ impl Module for RMSNorm {
                                         .into_dimensionality::<ndarray::Ix1>()
                                         .expect("RMSNorm weight must be 1D");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq =
                                                 x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                             let rms = (sum_sq / dim as f32 + eps).sqrt();
@@ -469,7 +509,8 @@ impl Module for RMSNorm {
                                             {
                                                 *o = xi * inv_rms * wi.to_f32();
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                                 TensorStorageView::BF16(weight_view) => {
                                     let weight_view = weight_view.as_standard_layout();
@@ -477,9 +518,10 @@ impl Module for RMSNorm {
                                         .into_dimensionality::<ndarray::Ix1>()
                                         .expect("RMSNorm weight must be 1D");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq =
                                                 x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                             let rms = (sum_sq / dim as f32 + eps).sqrt();
@@ -491,7 +533,8 @@ impl Module for RMSNorm {
                                             {
                                                 *o = xi * inv_rms * wi.to_f32();
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                             }
 
@@ -517,9 +560,10 @@ impl Module for RMSNorm {
                                         .as_slice()
                                         .expect("RMSNorm weight should be contiguous");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -532,7 +576,8 @@ impl Module for RMSNorm {
                                             {
                                                 *o = f16::from_f32(xi.to_f32() * inv_rms * wi);
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                                 TensorStorageView::F16(weight_view) => {
                                     let weight_view = weight_view.as_standard_layout();
@@ -540,9 +585,10 @@ impl Module for RMSNorm {
                                         .into_dimensionality::<ndarray::Ix1>()
                                         .expect("RMSNorm weight must be 1D");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -558,7 +604,8 @@ impl Module for RMSNorm {
                                                     xi.to_f32() * inv_rms * wi.to_f32(),
                                                 );
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                                 TensorStorageView::BF16(weight_view) => {
                                     let weight_view = weight_view.as_standard_layout();
@@ -566,9 +613,10 @@ impl Module for RMSNorm {
                                         .into_dimensionality::<ndarray::Ix1>()
                                         .expect("RMSNorm weight must be 1D");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -584,7 +632,8 @@ impl Module for RMSNorm {
                                                     xi.to_f32() * inv_rms * wi.to_f32(),
                                                 );
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                             }
 
@@ -613,9 +662,10 @@ impl Module for RMSNorm {
                                         .as_slice()
                                         .expect("RMSNorm weight should be contiguous");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -628,7 +678,8 @@ impl Module for RMSNorm {
                                             {
                                                 *o = bf16::from_f32(xi.to_f32() * inv_rms * wi);
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                                 TensorStorageView::F16(weight_view) => {
                                     let weight_view = weight_view.as_standard_layout();
@@ -636,9 +687,10 @@ impl Module for RMSNorm {
                                         .into_dimensionality::<ndarray::Ix1>()
                                         .expect("RMSNorm weight must be 1D");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -654,7 +706,8 @@ impl Module for RMSNorm {
                                                     xi.to_f32() * inv_rms * wi.to_f32(),
                                                 );
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                                 TensorStorageView::BF16(weight_view) => {
                                     let weight_view = weight_view.as_standard_layout();
@@ -662,9 +715,10 @@ impl Module for RMSNorm {
                                         .into_dimensionality::<ndarray::Ix1>()
                                         .expect("RMSNorm weight must be 1D");
 
-                                    Zip::from(output_flat.outer_iter_mut())
-                                        .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                    for_each_forward_row(
+                                        &mut output_flat,
+                                        x_2d,
+                                        |mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -680,7 +734,8 @@ impl Module for RMSNorm {
                                                     xi.to_f32() * inv_rms * wi.to_f32(),
                                                 );
                                             }
-                                        });
+                                        },
+                                    );
                                 }
                             }
 
@@ -698,7 +753,7 @@ impl Module for RMSNorm {
             });
         }
 
-        if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+        if output_device == crate::device::Device::Cuda && !input.is_empty() {
             let shape = input.shape_vec();
             let dim = shape[shape.len() - 1];
             let rows = input.len() / dim;
@@ -926,19 +981,16 @@ impl Module for RMSNorm {
                             .as_slice()
                             .expect("RMSNorm weight should be contiguous");
 
-                        Zip::from(output_flat.outer_iter_mut())
-                            .and(x_2d.outer_iter())
-                            .par_for_each(|mut out_row, x_row| {
-                                let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
-                                let rms = (sum_sq / dim as f32 + eps).sqrt();
-                                let inv_rms = 1.0 / rms;
+                        for_each_forward_row(&mut output_flat, x_2d, |mut out_row, x_row| {
+                            let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
+                            let rms = (sum_sq / dim as f32 + eps).sqrt();
+                            let inv_rms = 1.0 / rms;
 
-                                for (o, (&xi, &wi)) in
-                                    out_row.iter_mut().zip(x_row.iter().zip(w_slice))
-                                {
-                                    *o = xi * inv_rms * wi;
-                                }
-                            });
+                            for (o, (&xi, &wi)) in out_row.iter_mut().zip(x_row.iter().zip(w_slice))
+                            {
+                                *o = xi * inv_rms * wi;
+                            }
+                        });
                     }
                     TensorStorageView::F16(weight_view) => {
                         let weight_view = weight_view.as_standard_layout();
@@ -946,19 +998,17 @@ impl Module for RMSNorm {
                             .into_dimensionality::<ndarray::Ix1>()
                             .expect("RMSNorm weight must be 1D");
 
-                        Zip::from(output_flat.outer_iter_mut())
-                            .and(x_2d.outer_iter())
-                            .par_for_each(|mut out_row, x_row| {
-                                let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
-                                let rms = (sum_sq / dim as f32 + eps).sqrt();
-                                let inv_rms = 1.0 / rms;
+                        for_each_forward_row(&mut output_flat, x_2d, |mut out_row, x_row| {
+                            let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
+                            let rms = (sum_sq / dim as f32 + eps).sqrt();
+                            let inv_rms = 1.0 / rms;
 
-                                for (o, (&xi, &wi)) in
-                                    out_row.iter_mut().zip(x_row.iter().zip(w_1d.iter()))
-                                {
-                                    *o = xi * inv_rms * wi.to_f32();
-                                }
-                            });
+                            for (o, (&xi, &wi)) in
+                                out_row.iter_mut().zip(x_row.iter().zip(w_1d.iter()))
+                            {
+                                *o = xi * inv_rms * wi.to_f32();
+                            }
+                        });
                     }
                     TensorStorageView::BF16(weight_view) => {
                         let weight_view = weight_view.as_standard_layout();
@@ -966,19 +1016,17 @@ impl Module for RMSNorm {
                             .into_dimensionality::<ndarray::Ix1>()
                             .expect("RMSNorm weight must be 1D");
 
-                        Zip::from(output_flat.outer_iter_mut())
-                            .and(x_2d.outer_iter())
-                            .par_for_each(|mut out_row, x_row| {
-                                let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
-                                let rms = (sum_sq / dim as f32 + eps).sqrt();
-                                let inv_rms = 1.0 / rms;
+                        for_each_forward_row(&mut output_flat, x_2d, |mut out_row, x_row| {
+                            let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
+                            let rms = (sum_sq / dim as f32 + eps).sqrt();
+                            let inv_rms = 1.0 / rms;
 
-                                for (o, (&xi, &wi)) in
-                                    out_row.iter_mut().zip(x_row.iter().zip(w_1d.iter()))
-                                {
-                                    *o = xi * inv_rms * wi.to_f32();
-                                }
-                            });
+                            for (o, (&xi, &wi)) in
+                                out_row.iter_mut().zip(x_row.iter().zip(w_1d.iter()))
+                            {
+                                *o = xi * inv_rms * wi.to_f32();
+                            }
+                        });
                     }
                 }
 
@@ -1033,10 +1081,11 @@ impl Module for RMSNorm {
                                 let g_2d = g_cow.view().into_shape((rows, dim)).unwrap();
 
                                 let mut d_input_flat = Array2::<f32>::zeros((rows, dim));
-                                Zip::from(d_input_flat.outer_iter_mut())
-                                    .and(x_2d.outer_iter())
-                                    .and(g_2d.outer_iter())
-                                    .par_for_each(|mut dx_row, x_row, g_row| {
+                                for_each_input_grad_row(
+                                    &mut d_input_flat,
+                                    x_2d,
+                                    g_2d,
+                                    |mut dx_row, x_row, g_row| {
                                         let sum_sq =
                                             x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                         let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
@@ -1059,34 +1108,32 @@ impl Module for RMSNorm {
                                             let x_norm = xi * inv_rms;
                                             *dxi = inv_rms * (term1 - x_norm * mean_dot);
                                         }
-                                    });
+                                    },
+                                );
 
-                                let dw_accum = (0..rows)
-                                    .into_par_iter()
-                                    .fold(
-                                        || Array1::<f32>::zeros(dim),
-                                        |mut acc, r| {
-                                            let x_row = x_2d.row(r);
-                                            let g_row = g_2d.row(r);
+                                let dw_accum = crate::cpu::fold_reduce(
+                                    rows,
+                                    dim.saturating_mul(4),
+                                    || Array1::<f32>::zeros(dim),
+                                    |mut acc, r| {
+                                        let x_row = x_2d.row(r);
+                                        let g_row = g_2d.row(r);
 
-                                            let sum_sq = x_row.fold(0.0f32, |a, &v| a + v * v);
-                                            let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+                                        let sum_sq = x_row.fold(0.0f32, |a, &v| a + v * v);
+                                        let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
 
-                                            for (a, (&gi, &xi)) in
-                                                acc.iter_mut().zip(g_row.iter().zip(x_row.iter()))
-                                            {
-                                                *a += gi * xi * inv_rms;
-                                            }
-                                            acc
-                                        },
-                                    )
-                                    .reduce(
-                                        || Array1::<f32>::zeros(dim),
-                                        |mut a, b| {
-                                            a += &b;
-                                            a
-                                        },
-                                    );
+                                        for (a, (&gi, &xi)) in
+                                            acc.iter_mut().zip(g_row.iter().zip(x_row.iter()))
+                                        {
+                                            *a += gi * xi * inv_rms;
+                                        }
+                                        acc
+                                    },
+                                    |mut a, b| {
+                                        a += &b;
+                                        a
+                                    },
+                                );
 
                                 (
                                     d_input_flat.into_shape(shape.clone()).unwrap().into_dyn(),
@@ -1113,3 +1160,7 @@ impl Module for RMSNorm {
 #[cfg(test)]
 #[path = "../../../tests/unit/layers/norm/rms_norm/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/layers/norm/rms_norm/backward.rs"]
+mod backward_tests;

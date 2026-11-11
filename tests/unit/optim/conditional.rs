@@ -1,7 +1,6 @@
 use super::*;
-use crate::autograd::{
-    Device, StoragePreference, TensorStorageView, set_strict_device_execution_scoped,
-};
+use crate::autograd::{StoragePreference, TensorStorageView};
+use crate::device::{Device, set_strict_device_execution_scoped};
 use crate::precision::{ParameterQuantization, PrecisionConfig, with_precision_config};
 
 pub(super) fn values(tensor: &Tensor) -> Vec<f32> {

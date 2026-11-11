@@ -1,7 +1,7 @@
 use super::*;
-#[cfg(feature = "cuda")]
-use crate::autograd::Device;
 use crate::autograd::TensorStorageOwned;
+#[cfg(feature = "cuda")]
+use crate::device::Device;
 
 fn audit(value: serde_json::Value) {
     if std::env::var_os("LUMEN_LAYOUT_AUDIT").is_some() {
@@ -262,7 +262,7 @@ fn layout_audit_activation_forward_and_derivatives() {
 
 #[test]
 fn layout_audit_matmul_forward_and_backward() {
-    use crate::ops::matmul::{batch_matmul, matmul};
+    use crate::ops::matmul::{batch_matmul, matmul_transposed_rhs};
     let _cpu = cuda::set_enabled_scoped(false);
     let mut failures = Vec::new();
     for lhs_dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
@@ -291,7 +291,7 @@ fn layout_audit_matmul_forward_and_backward() {
                     let y = if batch {
                         batch_matmul(&a, &b)
                     } else {
-                        matmul(&a, &b)
+                        matmul_transposed_rhs(&a, &b)
                     };
                     let backward = y.0.borrow().backward_op.clone().unwrap();
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -335,7 +335,7 @@ fn layout_audit_matmul_forward_and_backward() {
                         }
                     }
                     audit(
-                        serde_json::json!({"case":"matmul","batch":batch,"dtype_a":format!("{lhs_dtype:?}"),
+                        serde_json::json!({"case":"matmul_transposed_rhs","batch":batch,"dtype_a":format!("{lhs_dtype:?}"),
                         "dtype_b":format!("{rhs_dtype:?}"),"orders":[a_order,b_order,g_order],
                         "a":av,"b":bv,"g":g,"out":values(&y),"da":da,"db":db}),
                     );
@@ -440,7 +440,7 @@ fn layout_audit_real_backward_training_descends() {
     use crate::layers::activation::SiLU;
     use crate::loss::MSELoss;
     use crate::module::Module;
-    use crate::ops::matmul::matmul;
+    use crate::ops::matmul::matmul_transposed_rhs;
     let _cpu = cuda::set_enabled_scoped(false);
     for (dtype, state) in [
         (DType::F32, DType::F32),
@@ -478,7 +478,7 @@ fn layout_audit_real_backward_training_descends() {
                 for step in 0..=80 {
                     opt.zero_grad();
                     x.zero_grad();
-                    let y = SiLU.forward(matmul(&x, &w));
+                    let y = SiLU.forward(matmul_transposed_rhs(&x, &w));
                     let loss = MSELoss::apply(&y, &target);
                     losses.push(values(&loss)[0] as f64);
                     if step < 80 {
@@ -513,7 +513,7 @@ fn layout_audit_real_backward_training_descends() {
 
 #[test]
 fn layout_audit_rank3_matmul_flattens_logical_rows() {
-    use crate::ops::matmul::matmul;
+    use crate::ops::matmul::matmul_transposed_rhs;
     let _cpu = cuda::set_enabled_scoped(false);
     let mut failures = Vec::new();
     for ad in [DType::F32, DType::F16, DType::BF16, DType::I8] {
@@ -526,7 +526,7 @@ fn layout_audit_rank3_matmul_flattens_logical_rows() {
                 let b = shaped_parameter(&[2, 3], &bv, bd, order);
                 let av = values(&a);
                 let bv = values(&b);
-                let y = matmul(&a, &b);
+                let y = matmul_transposed_rhs(&a, &b);
                 assert_eq!(y.shape_vec(), [2, 2, 2]);
                 let backward = y.0.borrow().backward_op.clone().unwrap();
                 backward(&ordered(&[2, 2, 2], &g, order).view());
@@ -563,7 +563,7 @@ fn layout_audit_rank3_matmul_flattens_logical_rows() {
                     }
                 }
                 audit(
-                    serde_json::json!({"case":"matmul","batch":false,"rank3":true,
+                    serde_json::json!({"case":"matmul_transposed_rhs","batch":false,"rank3":true,
                     "dtype_a":format!("{ad:?}"),"dtype_b":format!("{bd:?}"),"order":order,
                     "a":av,"b":bv,"g":g,"out":values(&y),"da":da,"db":db}),
                 );

@@ -1,13 +1,13 @@
 use super::*;
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution;
+use crate::device::set_strict_device_execution;
 use crate::precision::DType;
 use ndarray::{Array, IxDyn};
 
 fn check_no_grad_shape_identity(single_cat: bool) {
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for on_cuda in [false, true] {
         if on_cuda && !crate::ops::cuda::is_available() {
             continue;
@@ -73,7 +73,7 @@ fn regression_shape_no_grad_full_slice_is_untracked() {
 #[test]
 fn regression_shape_empty_slice_preserves_resident_input_and_gradients() {
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for on_cuda in [false, true] {
         if on_cuda && !crate::ops::cuda::is_available() {
             continue;
@@ -134,7 +134,7 @@ fn cuda_cat_with_empty_inputs_keeps_inference_resident() {
         return;
     }
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
         let full = make_tensor(&[2, 1, 3], vec![-2., -1., 0., 1., 2., 3.], dtype).to_cuda();
         let empty = make_tensor(&[2, 0, 3], vec![], dtype).to_cuda();
@@ -172,7 +172,7 @@ fn cuda_cat_with_empty_inputs_keeps_inference_resident() {
 #[test]
 fn cat_empty_inputs_preserve_dtype_promotion() {
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for on_cuda in [false, true] {
         if on_cuda && !crate::ops::cuda::is_available() {
             continue;
@@ -233,9 +233,9 @@ fn cuda_cat_with_empty_inputs_preserves_training_gradients() {
         return;
     }
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for strict in [false, true] {
-        let _strict = crate::autograd::set_strict_device_execution_scoped(strict);
+        let _strict = crate::device::set_strict_device_execution_scoped(strict);
         for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
             let empty = Tensor::new_with_dtype(Array::zeros(IxDyn(&[2, 0, 3])), dtype).to_cuda();
             let full = Tensor::new_with_dtype(Array::ones(IxDyn(&[2, 1, 3])), dtype).to_cuda();
@@ -281,7 +281,7 @@ fn cuda_empty_shape_training_preserves_gradient_shapes() {
         return;
     }
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for shape in [[0, 3, 4], [2, 0, 4], [2, 3, 0]] {
         for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
             let input = Tensor::new_with_dtype(Array::zeros(IxDyn(&shape)), dtype).to_cuda();
@@ -319,7 +319,7 @@ fn cuda_zero_width_slice_backward_preserves_existing_gradients() {
         return;
     }
     let _cuda = crate::ops::cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     let input = Tensor::new(Array::ones(IxDyn(&[2, 3]))).to_cuda();
     input.add_grad(Array::ones(IxDyn(&[2, 3])));
     let output = slice_last_dim(&input, 1, 1);
@@ -503,9 +503,9 @@ fn cuda_reshape_reuses_native_bf16_buffer_in_strict_mode() {
             .handle()
     };
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let reshaped = no_grad(|| reshape(&input, vec![4, 2]));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     assert!(reshaped.is_cuda());
     assert_eq!(reshaped.dtype(), DType::BF16);
@@ -585,9 +585,9 @@ fn cuda_permute_matches_cpu_reference_in_strict_mode() {
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(input.0.borrow().cuda_bf16_data.is_some());
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| permute(&input, vec![2, 0, 1]));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let cpu_out = no_grad(|| permute(&input.to_cpu(), vec![2, 0, 1]));
     assert!(cuda_out.is_cuda());
@@ -665,9 +665,9 @@ fn cuda_slice_last_dim_matches_cpu_reference_in_strict_mode() {
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(input.0.borrow().cuda_bf16_data.is_some());
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| slice_last_dim(&input, 1, 4));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let cpu_out = no_grad(|| slice_last_dim(&input.to_cpu(), 1, 4));
     assert!(cuda_out.is_cuda());
@@ -694,9 +694,9 @@ fn cuda_slice_last_dim_empty_no_grad_stays_on_cuda_in_strict_mode() {
     )
     .to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| slice_last_dim(&input, 2, 2));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     assert!(out.is_cuda());
     assert_eq!(out.dtype(), DType::BF16);
@@ -725,7 +725,7 @@ fn cuda_empty_shape_ops_chain_stays_on_cuda_in_strict_mode() {
     )
     .to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| {
         let lhs_empty = slice_last_dim(&lhs, 2, 2);
         let rhs_empty = slice_last_dim(&rhs, 2, 2);
@@ -734,7 +734,7 @@ fn cuda_empty_shape_ops_chain_stays_on_cuda_in_strict_mode() {
         let joined = cat(&[lhs_permuted, rhs_permuted], 0);
         reshape(&joined, vec![6, 2, 0])
     });
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     assert!(out.is_cuda());
     assert_eq!(out.dtype(), DType::BF16);

@@ -1,5 +1,6 @@
 use super::*;
-use crate::autograd::{no_grad, set_strict_device_execution};
+use crate::autograd::no_grad;
+use crate::device::set_strict_device_execution;
 #[cfg(feature = "cuda")]
 use crate::loss::CrossEntropyLoss;
 use crate::precision::{
@@ -34,7 +35,7 @@ fn cuda_activation_cast_to_f32_materializes_requested_dtype() {
         return;
     }
     let _enabled = cuda::set_enabled_scoped(true);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(true);
+    let _strict = crate::device::set_strict_device_execution_scoped(true);
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let values = ArrayD::from_shape_vec(IxDyn(&[1, 1, 4]), vec![0.5, -1.0, 1.5, 2.0]).unwrap();
         let reference =
@@ -261,7 +262,7 @@ fn forward_last_argmax_batch_matches_logits_argmax() {
 #[test]
 fn bf16_rounded_logits_can_tie_while_f32_argmax_has_a_unique_winner() {
     let _cuda = cuda::set_enabled_scoped(false);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(false);
+    let _strict = crate::device::set_strict_device_execution_scoped(false);
     with_precision_config(PrecisionConfig::default(), || {
         let model = LlamaModel::new_with_dtype(test_config(), DType::BF16);
         let mut weights = vec![0.; 32 * 8];
@@ -593,9 +594,9 @@ fn llama_mlp_decode_fast_path_stays_on_cuda_and_matches_cpu() {
     )
     .to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| mlp.forward(input.clone()));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let cpu_out = no_grad(|| mlp_ref.forward(input.to_cpu()));
     assert!(cuda_out.is_cuda());

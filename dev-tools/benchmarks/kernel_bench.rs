@@ -13,8 +13,8 @@ use lumen::ops::int8_kernels::{
 };
 use lumen::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel, dual_matvec_rowmajor_parallel_mixed,
-    dual_matvec_silu_mul_rowmajor_parallel, dual_matvec_silu_mul_rowmajor_parallel_mixed, matmul,
-    matvec_argmax_rowmajor_parallel, matvec_argmax_rowmajor_parallel_mixed,
+    dual_matvec_silu_mul_rowmajor_parallel, dual_matvec_silu_mul_rowmajor_parallel_mixed,
+    matmul_transposed_rhs, matvec_argmax_rowmajor_parallel, matvec_argmax_rowmajor_parallel_mixed,
     matvec_rowmajor_parallel, matvec_rowmajor_parallel_mixed,
 };
 use lumen::optim::{Adam, Optimizer, SGD};
@@ -1197,22 +1197,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     set_allow_parameter_dtype_copies(false);
     no_grad(|| {
-        let _ = black_box(matmul(&input, &weight_no_copy));
+        let _ = black_box(matmul_transposed_rhs(&input, &weight_no_copy));
     });
     let tensor_no_copy = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input), black_box(&weight_no_copy));
+            let out = matmul_transposed_rhs(black_box(&input), black_box(&weight_no_copy));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
 
     set_allow_parameter_dtype_copies(true);
     no_grad(|| {
-        let _ = black_box(matmul(&input, &weight_cached));
+        let _ = black_box(matmul_transposed_rhs(&input, &weight_cached));
     });
     let tensor_cached = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input), black_box(&weight_cached));
+            let out = matmul_transposed_rhs(black_box(&input), black_box(&weight_cached));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
@@ -1220,22 +1220,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     set_allow_parameter_dtype_copies(false);
     no_grad(|| {
-        let _ = black_box(matmul(&input_bf16, &weight_no_copy));
+        let _ = black_box(matmul_transposed_rhs(&input_bf16, &weight_no_copy));
     });
     let tensor_bf16_no_copy = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input_bf16), black_box(&weight_no_copy));
+            let out = matmul_transposed_rhs(black_box(&input_bf16), black_box(&weight_no_copy));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
 
     set_allow_parameter_dtype_copies(true);
     no_grad(|| {
-        let _ = black_box(matmul(&input_bf16, &weight_cached));
+        let _ = black_box(matmul_transposed_rhs(&input_bf16, &weight_cached));
     });
     let tensor_bf16_cached = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input_bf16), black_box(&weight_cached));
+            let out = matmul_transposed_rhs(black_box(&input_bf16), black_box(&weight_cached));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
@@ -1248,22 +1248,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     set_allow_parameter_dtype_copies(false);
     no_grad(|| {
-        let _ = black_box(matmul(&input_f16, &weight_no_copy_f16));
+        let _ = black_box(matmul_transposed_rhs(&input_f16, &weight_no_copy_f16));
     });
     let tensor_f16_no_copy = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input_f16), black_box(&weight_no_copy_f16));
+            let out = matmul_transposed_rhs(black_box(&input_f16), black_box(&weight_no_copy_f16));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
 
     set_allow_parameter_dtype_copies(true);
     no_grad(|| {
-        let _ = black_box(matmul(&input_f16, &weight_cached_f16));
+        let _ = black_box(matmul_transposed_rhs(&input_f16, &weight_cached_f16));
     });
     let tensor_f16_cached = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input_f16), black_box(&weight_cached_f16));
+            let out = matmul_transposed_rhs(black_box(&input_f16), black_box(&weight_cached_f16));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
@@ -1275,18 +1275,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     no_grad(|| {
-        let _ = black_box(matmul(&input, &weight_i8_ref));
-        let _ = black_box(matmul(&input, &weight_i8));
+        let _ = black_box(matmul_transposed_rhs(&input, &weight_i8_ref));
+        let _ = black_box(matmul_transposed_rhs(&input, &weight_i8));
     });
     let tensor_i8_ref = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input), black_box(&weight_i8_ref));
+            let out = matmul_transposed_rhs(black_box(&input), black_box(&weight_i8_ref));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });
     let tensor_i8 = bench_sampled(args.samples, args.iters, || {
         no_grad(|| {
-            let out = matmul(black_box(&input), black_box(&weight_i8));
+            let out = matmul_transposed_rhs(black_box(&input), black_box(&weight_i8));
             black_box(out.data_ref()[[0, 0, 0]]);
         });
     });

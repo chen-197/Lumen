@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- Preserve native CPU LayerNorm input and parameter storage when creating F32
+  compute views, including training, instead of implicitly promoting them on read.
+- Balance explicitly capped CPU indexed loops without temporary lists of views,
+  avoiding lost task groups from ceiling-width partitioning. Mutable-slice loops
+  and within-tile numerical order retain their existing implementation.
+- Construct benchmark layouts in native storage precision and record actual
+  matrix strides; casting an already-strided F32 tensor could normalize its
+  low-precision storage and mislabel it as strided.
+- Preserve the measured output dtype when inspecting values in the generic
+  matrix/attention benchmark, instead of promoting its output to F32.
 - Keep ByteLevel streaming prefixes valid when one BPE token finishes a UTF-8
   character and begins another; pending token IDs remain unchanged.
 - Return a configuration error for integer KV storage before constructing a
@@ -15,6 +25,9 @@
 
 ### Added
 
+- Standard `ops::matmul::matmul(A, B)` with `[..., K] @ [K, N] -> [..., N]`,
+  CPU/CUDA forward and gradients, mixed precisions, strided inputs and empty axes.
+  Use `matmul_transposed_rhs(A, W)` for output-major `[N, K]` weights.
 - Dense Qwen3 model/configuration support with explicit attention head dimensions,
   per-head Q/K RMSNorm, tied embedding/output parameters and shared decoder kernels.
 - Configuration-driven CLI and model benchmarks, text-only Qwen3 ChatML with optional
@@ -24,6 +37,57 @@
 
 ### Changed
 
+- Schedule CPU LayerNorm backward with fused row folds in caller-owned pools,
+  keeping small work serial, F64 accumulation and within-row arithmetic.
+  Skip frozen input/parameter gradients. Parameter sums may round differently
+  across groups; add `layer_norm_backward` scaling measurements.
+- Schedule CPU RMSNorm backward rows and weight-gradient folds through
+  caller-pool/task contexts, keeping small work serial and row arithmetic
+  unchanged. Weight-gradient grouping may change rounding; add
+  `rms_norm_backward` scaling measurements.
+- Fuse no-grad CPU LayerNorm row statistics and output, borrowing contiguous F32
+  inputs and avoiding normalized/backward-statistic arrays. Keep centered F64
+  statistics, F32 affine arithmetic and existing backward formulas.
+- Route CPU RMSNorm forward rows through work-aware caller-pool scheduling,
+  keeping small rows serial and respecting explicit task budgets. Preserve
+  per-row arithmetic, native storage and backward reductions. Add `rms_norm`
+  to the shared-pool scaling benchmark.
+- Reuse native BF16 panels for eligible narrow transposed-RHS CPU projections,
+  using shape, ISA and caller capacity to retain row kernels for small parallel
+  work and uneven column budgets. Keep mixed precisions and single-row decoding
+  on their existing routes.
+- Write native BF16 matrix-product panels directly into disjoint column views
+  of the final output, for both RHS layouts. Mask tail stores, group adjacent
+  panels within caller budgets, and remove the padded full-result buffer and
+  serial rearrangement without changing dot-product accumulation order.
+- Pack complete transposed-RHS BF16 K-pair panels with an AVX2 8x8 integer
+  transpose, preserving element bits, odd-K padding and accumulation order.
+  Retain SSE2/scalar fallbacks and the existing caller-controlled scheduling.
+- Stream standard CPU vector/few-row products from row-major F32/F16/BF16/I8
+  RHS storage with runtime AVX2/FMA or AVX-512 dispatch, avoiding RHS packing
+  and full conversion. Keep small work serial and preserve caller budgets for
+  larger work; narrow multi-row F32 and strided RHS retain general GEMM.
+- Accept custom matrix dimensions (`--shape M,K,N`) and storage layout
+  (`--layout 0|1`) in `generic_prefill_bench`, preserving its default cases.
+- Pack standard CPU matmul F16/BF16/I8 RHS panels directly from `[K, N]`
+  strides on supported x86 CPUs, retaining native weight storage and F32
+  accumulation without a complete RHS conversion or transpose. BF16 pairs
+  reuse the AVX-512 BF16 kernel; small products retain general GEMM.
+- Skip unused CPU matrix-product gradients and their operand conversions when
+  only one input requires gradients, for both standard and transposed RHS.
+- Move device types, strict execution policy and Tensor CPU/CUDA transfer/sync
+  implementation to `src/device.rs`. Use `lumen::device` as the canonical import;
+  earlier `lumen::autograd` device imports remain compatible through re-exports.
+- Breaking API clarification: the earlier `matmul(A, W)` operation is now
+  `matmul_transposed_rhs(A, W)` and continues to compute `A @ Wᵀ`. Migrate old
+  calls explicitly, including square weights. `Linear`, training, model paths,
+  benchmarks and examples use the explicit name. `batch_matmul` retains its
+  existing 4D standard-product semantics.
+- Pack BF16 inference inputs as rows of element pairs, removing per-element
+  index division while preserving strided views, odd-K padding and conversions.
+- Pack F16/BF16 CPU weight panels with an 8x8 integer SIMD transpose for both
+  AVX2 and AVX-512 mixed-precision GEMM, preserving weight bits, padded tails,
+  F32 accumulation order and caller task budgets.
 - Pack native CPU BF16 weight panels with an integer SIMD transpose, preserving
   weight bits, padded tails and the existing F32 accumulation order.
 - Keep BF16 prefill on the tiled path for long inputs beyond the former

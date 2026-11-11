@@ -1,5 +1,6 @@
 use super::*;
-use crate::autograd::{Tensor, set_strict_device_execution};
+use crate::autograd::Tensor;
+use crate::device::set_strict_device_execution;
 use ndarray::{Array, IxDyn};
 
 fn grad_tensor(shape: &[usize], data: Vec<f32>) -> Tensor {

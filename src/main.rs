@@ -1,7 +1,8 @@
 use mimalloc::MiMalloc;
 
-use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
+use lumen::autograd::{Tensor, no_grad};
 use lumen::cpu::CpuInferenceContext;
+use lumen::device::{Device, set_strict_device_execution_scoped};
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
 use lumen::models::{CausalLMConfig, LlamaModel};

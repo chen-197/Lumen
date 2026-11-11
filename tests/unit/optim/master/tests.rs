@@ -40,7 +40,7 @@ fn optimizer(param: &Tensor, kind: &str, lr: f32, master: bool) -> Box<dyn Optim
 
 fn subquantum_steps(device: Device) {
     let _enabled = cuda::set_enabled_scoped(device == Device::Cuda);
-    let _strict = crate::autograd::set_strict_device_execution_scoped(device == Device::Cuda);
+    let _strict = crate::device::set_strict_device_execution_scoped(device == Device::Cuda);
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let quantum = match dtype {
             DType::F16 => 1.0 / 1024.0,
@@ -225,7 +225,7 @@ fn i8_adam_master_training_escapes_initial_range_plateau() {
             continue;
         }
         let _enabled = cuda::set_enabled_scoped(device == Device::Cuda);
-        let _strict = crate::autograd::set_strict_device_execution_scoped(device == Device::Cuda);
+        let _strict = crate::device::set_strict_device_execution_scoped(device == Device::Cuda);
         with_precision_config(
             PrecisionConfig {
                 parameter_dtype: DType::I8,

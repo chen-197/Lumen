@@ -1,7 +1,5 @@
-use crate::autograd::{
-    StoragePreference, Tensor, TensorData, TensorStorageView, assert_native_device_support,
-    is_no_grad, is_strict_device_execution,
-};
+use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
+use crate::device::{assert_native_device_support, is_strict_device_execution};
 use crate::ops::cuda;
 use crate::precision::DType;
 use ndarray::{Array2, Zip, arr0};
@@ -28,7 +26,7 @@ fn cuda_loss_storage(tensor: &Tensor) -> Option<(cuda::CudaBuffer, DType, Option
 pub struct MSELoss;
 impl MSELoss {
     pub fn apply(output: &Tensor, target: &Tensor) -> Tensor {
-        let output_device = crate::autograd::assert_same_device(output, target, "mse_loss");
+        let output_device = crate::device::assert_same_device(output, target, "mse_loss");
         assert_eq!(
             output.shape_vec(),
             target.shape_vec(),
@@ -36,10 +34,10 @@ impl MSELoss {
         );
         assert!(!output.is_empty(), "mse_loss expects at least one element");
         let build_graph = !is_no_grad() && (output.requires_grad() || target.requires_grad());
-        let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+        let cuda_native_supported = output_device == crate::device::Device::Cuda;
         assert_native_device_support(output_device, "mse_loss", cuda_native_supported);
 
-        if output_device == crate::autograd::Device::Cuda {
+        if output_device == crate::device::Device::Cuda {
             let cuda_forward = (|| {
                 let (out_buf, out_dtype, out_scale) = cuda_loss_storage(output)
                     .ok_or_else(|| "CUDA mse_loss output missing resident buffer".to_string())?;
@@ -249,10 +247,10 @@ mod dense_targets_tests;
 impl CrossEntropyLoss {
     pub fn apply(input_logits: &Tensor, target_onehot: &Tensor) -> Tensor {
         let output_device =
-            crate::autograd::assert_same_device(input_logits, target_onehot, "cross_entropy");
+            crate::device::assert_same_device(input_logits, target_onehot, "cross_entropy");
         let build_graph =
             !is_no_grad() && (input_logits.requires_grad() || target_onehot.requires_grad());
-        let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+        let cuda_native_supported = output_device == crate::device::Device::Cuda;
         assert_native_device_support(output_device, "cross_entropy", cuda_native_supported);
         let shape = input_logits.shape_vec();
         assert_eq!(
@@ -275,7 +273,7 @@ impl CrossEntropyLoss {
             dim > 0,
             "cross_entropy class dimension must be greater than zero"
         );
-        if output_device == crate::autograd::Device::Cuda {
+        if output_device == crate::device::Device::Cuda {
             let cuda_forward = (|| {
                 let (logits_buf, logits_dtype, logits_scale) = cuda_loss_storage(input_logits)
                     .ok_or_else(|| {

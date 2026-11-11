@@ -1,6 +1,7 @@
 //! Resident F16/BF16 optimizer state; parameter/gradient arithmetic remains F32.
 use super::{adam_bias_corrections, finalize_cuda_param_update, should_use_cuda_pointer_batch};
-use crate::autograd::{Device, Tensor};
+use crate::autograd::Tensor;
+use crate::device::Device;
 use crate::ops::cuda::{self, CudaBuffer, LowpOptimizerConfig};
 use crate::precision::DType;
 use std::collections::BTreeMap;

@@ -5,8 +5,8 @@ use super::backward::{
 };
 use super::*;
 use crate::accuracy_gate::{check, ordered, tensor, values};
-use crate::autograd::Device;
 use crate::cpu::CpuKernelContext;
+use crate::device::Device;
 use std::num::NonZeroUsize;
 use std::sync::{
     Arc,

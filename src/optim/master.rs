@@ -1,5 +1,6 @@
 //! Explicit training storage: keep sub-quantum updates outside the forward tensor.
-use crate::autograd::{Device, StoragePreference, Tensor, TensorStorageView};
+use crate::autograd::{StoragePreference, Tensor, TensorStorageView};
+use crate::device::Device;
 use crate::ops::cuda;
 use crate::precision::{DType, ParameterQuantization};
 

@@ -54,7 +54,7 @@ architectures are not covered by running more combinations on one x86 machine.
   retained graphs, accumulation, optimizer state and checkpoints catch different
   failures. A training loss decrease alone cannot replace numerical references.
 - Keep all nine Python references: operator FP64, dense cross entropy, autograd
-  reuse, gradient flags, accumulation, generic NN, generic prefill and row matmul.
+  reuse, gradient flags, accumulation, generic NN, generic prefill (standard and transposed-RHS products) and row matmul.
   The Qwen3 reference also checks expanded attention heads, Q/K normalization,
   tied embeddings, full logits and all parameter VJPs against independent FP64
   equations. Their targets differ; none is replaced by the real-model generation check.

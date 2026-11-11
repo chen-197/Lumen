@@ -1393,7 +1393,7 @@ fn cuda_same_shape_lowp_binary_uses_native_forward_buffer_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let lhs = make_tensor(&[2, 2], vec![1.0, -2.0, 0.5, 3.0], dtype).to_cuda();
@@ -1445,7 +1445,7 @@ fn cuda_same_shape_lowp_binary_uses_native_forward_buffer_in_strict_mode() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -1457,7 +1457,7 @@ fn cuda_same_shape_lowp_binary_training_forward_outputs_f32_buffer() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let lhs =
@@ -1496,7 +1496,7 @@ fn cuda_same_shape_lowp_binary_training_forward_outputs_f32_buffer() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -1508,7 +1508,7 @@ fn cuda_b1d_1hd_lowp_binary_forward_uses_resident_buffers_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_tensor(
         &[2, 1, 3],
@@ -1540,7 +1540,7 @@ fn cuda_b1d_1hd_lowp_binary_forward_uses_resident_buffers_in_strict_mode() {
     assert!(lhs.0.borrow().cuda_f32_data.is_none());
     assert!(lhs.0.borrow().cuda_bf16_data.is_some());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let add_vals = add_out.data_ref().iter().copied().collect::<Vec<_>>();
@@ -1586,7 +1586,7 @@ fn cuda_row_scalar_lowp_binary_forward_uses_resident_buffers_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_tensor(
         &[2, 2, 3],
@@ -1613,7 +1613,7 @@ fn cuda_row_scalar_lowp_binary_forward_uses_resident_buffers_in_strict_mode() {
     assert!(lhs.0.borrow().cuda_f32_data.is_none());
     assert!(lhs.0.borrow().cuda_bf16_data.is_some());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let add_vals = add_out.data_ref().iter().copied().collect::<Vec<_>>();
@@ -1656,7 +1656,7 @@ fn cuda_special_lowp_binary_forward_uses_typed_output_buffers_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let row_lhs = make_tensor(
@@ -1703,7 +1703,7 @@ fn cuda_special_lowp_binary_forward_uses_typed_output_buffers_in_strict_mode() {
         assert_cuda_lowp_typed_output(&general_out, dtype, &[2, 4, 2, 3]);
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -1715,7 +1715,7 @@ fn cuda_row_scalar_mixed_lowp_f32_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 2, 3],
@@ -1740,7 +1740,7 @@ fn cuda_row_scalar_mixed_lowp_f32_backward_keeps_lowp_resident() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA row-scalar mul lhs grad");
@@ -1771,7 +1771,7 @@ fn cuda_row_scalar_mixed_lowp_f32_sub_backward_is_shape_only() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 2, 3],
@@ -1794,7 +1794,7 @@ fn cuda_row_scalar_mixed_lowp_f32_sub_backward_is_shape_only() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA row-scalar sub lhs grad");
@@ -1815,7 +1815,7 @@ fn cuda_lowp_sum_uses_resident_forward_buffer_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let input = make_tensor(&[2, 2], vec![1.0, -2.0, 0.5, 3.0], dtype).to_cuda();
@@ -1835,7 +1835,7 @@ fn cuda_lowp_sum_uses_resident_forward_buffer_in_strict_mode() {
         );
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -1847,7 +1847,7 @@ fn cuda_lowp_sum_backward_keeps_f32_grad_and_no_operand_f32_materialization() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let input =
@@ -1865,7 +1865,7 @@ fn cuda_lowp_sum_backward_keeps_f32_grad_and_no_operand_f32_materialization() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -1902,7 +1902,7 @@ fn cuda_row_broadcast_lowp_binary_uses_resident_forward_buffer_in_strict_mode() 
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let matrix = make_tensor(&[2, 3], vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0], dtype).to_cuda();
@@ -1952,7 +1952,7 @@ fn cuda_row_broadcast_lowp_binary_uses_resident_forward_buffer_in_strict_mode() 
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -1964,7 +1964,7 @@ fn cuda_row_broadcast_mixed_lowp_f32_uses_resident_forward_buffer_in_strict_mode
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let matrix = make_tensor(&[2, 3], vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0], DType::BF16).to_cuda();
     let row = make_tensor(&[3], vec![0.5, 3.0, -1.5], DType::F32).to_cuda();
@@ -1992,7 +1992,7 @@ fn cuda_row_broadcast_mixed_lowp_f32_uses_resident_forward_buffer_in_strict_mode
         assert!((got - expected).abs() <= 0.08);
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -2004,7 +2004,7 @@ fn cuda_same_shape_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs =
         make_training_tensor_with_dtype(&[2, 3], vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0], DType::BF16)
@@ -2028,7 +2028,7 @@ fn cuda_same_shape_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA same-shape mixed mul lhs grad");
@@ -2049,7 +2049,7 @@ fn cuda_row_broadcast_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let matrix =
         make_training_tensor_with_dtype(&[2, 3], vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0], DType::BF16)
@@ -2068,7 +2068,7 @@ fn cuda_row_broadcast_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     assert!(!matrix.has_host_grad());
     assert!(!row.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let matrix_grad = matrix.grad().expect("CUDA mixed row-broadcast matrix grad");
@@ -2092,7 +2092,7 @@ fn cuda_mixed_lowp_f32_add_sub_backward_is_shape_only() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs =
         make_training_tensor_with_dtype(&[2, 2], vec![1.0, -2.0, 0.5, 3.0], DType::BF16).to_cuda();
@@ -2111,7 +2111,7 @@ fn cuda_mixed_lowp_f32_add_sub_backward_is_shape_only() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA add lhs grad");
@@ -2129,7 +2129,7 @@ fn cuda_row_broadcast_mixed_lowp_f32_sub_backward_is_shape_only() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let matrix =
         make_training_tensor_with_dtype(&[2, 3], vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0], DType::BF16)
@@ -2148,7 +2148,7 @@ fn cuda_row_broadcast_mixed_lowp_f32_sub_backward_is_shape_only() {
     assert!(!matrix.has_host_grad());
     assert!(!row.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let matrix_grad = matrix.grad().expect("CUDA row-broadcast sub matrix grad");
@@ -2169,7 +2169,7 @@ fn cuda_general_broadcast_mixed_lowp_f32_sub_backward_is_shape_only() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 1, 3],
@@ -2192,7 +2192,7 @@ fn cuda_general_broadcast_mixed_lowp_f32_sub_backward_is_shape_only() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA general-broadcast sub lhs grad");
@@ -2213,7 +2213,7 @@ fn cuda_general_broadcast_non_special_mixed_lowp_f32_add_backward_is_shape_only(
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 1, 1, 3],
@@ -2243,7 +2243,7 @@ fn cuda_general_broadcast_non_special_mixed_lowp_f32_add_backward_is_shape_only(
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA non-special broadcast add lhs grad");
@@ -2264,7 +2264,7 @@ fn cuda_b1d_1hd_broadcast_mixed_lowp_f32_add_backward_is_shape_only() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 1, 3],
@@ -2293,7 +2293,7 @@ fn cuda_b1d_1hd_broadcast_mixed_lowp_f32_add_backward_is_shape_only() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA b1d/1hd broadcast add lhs grad");
@@ -2314,7 +2314,7 @@ fn cuda_b1d_1hd_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 1, 3],
@@ -2343,7 +2343,7 @@ fn cuda_b1d_1hd_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA b1d/1hd mul lhs grad");
@@ -2370,7 +2370,7 @@ fn cuda_general_broadcast_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 1, 1, 3],
@@ -2400,7 +2400,7 @@ fn cuda_general_broadcast_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA general-broadcast mul lhs grad");
@@ -2427,7 +2427,7 @@ fn cuda_b1d_1h1_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_training_tensor_with_dtype(
         &[2, 1, 3],
@@ -2450,7 +2450,7 @@ fn cuda_b1d_1h1_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA b1d/1h1 mul lhs grad");
@@ -2471,7 +2471,7 @@ fn cuda_scalar_broadcast_mixed_lowp_f32_sub_backward_is_shape_only() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs =
         make_training_tensor_with_dtype(&[2, 2], vec![1.0, -2.0, 0.5, 3.0], DType::BF16).to_cuda();
@@ -2489,7 +2489,7 @@ fn cuda_scalar_broadcast_mixed_lowp_f32_sub_backward_is_shape_only() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA scalar-broadcast sub lhs grad");
@@ -2508,7 +2508,7 @@ fn cuda_scalar_broadcast_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs =
         make_training_tensor_with_dtype(&[2, 2], vec![1.0, -2.0, 0.5, 3.0], DType::BF16).to_cuda();
@@ -2526,7 +2526,7 @@ fn cuda_scalar_broadcast_mixed_lowp_f32_mul_backward_keeps_lowp_resident() {
     assert!(!lhs.has_host_grad());
     assert!(!rhs.has_host_grad());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let lhs_grad = lhs.grad().expect("CUDA scalar-broadcast mul lhs grad");
@@ -2545,7 +2545,7 @@ fn cuda_row_broadcast_lowp_mul_backward_outputs_f32_grads() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     for dtype in [DType::F16, DType::BF16, DType::I8] {
         let matrix =
@@ -2573,7 +2573,7 @@ fn cuda_row_broadcast_lowp_mul_backward_outputs_f32_grads() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -2585,7 +2585,7 @@ fn cuda_2d_row_broadcast_i8_mul_backward_matches_reference() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let matrix =
         make_training_tensor_with_dtype(&[2, 3], vec![1.0, -2.0, 0.5, 3.0, -4.0, 2.0], DType::I8)
@@ -2600,7 +2600,7 @@ fn cuda_2d_row_broadcast_i8_mul_backward_matches_reference() {
     assert!(!matrix.has_host_f32_data());
     assert!(!row.has_host_f32_data());
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let matrix_grad = matrix.grad().expect("CUDA 2D row-broadcast matrix grad");
@@ -2874,7 +2874,7 @@ fn cuda_empty_binary_and_sum_stay_stable_in_strict_mode() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let lhs = make_tensor(&[0, 4], vec![], DType::BF16).to_cuda();
     let rhs = make_tensor(&[0, 4], vec![], DType::BF16).to_cuda();
@@ -2906,7 +2906,7 @@ fn cuda_empty_binary_and_sum_stay_stable_in_strict_mode() {
     assert_eq!(lhs_grad.len(), 0);
     assert_eq!(rhs_grad.len(), 0);
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -2923,7 +2923,7 @@ fn cuda_sum_backward_matches_cpu_reference_in_strict_mode() {
         .collect::<Vec<_>>();
 
     crate::ops::cuda::set_enabled(false);
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     let cpu_input = make_training_tensor(&shape, values.clone());
     let cpu_out = sum(&cpu_input);
     cpu_out.backward();
@@ -2933,7 +2933,7 @@ fn cuda_sum_backward_matches_cpu_reference_in_strict_mode() {
     let cpu_sum = cpu_out.data_ref().first().copied().unwrap();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_input = make_training_tensor(&shape, values).to_cuda();
     let cuda_out = sum(&cuda_input);
     assert!(cuda_out.is_cuda());
@@ -2944,7 +2944,7 @@ fn cuda_sum_backward_matches_cpu_reference_in_strict_mode() {
     assert!(cuda_input.cloned_cuda_f32_grad().is_some());
     let cuda_sum = cuda_out.data_ref().first().copied().unwrap();
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(
@@ -2976,7 +2976,7 @@ fn cuda_binary_backward_matches_cpu_reference_in_strict_mode() {
 
     for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
         crate::ops::cuda::set_enabled(false);
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(false);
         let cpu_lhs = make_training_tensor(&shape, lhs_values.clone());
         let cpu_rhs = make_training_tensor(&shape, rhs_values.clone());
         let cpu_out = match op {
@@ -2993,7 +2993,7 @@ fn cuda_binary_backward_matches_cpu_reference_in_strict_mode() {
             .expect("CPU binary backward should populate rhs grad");
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
+        crate::device::set_strict_device_execution(true);
         let cuda_lhs = make_training_tensor(&shape, lhs_values.clone()).to_cuda();
         let cuda_rhs = make_training_tensor(&shape, rhs_values.clone()).to_cuda();
         let binary_out = match op {
@@ -3033,7 +3033,7 @@ fn cuda_binary_backward_matches_cpu_reference_in_strict_mode() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3045,7 +3045,7 @@ fn backward_traverses_node_with_cuda_only_grad() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let shape = [64, 256];
     let values = (0..(shape[0] * shape[1]))
@@ -3077,7 +3077,7 @@ fn backward_traverses_node_with_cuda_only_grad() {
         );
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3089,7 +3089,7 @@ fn backward_seeds_no_host_cuda_output_without_host_grad() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let shape = [64, 256];
     let values = (0..(shape[0] * shape[1]))
@@ -3114,7 +3114,7 @@ fn backward_seeds_no_host_cuda_output_without_host_grad() {
         );
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3126,7 +3126,7 @@ fn backward_materializes_cuda_only_grad_for_host_backed_cuda_node() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let shape = [128];
     let values = (0..shape[0])
@@ -3155,7 +3155,7 @@ fn backward_materializes_cuda_only_grad_for_host_backed_cuda_node() {
         );
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3167,7 +3167,7 @@ fn cuda_only_grad_accumulates_after_host_grad() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
 
     let input = make_training_tensor(&[3], vec![1.0, 2.0, 3.0]).to_cuda();
     let out = input.clone() + input.clone();
@@ -3185,7 +3185,7 @@ fn cuda_only_grad_accumulates_after_host_grad() {
         vec![6.0, 6.0, 6.0]
     );
     assert!(input.cloned_cuda_f32_grad().is_some());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3207,7 +3207,7 @@ fn cuda_broadcast_binary_backward_matches_cpu_reference_in_strict_mode() {
 
     for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
         crate::ops::cuda::set_enabled(false);
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(false);
         let cpu_lhs = make_training_tensor(&lhs_shape, lhs_values.clone());
         let cpu_rhs = make_training_tensor(&rhs_shape, rhs_values.clone());
         let cpu_out = match op {
@@ -3224,7 +3224,7 @@ fn cuda_broadcast_binary_backward_matches_cpu_reference_in_strict_mode() {
             .expect("CPU broadcast binary backward should populate rhs grad");
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
+        crate::device::set_strict_device_execution(true);
         let cuda_lhs = make_training_tensor(&lhs_shape, lhs_values.clone()).to_cuda();
         let cuda_rhs = make_training_tensor(&rhs_shape, rhs_values.clone()).to_cuda();
         let cuda_out = match op {
@@ -3259,7 +3259,7 @@ fn cuda_broadcast_binary_backward_matches_cpu_reference_in_strict_mode() {
         }
     }
 
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 }
 
@@ -3294,11 +3294,11 @@ fn cuda_async_general_broadcast_chain_matches_cpu_after_metadata_and_buffer_reus
         let cpu_out = no_grad(|| ((a.clone() + b.clone()) * c.clone()) - d.clone());
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
+        crate::device::set_strict_device_execution(true);
         let cuda_out = no_grad(|| ((a.to_cuda() + b.to_cuda()) * c.to_cuda()) - d.to_cuda());
         assert!(cuda_out.is_cuda());
         assert!(!cuda_out.has_host_f32_data());
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
 
         for (idx, (got, expected)) in cuda_out

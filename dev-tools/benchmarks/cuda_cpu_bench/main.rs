@@ -3,7 +3,8 @@ use mimalloc::MiMalloc;
 #[path = "paths.rs"]
 mod cuda_cpu_bench_path;
 
-use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
+use lumen::autograd::{Tensor, no_grad};
+use lumen::device::{Device, set_strict_device_execution_scoped};
 use lumen::layers::activation::{ReLU, SiLU, Softmax};
 use lumen::layers::{Conv2D, Embedding, MaxPool2D, RMSNorm, RotaryEmbedding, SelfAttention};
 use lumen::loss::{CrossEntropyLoss, MSELoss};
@@ -14,7 +15,7 @@ use lumen::ops::fused::{
     fused_gate_up_silu_infer, fused_qkv_decode_infer_tensors, fused_qkv_prefill_infer_tensors,
     fused_softmax,
 };
-use lumen::ops::matmul::{batch_matmul, matmul};
+use lumen::ops::matmul::{batch_matmul, matmul_transposed_rhs};
 use lumen::optim::{Adam, Optimizer, SGD};
 use lumen::precision::DType;
 
@@ -883,7 +884,7 @@ fn check_matmul_backward(args: &Args, cfg: ShapeConfig) -> CheckResult {
         coeff_data.clone(),
         args.dtype,
     );
-    let cpu_out = matmul(&a_cpu, &b_cpu);
+    let cpu_out = matmul_transposed_rhs(&a_cpu, &b_cpu);
     let cpu_loss = sum(&(&cpu_out * &coeff_cpu));
     let cpu_loss_value = scalar_value(&cpu_loss);
     cpu_loss.backward();
@@ -895,7 +896,7 @@ fn check_matmul_backward(args: &Args, cfg: ShapeConfig) -> CheckResult {
     let a_cuda = tensor_grad(&[cfg.matmul_m, cfg.matmul_k], a_data, args.dtype).to_cuda();
     let b_cuda = tensor_grad(&[cfg.matmul_n, cfg.matmul_k], b_data, args.dtype).to_cuda();
     let coeff_cuda = tensor_const(&[cfg.matmul_m, cfg.matmul_n], coeff_data, args.dtype).to_cuda();
-    let cuda_out = matmul(&a_cuda, &b_cuda);
+    let cuda_out = matmul_transposed_rhs(&a_cuda, &b_cuda);
     let cuda_loss = sum(&(&cuda_out * &coeff_cuda));
     let cuda_loss_value = scalar_value(&cuda_loss);
     cuda_loss.backward();
@@ -912,21 +913,21 @@ fn check_matmul_backward(args: &Args, cfg: ShapeConfig) -> CheckResult {
         rel_tol,
     );
     let (a_abs, a_rel) = assert_close_vec(
-        "matmul.backward.lhs_grad",
+        "matmul_transposed_rhs.backward.lhs_grad",
         &cpu_a_grad,
         &cuda_a_grad,
         abs_tol,
         rel_tol,
     );
     let (b_abs, b_rel) = assert_close_vec(
-        "matmul.backward.rhs_grad",
+        "matmul_transposed_rhs.backward.rhs_grad",
         &cpu_b_grad,
         &cuda_b_grad,
         abs_tol,
         rel_tol,
     );
     CheckResult {
-        name: "matmul.backward",
+        name: "matmul_transposed_rhs.backward",
         metrics: vec![
             loss,
             CheckMetric {
@@ -965,7 +966,7 @@ fn check_matmul_accuracy_case(
     let a_cpu = tensor_grad(&[m, k], a_data.clone(), a_dtype);
     let b_cpu = tensor_grad(&[n, k], b_data.clone(), b_dtype);
     let coeff_cpu = tensor_const(&[m, n], coeff_data.clone(), DType::F32);
-    let cpu_out = matmul(&a_cpu, &b_cpu);
+    let cpu_out = matmul_transposed_rhs(&a_cpu, &b_cpu);
     let cpu_out_data = tensor_data_vec(&cpu_out);
     let cpu_loss = sum(&(&cpu_out * &coeff_cpu));
     let cpu_loss_value = scalar_value(&cpu_loss);
@@ -978,7 +979,7 @@ fn check_matmul_accuracy_case(
     let a_cuda = tensor_grad(&[m, k], a_data, a_dtype).to_cuda();
     let b_cuda = tensor_grad(&[n, k], b_data, b_dtype).to_cuda();
     let coeff_cuda = tensor_const(&[m, n], coeff_data, DType::F32).to_cuda();
-    let cuda_out = matmul(&a_cuda, &b_cuda);
+    let cuda_out = matmul_transposed_rhs(&a_cuda, &b_cuda);
     let cuda_out_data = tensor_data_vec(&cuda_out);
     let cuda_loss = sum(&(&cuda_out * &coeff_cuda));
     let cuda_loss_value = scalar_value(&cuda_loss);
@@ -1073,7 +1074,7 @@ fn check_matmul_matrix_accuracy(args: &Args, _cfg: ShapeConfig) -> CheckResult {
     }
 
     CheckResult {
-        name: "matmul.matrix.accuracy",
+        name: "matmul_transposed_rhs.matrix.accuracy",
         metrics: vec![
             CheckMetric {
                 label: "forward",
@@ -2064,21 +2065,21 @@ fn bench_matmul_forward(args: &Args, cfg: ShapeConfig) -> BenchResult {
         args.dtype,
     );
     let cpu = measure(args, || {
-        let out = no_grad(|| matmul(&a, &b));
+        let out = no_grad(|| matmul_transposed_rhs(&a, &b));
         black_box(out.shape_vec());
     });
     let cuda = if lumen::ops::cuda::is_available() {
         let a_cuda = a.to_cuda();
         let b_cuda = b.to_cuda();
         measure_cuda(args, || {
-            let out = no_grad(|| matmul(&a_cuda, &b_cuda));
+            let out = no_grad(|| matmul_transposed_rhs(&a_cuda, &b_cuda));
             black_box(out.shape_vec());
         })
     } else {
         None
     };
     BenchResult {
-        name: "matmul.forward",
+        name: "matmul_transposed_rhs.forward",
         cpu,
         cuda,
     }
@@ -2140,7 +2141,7 @@ fn bench_matmul_backward(args: &Args, cfg: ShapeConfig) -> BenchResult {
     );
     let cpu = measure(args, || {
         zero_all(&[&a, &b]);
-        let out = matmul(&a, &b);
+        let out = matmul_transposed_rhs(&a, &b);
         let loss = sum(&(&out * &coeff));
         loss.backward();
         black_box(a.grad().is_some());
@@ -2151,7 +2152,7 @@ fn bench_matmul_backward(args: &Args, cfg: ShapeConfig) -> BenchResult {
         let coeff_cuda = coeff.to_cuda();
         measure_cuda(args, || {
             zero_all(&[&a_cuda, &b_cuda]);
-            let out = matmul(&a_cuda, &b_cuda);
+            let out = matmul_transposed_rhs(&a_cuda, &b_cuda);
             let loss = sum(&(&out * &coeff_cuda));
             loss.backward();
             black_box(a_cuda.requires_grad());
@@ -2160,7 +2161,7 @@ fn bench_matmul_backward(args: &Args, cfg: ShapeConfig) -> BenchResult {
         None
     };
     BenchResult {
-        name: "matmul.backward",
+        name: "matmul_transposed_rhs.backward",
         cpu,
         cuda,
     }
@@ -4376,7 +4377,7 @@ fn should_run(args: &Args, name: &str) -> bool {
     let suite_match = match args.suite {
         Suite::All => true,
         Suite::Ops => {
-            name.starts_with("matmul")
+            name.starts_with("matmul_transposed_rhs")
                 || name.starts_with("batch_matmul")
                 || name.starts_with("elementwise")
                 || name.starts_with("binary")
@@ -4499,7 +4500,7 @@ fn main() {
 
     let benches = [
         BenchDef {
-            name: "matmul.forward",
+            name: "matmul_transposed_rhs.forward",
             run: bench_matmul_forward,
         },
         BenchDef {
@@ -4507,7 +4508,7 @@ fn main() {
             run: bench_batch_matmul_forward,
         },
         BenchDef {
-            name: "matmul.backward",
+            name: "matmul_transposed_rhs.backward",
             run: bench_matmul_backward,
         },
         BenchDef {
@@ -4750,11 +4751,11 @@ fn main() {
 
     let checks = [
         CheckDef {
-            name: "matmul.backward",
+            name: "matmul_transposed_rhs.backward",
             run: check_matmul_backward,
         },
         CheckDef {
-            name: "matmul.matrix.accuracy",
+            name: "matmul_transposed_rhs.matrix.accuracy",
             run: check_matmul_matrix_accuracy,
         },
         CheckDef {

@@ -789,9 +789,9 @@ fn cuda_fused_gateup_matches_cpu_reference_in_strict_mode() {
     assert!(gate.0.borrow().cuda_f32_data.is_none());
     assert!(up.0.borrow().cuda_f32_data.is_none());
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| fused_gate_up_silu_infer(&input, &gate, &up));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(gate.0.borrow().cuda_f32_data.is_none());
     assert!(up.0.borrow().cuda_f32_data.is_none());
@@ -854,9 +854,9 @@ fn cuda_fused_gateup_accepts_i8_inputs_in_strict_mode() {
     assert!(gate.0.borrow().cuda_f32_data.is_none());
     assert!(up.0.borrow().cuda_f32_data.is_none());
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| fused_gate_up_silu_infer(&input, &gate, &up));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(gate.0.borrow().cuda_f32_data.is_none());
     assert!(up.0.borrow().cuda_f32_data.is_none());
@@ -895,9 +895,9 @@ fn cuda_fused_gateup_mixed_float_dtypes_promote_to_f32_in_strict_mode() {
     )
     .to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| fused_gate_up_silu_infer(&input, &gate, &up));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     assert!(out.is_cuda());
     assert_eq!(out.dtype(), DType::F32);
@@ -953,10 +953,10 @@ fn cuda_fused_qkv_matches_cpu_reference_in_strict_mode() {
     let k_w = make_tensor(&[hidden, hidden], k.clone(), DType::BF16).to_cuda();
     let v_w = make_tensor(&[hidden, hidden], v.clone(), DType::BF16).to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_cuda, k_cuda, v_cuda) =
         no_grad(|| fused_qkv_decode_infer(&input, &q_w, &k_w, &v_w, 1, 1));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let (q_cpu, k_cpu, v_cpu) = no_grad(|| {
         fused_qkv_decode_infer(
@@ -997,9 +997,9 @@ fn cuda_fused_qkv_accepts_i8_weights_in_strict_mode() {
     let k_w = make_tensor(&[hidden, hidden], k, DType::I8).to_cuda();
     let v_w = make_tensor(&[hidden, hidden], v, DType::I8).to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_out, k_out, v_out) = no_grad(|| fused_qkv_decode_infer(&input, &q_w, &k_w, &v_w, 1, 1));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     assert_eq!(q_out.shape(), &[1, 1, hidden]);
     assert_eq!(k_out.shape(), &[1, 1, hidden]);
@@ -1039,10 +1039,10 @@ fn cuda_fused_qkv_decode_tensors_preserve_bf16_dtype_in_strict_mode() {
     assert!(k_w.0.borrow().cuda_f32_data.is_none());
     assert!(v_w.0.borrow().cuda_f32_data.is_none());
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_out, k_out, v_out) =
         no_grad(|| fused_qkv_decode_infer_tensors(&input, &q_w, &k_w, &v_w, 1, 1));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(q_w.0.borrow().cuda_f32_data.is_none());
     assert!(k_w.0.borrow().cuda_f32_data.is_none());
@@ -1076,10 +1076,10 @@ fn cuda_fused_qkv_decode_tensors_mixed_dtype_promotes_to_f32_in_strict_mode() {
     let k_w = make_tensor(&[hidden, hidden], sample_f32(hidden * hidden), DType::BF16).to_cuda();
     let v_w = make_tensor(&[hidden, hidden], sample_f32(hidden * hidden), DType::F16).to_cuda();
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_out, k_out, v_out) =
         no_grad(|| fused_qkv_decode_infer_tensors(&input, &q_w, &k_w, &v_w, 1, 1));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     for out in [&q_out, &k_out, &v_out] {
         assert!(out.is_cuda());
@@ -1128,12 +1128,12 @@ fn cuda_fused_qkv_prefill_tensors_preserve_f16_dtype_in_strict_mode() {
     assert!(k_w.0.borrow().cuda_f32_data.is_none());
     assert!(v_w.0.borrow().cuda_f32_data.is_none());
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_out, k_out, v_out) = no_grad(|| {
         fused_qkv_prefill_infer_tensors(&input, &q_w, &k_w, &v_w, 1, 1)
             .expect("CUDA prefill fused QKV should run")
     });
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     assert!(input.0.borrow().cuda_f32_data.is_none());
     assert!(q_w.0.borrow().cuda_f32_data.is_none());
     assert!(k_w.0.borrow().cuda_f32_data.is_none());
@@ -1186,7 +1186,7 @@ fn cuda_fused_qkv_prefill_tensors_gqa_matches_cpu_reference_in_strict_mode() {
     let k_w = make_tensor(&[kv_hidden, hidden], k_data, DType::BF16);
     let v_w = make_tensor(&[kv_hidden, hidden], v_data, DType::BF16);
 
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_cuda, k_cuda, v_cuda) = no_grad(|| {
         fused_qkv_prefill_infer_tensors(
             &input.to_cuda(),
@@ -1198,7 +1198,7 @@ fn cuda_fused_qkv_prefill_tensors_gqa_matches_cpu_reference_in_strict_mode() {
         )
         .expect("CUDA prefill fused QKV should run")
     });
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let expected_projection = |weight: &Tensor, out_heads: usize| {
         let x_vals = input.data_ref().iter().copied().collect::<Vec<_>>();
@@ -1275,9 +1275,9 @@ fn cuda_fused_gateup_into_matches_cpu_reference_in_strict_mode() {
     .to_cuda();
 
     let mut cuda_out = vec![0.0f32; inter];
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     no_grad(|| fused_gate_up_silu_infer_into(&input, &gate, &up, &mut cuda_out));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let mut cpu_out = vec![0.0f32; inter];
     no_grad(|| {
@@ -1316,7 +1316,7 @@ fn cuda_fused_qkv_into_matches_cpu_reference_in_strict_mode() {
     let mut q_cuda = vec![0.0f32; hidden];
     let mut k_cuda = vec![0.0f32; hidden];
     let mut v_cuda = vec![0.0f32; hidden];
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     no_grad(|| {
         fused_qkv_decode_infer_into(
             &input,
@@ -1328,7 +1328,7 @@ fn cuda_fused_qkv_into_matches_cpu_reference_in_strict_mode() {
             &mut v_cuda,
         )
     });
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
 
     let mut q_cpu = vec![0.0f32; hidden];
     let mut k_cpu = vec![0.0f32; hidden];
@@ -1476,9 +1476,9 @@ fn cuda_fused_softmax_preserves_bf16_dtype_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| fused_softmax(&input, 0.75, true));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = no_grad(|| fused_softmax(&input.to_cpu(), 0.75, true));
@@ -1521,9 +1521,9 @@ fn cuda_fused_softmax_promotes_i8_to_f32_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| fused_softmax(&input, 1.0, false));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = no_grad(|| fused_softmax(&input.to_cpu(), 1.0, false));
@@ -1581,14 +1581,14 @@ fn cuda_fused_softmax_backward_matches_cpu_reference_in_strict_mode() {
     let coeff_cuda = coeff_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = fused_softmax(&input_cuda, 0.75, true);
     assert!(cuda_out.is_cuda());
     let loss_cuda = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
     loss_cuda.backward();
     assert!(input_cuda.cloned_cuda_f32_grad().is_some());
     assert!(!input_cuda.has_host_grad());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = fused_softmax(&input_cpu, 0.75, true);
@@ -1620,9 +1620,9 @@ fn cuda_fused_softmax_with_past_matches_cpu_reference_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| fused_softmax_with_past_infer(&input, 0.75, true, 2));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = no_grad(|| fused_softmax_with_past_infer(&input.to_cpu(), 0.75, true, 2));
@@ -1665,9 +1665,9 @@ fn cuda_empty_fused_softmax_no_grad_stays_on_cuda_in_strict_mode() {
     let input = make_tensor(&[1, 2, 0, 4], Vec::new(), DType::BF16).to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| fused_softmax(&input, 1.0, false));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -1699,9 +1699,9 @@ fn cuda_empty_fused_gateup_no_grad_stays_on_cuda_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| fused_gate_up_silu_infer(&input, &gate, &up));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -1741,10 +1741,10 @@ fn cuda_empty_fused_qkv_decode_tensors_stay_on_cuda_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_out, k_out, v_out) =
         no_grad(|| fused_qkv_decode_infer_tensors(&input, &q_w, &k_w, &v_w, 1, 1));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     for out in [&q_out, &k_out, &v_out] {
@@ -1790,12 +1790,12 @@ fn cuda_empty_fused_qkv_prefill_tensors_stay_on_cuda_in_strict_mode() {
     .to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_out, k_out, v_out) = no_grad(|| {
         fused_qkv_prefill_infer_tensors(&input, &q_w, &k_w, &v_w, 1, 1)
             .expect("empty CUDA prefill QKV should return empty tensors")
     });
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     for out in [&q_out, &k_out, &v_out] {
@@ -1881,7 +1881,7 @@ fn cuda_fused_qkv_train_bf16_input_i8_weights_backward_stays_native_lowp() {
     }
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_cuda, k_cuda, v_cuda) = fused_qkv_train_tensors(
         &input_cuda,
         &q_w_cuda,
@@ -1904,26 +1904,26 @@ fn cuda_fused_qkv_train_bf16_input_i8_weights_backward_stays_native_lowp() {
             "BF16xI8 fused QKV train backward should not materialize CUDA f32 parameter data"
         );
     }
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let q_cpu = permute(
         &reshape(
-            &crate::ops::matmul::matmul(&input_cpu, &q_w_cpu),
+            &crate::ops::matmul::matmul_transposed_rhs(&input_cpu, &q_w_cpu),
             vec![b as i32, s as i32, n_head as i32, d as i32],
         ),
         vec![0, 2, 1, 3],
     );
     let k_cpu = permute(
         &reshape(
-            &crate::ops::matmul::matmul(&input_cpu, &k_w_cpu),
+            &crate::ops::matmul::matmul_transposed_rhs(&input_cpu, &k_w_cpu),
             vec![b as i32, s as i32, n_kv_head as i32, d as i32],
         ),
         vec![0, 2, 1, 3],
     );
     let v_cpu = permute(
         &reshape(
-            &crate::ops::matmul::matmul(&input_cpu, &v_w_cpu),
+            &crate::ops::matmul::matmul_transposed_rhs(&input_cpu, &v_w_cpu),
             vec![b as i32, s as i32, n_kv_head as i32, d as i32],
         ),
         vec![0, 2, 1, 3],
@@ -2009,7 +2009,7 @@ fn cuda_fused_qkv_train_with_bias_matches_cpu_reference_in_strict_mode() {
     let v_coeff_cuda = v_coeff_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let (q_cuda, k_cuda, v_cuda) = fused_qkv_train_tensors(
         &input_cuda,
         &q_w_cuda,
@@ -2028,26 +2028,26 @@ fn cuda_fused_qkv_train_with_bias_matches_cpu_reference_in_strict_mode() {
     assert!(q_b_cuda.cloned_cuda_f32_grad().is_some());
     assert!(k_b_cuda.cloned_cuda_f32_grad().is_some());
     assert!(v_b_cuda.cloned_cuda_f32_grad().is_some());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let q_cpu = permute(
         &reshape(
-            &(crate::ops::matmul::matmul(&input_cpu, &q_w_cpu) + q_b_cpu.clone()),
+            &(crate::ops::matmul::matmul_transposed_rhs(&input_cpu, &q_w_cpu) + q_b_cpu.clone()),
             vec![b as i32, s as i32, n_head as i32, d as i32],
         ),
         vec![0, 2, 1, 3],
     );
     let k_cpu = permute(
         &reshape(
-            &(crate::ops::matmul::matmul(&input_cpu, &k_w_cpu) + k_b_cpu.clone()),
+            &(crate::ops::matmul::matmul_transposed_rhs(&input_cpu, &k_w_cpu) + k_b_cpu.clone()),
             vec![b as i32, s as i32, n_kv_head as i32, d as i32],
         ),
         vec![0, 2, 1, 3],
     );
     let v_cpu = permute(
         &reshape(
-            &(crate::ops::matmul::matmul(&input_cpu, &v_w_cpu) + v_b_cpu.clone()),
+            &(crate::ops::matmul::matmul_transposed_rhs(&input_cpu, &v_w_cpu) + v_b_cpu.clone()),
             vec![b as i32, s as i32, n_kv_head as i32, d as i32],
         ),
         vec![0, 2, 1, 3],

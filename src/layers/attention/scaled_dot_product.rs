@@ -1,5 +1,6 @@
 //! Attention over already projected Q/K/V, independent of positional encoding.
-use crate::autograd::{Tensor, assert_same_device, is_no_grad};
+use crate::autograd::{Tensor, is_no_grad};
+use crate::device::assert_same_device;
 use crate::ops::{fused::fused_softmax, matmul::batch_matmul};
 use ndarray::{ArrayD, IxDyn};
 use std::cell::RefCell;

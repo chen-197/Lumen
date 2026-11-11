@@ -1,7 +1,7 @@
-//! Public-API CPU matmul VJP timing with caller-owned workers and explicit budgets.
+//! Public-API CPU transpose-RHS and batched matmul VJP timing with caller-owned workers and explicit budgets.
 use lumen::autograd::Tensor;
 use lumen::cpu::CpuKernelContext;
-use lumen::ops::matmul::{batch_matmul, matmul};
+use lumen::ops::matmul::{batch_matmul, matmul_transposed_rhs};
 use lumen::precision::DType;
 use ndarray::{ArrayD, Dimension, IxDyn};
 use serde_json::json;
@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let b = Tensor::new_with_dtype(data(b_shape, *layout, 7), weight_dtype);
             let out = context.scope(|| {
                 if case < 2 {
-                    matmul(&a, &b)
+                    matmul_transposed_rhs(&a, &b)
                 } else {
                     batch_matmul(&a, &b)
                 }
@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             println!(
                 "{}",
-                json!({"op":if case<2 {"matmul"}else{"batch_matmul"},"case":case,"input_dtype":format!("{input_dtype:?}"),"weight_dtype":format!("{weight_dtype:?}"),"input_shape":a_shape,"weight_shape":b_shape,"layout":layout,"threads":threads,"tasks":tasks,"warmup":warmup,"samples":samples,"iters":iters,"samples_ms":timings,"gradients":gradients})
+                json!({"op":if case<2 {"matmul_transposed_rhs"}else{"batch_matmul"},"case":case,"input_dtype":format!("{input_dtype:?}"),"weight_dtype":format!("{weight_dtype:?}"),"input_shape":a_shape,"weight_shape":b_shape,"layout":layout,"threads":threads,"tasks":tasks,"warmup":warmup,"samples":samples,"iters":iters,"samples_ms":timings,"gradients":gradients})
             );
         }
     }

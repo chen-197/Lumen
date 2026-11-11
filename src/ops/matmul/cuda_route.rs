@@ -7,7 +7,7 @@ pub(super) fn try_cuda_matmul_buffer(
     k_dim: usize,
     n_dim: usize,
 ) -> Option<cuda::CudaBuffer> {
-    if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
+    if a.device() != crate::device::Device::Cuda || b.device() != crate::device::Device::Cuda {
         return None;
     }
     if let Some(buffer) = try_cuda_matmul_native_low_precision_buffer(a, b, m_dim, k_dim, n_dim) {
@@ -242,7 +242,7 @@ pub(super) fn try_cuda_matmul_i8_typed_output_buffer(
     k_dim: usize,
     n_dim: usize,
 ) -> Option<(cuda::CudaBuffer, f32)> {
-    if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
+    if a.device() != crate::device::Device::Cuda || b.device() != crate::device::Device::Cuda {
         return None;
     }
     let (Some((DType::I8, a_buffer, Some(a_scale))), Some((DType::I8, b_buffer, Some(b_scale)))) = (
@@ -265,7 +265,7 @@ pub(super) fn try_cuda_matmul_native_low_precision_typed_output_buffer(
     n_dim: usize,
     output_dtype: DType,
 ) -> Option<cuda::CudaBuffer> {
-    if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
+    if a.device() != crate::device::Device::Cuda || b.device() != crate::device::Device::Cuda {
         return None;
     }
     let (Some((a_dtype, a_buffer, _)), Some((b_dtype, b_buffer, _))) = (
@@ -300,9 +300,7 @@ pub(super) fn try_cuda_batch_matmul_buffer(
     k: usize,
     n: usize,
 ) -> Option<cuda::CudaBuffer> {
-    if lhs.device() != crate::autograd::Device::Cuda
-        || rhs.device() != crate::autograd::Device::Cuda
-    {
+    if lhs.device() != crate::device::Device::Cuda || rhs.device() != crate::device::Device::Cuda {
         return None;
     }
     let batch_count = b.checked_mul(h)?;
@@ -473,11 +471,21 @@ pub(super) fn try_cuda_batch_matmul(
     output_dtype: DType,
 ) -> Option<Tensor> {
     let out_shape = dims.out_shape();
+    try_cuda_batch_matmul_with_shape(lhs, rhs, dims, output_dtype, &out_shape)
+}
+
+pub(super) fn try_cuda_batch_matmul_with_shape(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    dims: BatchMatmulDims,
+    output_dtype: DType,
+    out_shape: &[usize],
+) -> Option<Tensor> {
     if output_dtype == DType::I8
         && let Some((buffer, scale)) = try_cuda_batch_matmul_i8_typed_output_buffer(lhs, rhs, dims)
     {
         return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
-            &out_shape,
+            out_shape,
             buffer,
             lhs.device(),
             output_dtype,
@@ -494,7 +502,7 @@ pub(super) fn try_cuda_batch_matmul(
         )
     {
         return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
-            &out_shape,
+            out_shape,
             buffer,
             lhs.device(),
             output_dtype,
@@ -505,7 +513,7 @@ pub(super) fn try_cuda_batch_matmul(
     let buffer = try_cuda_batch_matmul_buffer(lhs, rhs, dims.b, dims.h, dims.m, dims.k, dims.n)?;
     if output_dtype == DType::F32 {
         return Some(Tensor::from_cuda_f32_buffer_no_host(
-            &out_shape,
+            out_shape,
             buffer,
             lhs.device(),
         ));
@@ -513,7 +521,7 @@ pub(super) fn try_cuda_batch_matmul(
 
     if matches!(output_dtype, DType::F16 | DType::BF16) {
         return Some(Tensor::from_cuda_f32_buffer_no_host_with_dtype(
-            &out_shape,
+            out_shape,
             buffer,
             lhs.device(),
             output_dtype,
@@ -523,7 +531,7 @@ pub(super) fn try_cuda_batch_matmul(
     if output_dtype == DType::I8 {
         let (i8_buffer, scale) = cuda::quantize_f32_to_i8_dynamic_no_host(&buffer).ok()?;
         return Some(Tensor::from_cuda_native_lowp_buffer_no_host_with_dtype(
-            &out_shape,
+            out_shape,
             i8_buffer,
             lhs.device(),
             output_dtype,
@@ -539,9 +547,7 @@ pub(super) fn try_cuda_batch_matmul_i8_typed_output_buffer(
     rhs: &Tensor,
     dims: BatchMatmulDims,
 ) -> Option<(cuda::CudaBuffer, f32)> {
-    if lhs.device() != crate::autograd::Device::Cuda
-        || rhs.device() != crate::autograd::Device::Cuda
-    {
+    if lhs.device() != crate::device::Device::Cuda || rhs.device() != crate::device::Device::Cuda {
         return None;
     }
     let (
@@ -574,9 +580,7 @@ pub(super) fn try_cuda_batch_matmul_native_low_precision_typed_output_buffer(
     dims: BatchMatmulDims,
     output_dtype: DType,
 ) -> Option<cuda::CudaBuffer> {
-    if lhs.device() != crate::autograd::Device::Cuda
-        || rhs.device() != crate::autograd::Device::Cuda
-    {
+    if lhs.device() != crate::device::Device::Cuda || rhs.device() != crate::device::Device::Cuda {
         return None;
     }
     let batch_count = dims.batch_count()?;

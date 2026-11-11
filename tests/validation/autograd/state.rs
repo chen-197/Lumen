@@ -3,7 +3,8 @@ use crate::accuracy_gate::check;
 use crate::accuracy_gate::{run, tensor, values};
 #[cfg(feature = "cuda")]
 use crate::autograd::Tensor;
-use crate::autograd::{Device, TensorRawData};
+use crate::autograd::TensorRawData;
+use crate::device::Device;
 use crate::precision::DType;
 use ndarray::{ArrayD, IxDyn};
 
@@ -310,7 +311,7 @@ fn cuda_matmul_dispatch_does_not_snapshot_unsupported_host_pairs() {
                     })
                     .collect::<Vec<_>>();
                 let before = cuda::test_host_downloads();
-                let output = no_grad(|| matmul::matmul(&x, &w));
+                let output = no_grad(|| matmul::matmul_transposed_rhs(&x, &w));
                 assert_eq!(
                     cuda::test_host_downloads(),
                     before,

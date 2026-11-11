@@ -1,9 +1,10 @@
 //! Forward/gradient references for query/row tiling and caller task budgets.
 use crate::accuracy_gate::{check, ordered, tensor, values};
-use crate::autograd::{Device, Tensor, no_grad};
+use crate::autograd::{Tensor, no_grad};
 use crate::cpu::CpuKernelContext;
+use crate::device::Device;
 use crate::layers::{AttentionMask, AttentionOptions, scaled_dot_product_attention};
-use crate::ops::matmul::{batch_matmul, matmul};
+use crate::ops::matmul::{batch_matmul, matmul, matmul_transposed_rhs};
 use crate::precision::DType;
 use ndarray::{ArrayD, IxDyn};
 use serde_json::json;
@@ -86,7 +87,7 @@ fn row_fallback_all_dtype_pairs_layouts_and_budgets_match_f64() {
                     for (budget, context) in contexts.iter().enumerate() {
                         x.zero_grad();
                         w.zero_grad();
-                        let y = context.scope(|| matmul(&x, &w));
+                        let y = context.scope(|| matmul_transposed_rhs(&x, &w));
                         check("row fallback forward", &values(&y), &expected, 8e-6, 8e-6);
                         context.scope(|| y.backward_with_grad(ordered(&[m, n], &dy, layout)));
                         check(
@@ -103,7 +104,7 @@ fn row_fallback_all_dtype_pairs_layouts_and_budgets_match_f64() {
                             8e-6,
                             8e-6,
                         );
-                        let inference = context.scope(|| no_grad(|| matmul(&x, &w)));
+                        let inference = context.scope(|| no_grad(|| matmul_transposed_rhs(&x, &w)));
                         let scale = match inference.native_storage_owned() {
                             TensorStorageOwned::I8(_, scale) => Some(scale),
                             _ => None,
@@ -148,8 +149,9 @@ fn matrix_row_tiles_keep_layouts_precision_and_gradients() {
     let contexts = contexts();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         for layout in 0..3 {
-            for batched in [false, true] {
-                let (xs, ws) = if dtype == DType::F32 && batched {
+            for op in ["matmul", "matmul_transposed_rhs", "batch_matmul"] {
+                let batched = op == "batch_matmul";
+                let (xs, mut ws) = if dtype == DType::F32 && batched {
                     (vec![1, 1, 257, 129], vec![1, 1, 129, 257])
                 } else if dtype == DType::F32 {
                     (vec![129, 513], vec![129, 513])
@@ -158,6 +160,9 @@ fn matrix_row_tiles_keep_layouts_precision_and_gradients() {
                 } else {
                     (vec![129, 65], vec![33, 65])
                 };
+                if op == "matmul" {
+                    ws.swap(0, 1);
+                }
                 let x = make(&xs, dtype, layout, 3);
                 let w = make(&ws, dtype, layout, 7);
                 let mut expected: Option<Vec<f32>> = None;
@@ -168,8 +173,10 @@ fn matrix_row_tiles_keep_layouts_precision_and_gradients() {
                     let y = context.scope(|| {
                         if batched {
                             batch_matmul(&x, &w)
-                        } else {
+                        } else if op == "matmul" {
                             matmul(&x, &w)
+                        } else {
+                            matmul_transposed_rhs(&x, &w)
                         }
                     });
                     let actual = values(&y);
@@ -212,14 +219,16 @@ fn matrix_row_tiles_keep_layouts_precision_and_gradients() {
                         no_grad(|| {
                             if batched {
                                 batch_matmul(&x, &w)
-                            } else {
+                            } else if op == "matmul" {
                                 matmul(&x, &w)
+                            } else {
+                                matmul_transposed_rhs(&x, &w)
                             }
                         })
                     });
                     if budget == 2 {
                         trace(
-                            json!({"op":if batched{"batch_matmul"}else{"matmul"},"dtype":format!("{dtype:?}"),"layout":layout,"x":snapshot(&x),"w":snapshot(&w),"y":actual,"dy":dy.iter().copied().collect::<Vec<_>>(),"inference_y":values(&infer)}),
+                            json!({"op":op,"dtype":format!("{dtype:?}"),"layout":layout,"x":snapshot(&x),"w":snapshot(&w),"y":actual,"dy":dy.iter().copied().collect::<Vec<_>>(),"inference_y":values(&infer)}),
                         );
                     }
                 }
@@ -245,7 +254,7 @@ fn f32_strided_prefill_weights_match_full_f64_without_repacking() {
                 })
                 .collect::<Vec<_>>();
             for context in contexts() {
-                let y = context.scope(|| no_grad(|| matmul(&x, &w)));
+                let y = context.scope(|| no_grad(|| matmul_transposed_rhs(&x, &w)));
                 check(
                     "F32 strided prefill GEMM",
                     &values(&y),

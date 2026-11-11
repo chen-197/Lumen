@@ -48,7 +48,7 @@ rayon = "1.7"
 ```rust
 use lumen::autograd::Tensor;
 use lumen::loss::MSELoss;
-use lumen::ops::matmul::matmul;
+use lumen::ops::matmul::matmul_transposed_rhs;
 use lumen::optim::{Optimizer, SGD};
 use lumen::precision::DType;
 use ndarray::arr2;
@@ -61,20 +61,25 @@ fn main() {
 
     for _ in 0..100 {
         optimizer.zero_grad();
-        let prediction = matmul(&input, &weight);
+        let prediction = matmul_transposed_rhs(&input, &weight);
         let loss = MSELoss::apply(&prediction, &target);
         loss.backward();
         optimizer.step();
     }
 
-    let loss = MSELoss::apply(&matmul(&input, &weight), &target);
+    let loss = MSELoss::apply(&matmul_transposed_rhs(&input, &weight), &target);
     let value = *loss.data().first().unwrap();
     println!("loss = {value:.6}");
     assert!(value < 1e-6);
 }
 ```
 
-`matmul` computes `A[..., K] @ B[N, K]ᵀ`, producing `[..., N]`.
+`matmul(A, B)` computes the standard product `A[..., K] @ B[K, N] → [..., N]`.
+`matmul_transposed_rhs(A, W)` computes `A[..., K] @ W[N, K]ᵀ → [..., N]` for output-major linear weights.
+
+Migrate earlier `matmul(x, weight)` calls to `matmul_transposed_rhs(x, weight)`.
+Square weights also require migration: both layouts have valid shapes but generally produce different results.
+`Linear` already uses the explicit transposed-RHS API internally.
 Create a fresh forward graph after each parameter update and call `zero_grad()`
 before the next batch. Leaf gradients accumulate across backward calls;
 `backward_with_grad(seed)` accepts a custom seed.
@@ -135,7 +140,8 @@ dependencies from Quick start. Generate the full API reference with
 
 | Module | What it provides |
 | --- | --- |
-| [`autograd`](./src/autograd/) | `Tensor`, `Device`, graph construction, gradients, storage and device transfers |
+| [`device`](./src/device.rs) | `Device`, CPU/CUDA placement and transfers, strict execution policy |
+| [`autograd`](./src/autograd/) | `Tensor`, graph construction, gradients and storage |
 | [`ops`](./src/ops/) | Arithmetic, shape operations, matrix products, convolution, pooling and fused kernels |
 | [`layers`](./src/layers/) | Reusable layers, activation functions, normalization and attention |
 | [`module`](./src/module.rs) | `Module`, `Sequential`, `sequential!`, checkpoints and parameter conversion |
@@ -175,7 +181,7 @@ so run a fresh forward after updating parameters.
 
 ```rust
 use lumen::autograd::Tensor;
-use lumen::ops::{matmul::{batch_matmul, matmul}, shape::cat};
+use lumen::ops::{matmul::{batch_matmul, matmul, matmul_transposed_rhs}, shape::cat};
 use ndarray::{ArrayD, IxDyn, arr1, arr2};
 
 fn main() {
@@ -191,8 +197,11 @@ fn main() {
     let joined = cat(&[flat.clone(), flat], 0);
     assert_eq!(joined.shape_vec(), vec![2, 4]);
 
+    let rhs = Tensor::from_array_no_grad(arr2(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).into_dyn());
+    assert_eq!(matmul(&x, &rhs).shape_vec(), vec![2, 3]);
+
     let weight = Tensor::parameter(arr2(&[[1.0, 0.0], [0.0, 1.0]]).into_dyn());
-    assert_eq!(matmul(&x, &weight).shape_vec(), vec![2, 2]);
+    assert_eq!(matmul_transposed_rhs(&x, &weight).shape_vec(), vec![2, 2]);
 
     let a = Tensor::from_array_no_grad(ArrayD::ones(IxDyn(&[1, 2, 3, 4])));
     let b = Tensor::from_array_no_grad(ArrayD::ones(IxDyn(&[1, 2, 4, 5])));
@@ -210,7 +219,8 @@ fn main() {
 | `x.permute(axes)`, `x.transpose(i, j)` | Reorder axes |
 | `ops::shape::cat(&tensors, axis)` | Concatenate along an axis |
 | `ops::shape::slice_last_dim(&x, start, end)` | Slice the final axis over `[start, end)` |
-| `ops::matmul::matmul(&a, &weights)` | `[..., K] × [N, K]ᵀ → [..., N]`; weights are stored output-major |
+| `ops::matmul::matmul(&a, &b)` | Standard product: `[..., K] × [K, N] → [..., N]`; RHS is 2D and LHS leading dimensions are preserved |
+| `ops::matmul::matmul_transposed_rhs(&a, &weights)` | `[..., K] × [N, K]ᵀ → [..., N]`; weights are stored output-major |
 | `ops::matmul::batch_matmul(&a, &b)` | `[B,H,M,K] × [B,H,K,N] → [B,H,M,N]`; RHS is already in multiplication order |
 | `ops::convolution::{conv2d, max_pool2d}` | NCHW convolution and pooling; layer wrappers provide simpler constructors |
 | `ops::fused::fused_softmax(&x, scale, causal)` | Scaled softmax, optionally with a causal mask |
@@ -390,7 +400,8 @@ can synchronize CUDA and copy values back. CUDA targets a single device;
 operator/dtype coverage differs from CPU.
 
 ```rust
-use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
+use lumen::device::{Device, set_strict_device_execution_scoped};
+use lumen::autograd::{Tensor, no_grad};
 use lumen::layers::Linear;
 use lumen::module::Module;
 use lumen::ops::cuda;
@@ -530,7 +541,7 @@ fn main() {
 ```rust
 use lumen::autograd::{Tensor, no_grad};
 use lumen::cpu::{CpuInferenceContext, CpuKernelContext};
-use lumen::ops::matmul::matmul;
+use lumen::ops::matmul::matmul_transposed_rhs;
 use ndarray::arr2;
 use std::{num::NonZeroUsize, sync::Arc};
 
@@ -540,14 +551,14 @@ fn main() {
         .with_task_limit(NonZeroUsize::new(2).unwrap());
     let input = Tensor::from_array_no_grad(arr2(&[[1.0, 2.0]]).into_dyn());
     let weight = Tensor::parameter(arr2(&[[0.5, 0.5]]).into_dyn());
-    context.scope(|| matmul(&input, &weight).sum().backward());
+    context.scope(|| matmul_transposed_rhs(&input, &weight).sum().backward());
     assert!(weight.grad().is_some());
 
     let inference = CpuInferenceContext::new(context)
         .with_prefill_task_limit(NonZeroUsize::new(2).unwrap())
         .with_decode_task_limit(NonZeroUsize::new(1).unwrap());
-    let prefill = inference.prefill(|| no_grad(|| matmul(&input, &weight)));
-    let decode = inference.decode(|| no_grad(|| matmul(&input, &weight)));
+    let prefill = inference.prefill(|| no_grad(|| matmul_transposed_rhs(&input, &weight)));
+    let decode = inference.decode(|| no_grad(|| matmul_transposed_rhs(&input, &weight)));
     assert_eq!(prefill.data(), decode.data());
 }
 ```
@@ -555,21 +566,50 @@ fn main() {
 Create pools outside compute loops and share them between callers. `scope` keeps
 Tensors and autograd state on the calling thread; numerical slices enter the pool.
 The task budget is per integrated kernel, not a process-wide thread limit.
+Explicitly capped indexed loops divide tiles evenly across the selected task
+groups without temporary lists of views, avoiding lost groups from ceiling-width
+partitioning.
 Small jobs and nested numerical work execute serially. The library does not set
 a global pool, pin threads or infer policy from a particular CPU model.
 
 MatVec, matmul/batch-matmul forward and backward, fused projections, argmax,
-prefill, inference attention and native lowp optimizer-state kernels observe
+prefill, inference attention, RMSNorm forward rows and native lowp optimizer-state kernels observe
 these contexts. Enter the scope around **backward as well as forward**; creating
 a graph inside it does not bind a later traversal to that policy.
+LayerNorm forward also uses these contexts. CPU LayerNorm inference computes
+rows without retaining backward intermediates and preserves input/parameter
+storage precision; centered statistics use F64 and outputs remain F32.
+RMSNorm input-gradient rows and weight-gradient reductions also observe these
+contexts. Within-row arithmetic is unchanged; grouping weight-gradient sums can
+change floating-point rounding. LayerNorm backward also observes these contexts:
+small work uses a fused serial pass, while larger input/parameter gradients share
+grouped row work and F64 accumulation. Frozen inputs and parameters skip their
+gradient arrays and computation. Grouping parameter sums may change rounding.
 `CpuInferenceContext` provides separate prefill/decode budgets over a shared pool.
 Tensor handles use `Rc<RefCell<_>>` and are not `Send`/`Sync`; separate callers
 own their model/Tensor handles while sharing numerical worker pools.
 CPU BF16 prefill reuses temporary weight panels across input rows, including
-long prompts. Supported CPUs use BF16 dot products with F32 accumulation;
-mixed F32/F16 activations
+long prompts. Supported CPUs use BF16 dot products with F32 accumulation.
+BF16 K-pair weight packing uses an integer AVX2 transpose for complete panels,
+with SSE2/scalar fallbacks for smaller panels and other CPUs.
+Native BF16 × BF16 matrix-product panels write directly into the final output,
+avoiding a padded full-result buffer and its rearrangement. Adjacent panels
+share a task within the caller's pool capacity and task budget.
+Narrow BF16 output projections can also reuse native panels when the input size
+and caller's task capacity amortize packing; smaller parallel products retain
+the row kernels. Single-row decoding keeps its existing path.
+Mixed F32/F16 activations
 retain their precision through exact weight expansion and AVX2/FMA or AVX-512.
 Other CPUs use the portable fallback without changing the public API.
+Standard `matmul` also packs F16/BF16/I8 RHS blocks directly from their original
+strides on supported x86 CPUs, avoiding a complete F32 RHS copy or transpose.
+BF16 input/RHS pairs can use AVX-512 BF16 with F32 accumulation; other native
+panels expand weights during F32 computation. Vectors and a few input rows can
+stream row-major F32/F16/BF16/I8 RHS columns directly with AVX2/FMA or AVX-512,
+without packing. Small work stays on the calling thread; larger work respects
+the caller's pool and task budget. Narrow multi-row F32 products, strided RHS
+and unsupported small shapes retain general GEMM. CPU matrix-product backward
+skips gradients for frozen inputs.
 No-grad, precision, initialization and device-selection guards are also
 `!Send`/`!Sync`. Create and drop these scopes on the thread that executes the
 computation so their thread-local settings are restored correctly.
@@ -734,7 +774,7 @@ Benchmark tools require `dev-tools` and should run with `--release`.
 | `cpu_backward_bench` | Matmul and batch-matmul gradients |
 | `cpu_projection_bench` | Projection, QKV and gated MLP kernels |
 | `cpu_decode_bench` | Decode working sets and vocabulary argmax |
-| `cpu_scaling_bench` | Pool size, task budgets and concurrent callers |
+| `cpu_scaling_bench` | Pool size, task budgets, concurrent callers, and normalization |
 | `cuda_cpu_bench` | CPU/CUDA operators and training paths |
 | `prefill_decode_bench` | Real-weight prefill/decode, replay and sampling |
 | `manual_state_check` | Public API, checkpoint and state checks |
@@ -769,91 +809,83 @@ directory for each run and run timing serially, without competing builds or
 reference checks. See the [benchmark runner documentation](./dev-tools/README.md#bounded-performance-runs)
 for output and runtime-library requirements.
 
-### General operator measurements (2026-10-29)
+### General operator measurements (2026-11-04)
 
-Ryzen 9 8945HX, 8 workers and an 8-task cap; same build as the model measurements
-below. Each case uses 5 warmup samples and 7 measured samples, with 5 calls per
-sample; medians are per call. Forward runs under no-grad and includes output
-allocation. Backward reuses a prebuilt graph and includes zeroing gradients, seed
-copying and VJP; forward and optimizer step are excluded. Individual samples are
-in the [measurement data](./dev-tools/benchmarks/results/2026-10-29.json).
+Windows x86-64, Ryzen 9 8945HX, eight workers. Matrix multiplication and attention
+use a task limit of eight, five warmup samples, and seven measured samples with
+five calls each. Forward includes output allocation under no-grad. Backward reuses
+a prebuilt graph and measures gradient clearing, upstream seed copying, and the VJP.
+`matmul` computes `A @ B` and `matmul_transposed_rhs` computes `A @ Wᵀ`.
+The data records matrix strides in the measured storage dtype.
+[Samples and build metadata](./dev-tools/benchmarks/results/2026-11-04.json)
 
-| Operation | Input / weight shapes or parameters | Dtype | Layout | Median ms |
+| Operation | Shapes or parameters | Dtype | Layout | Median ms |
 | --- | --- | --- | --- | ---: |
-| matmul forward | A=[129,1024], W=[1536,1024] | F32 | strided | 2.06412 |
-| matmul forward | A=[129,1024], W=[1536,1024] | BF16 | strided | 0.99518 |
-| GQA forward | 2 sequences; 6 query / 2 key-value heads; query length 129 / key-value length 191; 65 query/key and 33 value features per head; causal, query offset 31, last sequence fully masked | F32 | strided | 0.31784 |
-| matmul backward VJP | A=[193,257], W=[257,257] | F32 | strided | 1.39080 |
-| batch_matmul backward VJP | A=[2,3,65,129], B=[2,3,129,257] | F32 | contiguous | 0.64416 |
+| `matmul` forward | `A=[129,1024]`, `B=[1024,1536]` | F32 | strided | 2.85434 |
+| `matmul` forward | `A=[129,1024]`, `B=[1024,1536]` | BF16 | strided | 0.91118 |
+| `matmul_transposed_rhs` forward | `A=[129,1024]`, `W=[1536,1024]` | F32 | strided | 2.45120 |
+| `matmul_transposed_rhs` forward | `A=[129,1024]`, `W=[1536,1024]` | BF16 | strided | 2.76784 |
+| GQA forward | 2 sequences, 6 query heads, 2 key-value heads, query length 129, key-value length 191, 65 query/key and 33 value features per head, causal mask, query offset 31, final sequence fully masked | F32 | strided | 0.33592 |
+| `matmul_transposed_rhs` backward VJP | `A=[193,257]`, `W=[257,257]` | F32 | strided | 1.43494 |
+| `batch_matmul` backward VJP | `A=[2,3,65,129]`, `B=[2,3,129,257]` | F32 | contiguous | 0.67626 |
 
-### Model measurements (2026-10-29)
+Normalization uses automatic task selection, five warmup calls, and seven
+measured samples with 30 calls each. Shapes are `[rows, normalized features]`.
+Backward measures the complete VJP with gradient clearing and seed copying.
 
-Windows/x86-64, Ryzen 9 8945HX, RTX 5070 Laptop (8 GB), eight CPU workers.
-Rust 1.98.1 release builds used `target-cpu=native` and
-`dev-tools,cuda,x86-fp-kernels,x86-int8-kernels`. The
-[measurement data](./dev-tools/benchmarks/results/2026-10-29.json) includes the
-measured source fingerprint, build metadata, checkpoint hashes, prompts, replay
-IDs, individual warmup/formal samples, ranges and medians.
+| Operation | Shape | F32 median µs | BF16 median µs |
+| --- | --- | ---: | ---: |
+| `rms_norm` | `[65,513]` | 56.593 | 51.633 |
+| `rms_norm_backward` | `[65,513]` | 96.607 | 116.770 |
+| `rms_norm_backward` | `[512,2048]` | 1876.883 | — |
+| `layer_norm` | `[65,513]` | 66.163 | 79.343 |
+| `layer_norm_backward` | `[65,513]` | 230.740 | 226.287 |
+| `layer_norm_backward` | `[512,2048]` | 4398.540 | — |
 
-PyTorch 2.14.0+cu130 / Transformers 5.17.0 used SDPA + DynamicCache, eight CPU
-workers and one interop worker; TF32, reduced-precision reductions and graph
-compilation were disabled. Each process ran two warmups and five measured runs,
-serially without competing builds or reference checks. Both engines used the same
-model, floating storage precision, prompt and fixed 64-token decode replay.
-Floating rows use matching weight/activation/KV dtypes. I8 uses BF16
-runtime/activations/KV with dynamic activation I8 off, and has no PyTorch I8 ratio.
+### Model measurements (2026-11-04)
 
-The tables show medians. Model loading and external input construction are
-excluded; forward, argmax, host-token completion and the final decode forward are
-included. Lumen uses preallocated KV; PyTorch uses DynamicCache. Rows have five
-formal samples per engine, except TinyLlama CUDA BF16 and Qwen3 CUDA F32/F16/BF16,
-which have ten after one reverse-order pair was added when the initial prefill
-range/median exceeded 25% in either engine. All samples are retained.
+Windows x86-64, Ryzen 9 8945HX, RTX 5070 Laptop GPU (8 GB), eight CPU workers.
+Lumen used Rust 1.98.1 with `--release`, `-C target-cpu=native`, and
+`dev-tools,cuda,x86-fp-kernels,x86-int8-kernels`. PyTorch 2.14.0+cu130 with
+Transformers 5.17.0 used SDPA and DynamicCache, eight CPU threads and one
+interop thread, with TF32, reduced-precision reductions and compilation disabled.
+Lumen used a preallocated KV cache with capacity 1024.
+[Source fingerprint, model assets, and samples](./dev-tools/benchmarks/results/2026-11-04.json)
 
-#### TinyLlama-1.1B (46 token prompt)
+Each row reports medians from five runs after two warmups per engine. Both
+engines use the same prompt, 64 fixed decode steps, and matching floating-point
+weight, activation, and KV dtypes. Forward timing includes argmax and excludes
+model loading and input construction. I8 rows use I8 weights with BF16
+activations and KV, and report Lumen timings only.
 
-| Device / weights | Lumen prefill ms | PyTorch prefill ms | Lumen decode tok/s | PyTorch decode tok/s |
+#### TinyLlama-1.1B (46-token prompt)
+
+| Device / weights | Lumen prefill ms | PyTorch prefill ms | Lumen decode steps/s | PyTorch decode steps/s |
 | --- | ---: | ---: | ---: | ---: |
-| cpu / F32 | 291.398 | 275.976 | 11.51 | 8.65 |
-| cpu / F16 | 291.338 | 1162.755 | 21.01 | 18.80 |
-| cpu / BF16 | 248.226 | 97.590 | 21.11 | 16.93 |
-| cpu / I8 (BF16 runtime/KV) | 256.487 | — | 35.90 | — |
-| cuda / F32 | 31.670 | 22.482 | 49.55 | 60.44 |
-| cuda / F16 | 19.992 | 16.739 | 85.82 | 63.34 |
-| cuda / BF16 | 19.677 | 19.381 | 88.43 | 54.55 |
-| cuda / I8 (BF16 runtime/KV) | 38.883 | — | 148.03 | — |
+| cpu / F32 | 441.550 | 410.303 | 11.51 | 7.62 |
+| cpu / F16 | 267.890 | 1767.148 | 20.27 | 16.06 |
+| cpu / BF16 | 245.308 | 158.047 | 18.96 | 14.87 |
+| cpu / I8 | 315.466 | — | 32.70 | — |
+| cuda / F32 | 37.014 | 28.952 | 48.31 | 50.66 |
+| cuda / F16 | 25.185 | 23.569 | 76.54 | 45.83 |
+| cuda / BF16 | 25.929 | 23.275 | 75.37 | 44.98 |
+| cuda / I8 | 51.057 | — | 127.01 | — |
 
-#### Qwen3-0.6B (36 token prompt)
+#### Qwen3-0.6B (36-token prompt)
 
-| Device / weights | Lumen prefill ms | PyTorch prefill ms | Lumen decode tok/s | PyTorch decode tok/s |
+| Device / weights | Lumen prefill ms | PyTorch prefill ms | Lumen decode steps/s | PyTorch decode steps/s |
 | --- | ---: | ---: | ---: | ---: |
-| cpu / F32 | 163.534 | 131.526 | 17.86 | 11.83 |
-| cpu / F16 | 194.189 | 488.894 | 28.33 | 24.27 |
-| cpu / BF16 | 145.108 | 64.487 | 27.90 | 22.74 |
-| cpu / I8 (BF16 runtime/KV) | 145.368 | — | 41.54 | — |
-| cuda / F32 | 21.696 | 26.651 | 56.37 | 34.23 |
-| cuda / F16 | 32.385 | 30.793 | 65.64 | 22.22 |
-| cuda / BF16 | 31.120 | 30.202 | 68.36 | 24.85 |
-| cuda / I8 (BF16 runtime/KV) | 32.170 | — | 92.84 | — |
+| cpu / F32 | 216.199 | 232.537 | 17.65 | 10.35 |
+| cpu / F16 | 242.245 | 613.837 | 27.24 | 20.69 |
+| cpu / BF16 | 131.692 | 94.021 | 26.09 | 18.45 |
+| cpu / I8 | 213.505 | — | 34.48 | — |
+| cuda / F32 | 33.181 | 35.572 | 44.67 | 29.02 |
+| cuda / F16 | 56.987 | 39.096 | 50.68 | 26.48 |
+| cuda / BF16 | 55.199 | 38.331 | 51.43 | 26.96 |
+| cuda / I8 | 54.523 | — | 75.00 | — |
 
-#### CPU BF16 long prompts
-
-| Model | Prompt tokens | Lumen prefill ms | PyTorch prefill ms |
-| --- | ---: | ---: | ---: |
-| TinyLlama-1.1B | 360 | 1502.552 | 646.172 |
-| Qwen3-0.6B | 350 | 939.386 | 370.206 |
-
-Long prompts use BF16 weights/activations/KV, context capacity 2048, two warmups
-and five formal runs per engine. A single forced decode forward completes the
-replay; only prefill is interpreted here. The short-prompt context capacity is
-512. Fixed replay is a timing control, not a free-generation quality test.
-
-CPU BF16 short prefill takes about 2.54×/2.25× PyTorch time for TinyLlama/Qwen3.
-TinyLlama CUDA F32 decode is 49.55 versus 60.44 token/s. GPU samples show
-variation, with ranges retained in the data file. Results depend on shape,
-precision, cache strategy and hardware; they do not represent compiled graphs,
-StaticCache or dedicated inference engines, and do not establish a speedup
-against a different date or source snapshot.
+The earlier dataset includes CPU BF16 long-prompt prefill measurements.
+[2026-10-29 measurements](./dev-tools/benchmarks/results/2026-10-29.json)
 
 ## Testing
 
@@ -903,6 +935,12 @@ differences in inference results.
 Long tests are explicitly selected, and missing real-model assets are reported as skipped.
 See the [portable CPU workflow](./.github/workflows/operator-accuracy.yml) for CI.
 
+The 2026-11-04 validation passed 685 native CPU/CUDA and 408 portable library tests.
+Each configuration passed 17 tool tests and 7 doctests. All 72 training runs
+showed an overall loss decrease across 1,000 updates. Real-weight logits for
+TinyLlama and Qwen3 passed PyTorch comparisons, and simple English generations
+showed no significant text corruption. [Validation and measurement data](./dev-tools/benchmarks/results/2026-11-04.json)
+
 ## Repository layout
 
 Main directories and entry points:
@@ -918,6 +956,7 @@ Lumen/
 │   ├── lib.rs
 │   ├── main.rs
 │   ├── bin/quantize_safetensors.rs
+│   ├── device.rs
 │   ├── autograd/
 │   ├── cpu/
 │   ├── arch.rs
@@ -940,6 +979,8 @@ Lumen/
 │   │   ├── arithmetic.rs
 │   │   ├── shape.rs
 │   │   ├── matmul/
+│   │   ├── cpu_gemm.rs
+│   │   ├── cpu_gemm/
 │   │   └── cuda/
 │   └── models/
 │       ├── llama.rs
@@ -953,7 +994,7 @@ Lumen/
     ├── README.md
     ├── bin/
     ├── benchmarks/
-    │   └── results/2026-10-29.json
+    │   └── results/
     ├── check_release.ps1
     ├── check_operator_accuracy.ps1
     ├── check_performance.py
@@ -962,10 +1003,11 @@ Lumen/
 
 `src/` contains library and production CLI implementation. `cpu/mod.rs` owns
 CPU scheduling and execution contexts; `cpu/profiling.rs` is its optional
-instrumentation submodule. CPU math kernels remain under `ops/`.
+instrumentation submodule. `ops/cpu_gemm.rs` provides the CPU matrix kernel
+entry points, and `ops/cpu_gemm/` contains packing and compute implementations.
 
-`autograd/` separates Tensor construction, storage, quantization, views, device
-transfers, gradient execution, and optimizer updates. `ops/matmul/` groups dot
+`device.rs` owns device types, strict execution policy, and Tensor placement and synchronization; earlier `autograd::Device` imports remain compatible.
+`autograd/` separates Tensor construction, storage, quantization, views, gradient execution, and optimizer updates. `ops/matmul/` groups dot
 products, MatVec, fused projections, prefill, backward, and CUDA routing.
 `ops/cuda/api/` contains operator-facing wrappers; the private `imp/` directory
 contains validation, allocation/dispatch, and isolated FFI declarations.

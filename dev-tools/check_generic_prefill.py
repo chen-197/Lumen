@@ -21,7 +21,7 @@ def main():
     torch.set_num_threads(1)
     records = [json.loads(line.split('PREFILL_CPU_AUDIT=', 1)[1])
                for line in args.log.read_text(encoding='utf-8-sig').splitlines() if 'PREFILL_CPU_AUDIT=' in line]
-    expected = {(op, dtype, layout) for op, dtype, layout in itertools.product(['matmul', 'batch_matmul'], ['F32', 'F16', 'BF16'], range(3))}
+    expected = {(op, dtype, layout) for op, dtype, layout in itertools.product(['matmul', 'matmul_transposed_rhs', 'batch_matmul'], ['F32', 'F16', 'BF16'], range(3))}
     expected |= {('attention', case, layout) for case, layout in itertools.product(range(5), range(3))}
     seen, errors, checks, fraction = set(), {}, 0, 0.0
 
@@ -54,7 +54,7 @@ def main():
         else:
             key = row['op'], row['dtype'], row['layout']
             x, w = tensor(row['x'], True), tensor(row['w'], True)
-            output = x @ (w.T if row['op'] == 'matmul' else w)
+            output = x @ (w.T if row['op'] == 'matmul_transposed_rhs' else w)
             compare(f"{row['op']}/forward", row['y'], output)
             output.backward(torch.tensor(row['dy'], dtype=torch.float64).reshape(output.shape))
             compare(f"{row['op']}/grad/x", row['x']['grad'], x.grad, 3e-5, 3e-5)

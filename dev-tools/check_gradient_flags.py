@@ -11,14 +11,14 @@ import torch.nn.functional as functional
 TYPES = ['F32', 'F16', 'BF16', 'I8']
 OPS = [f'{op}-{layout}' for op in ['add', 'sub', 'mul']
        for layout in ['same', 'row', 'column', 'scalar']]
-OPS += ['matmul', 'batch-matmul', 'cat', 'rms', 'conv']
+OPS += ['matmul_transposed_rhs', 'batch-matmul', 'cat', 'rms', 'conv']
 QKV_PAIRS = [(d, d) for d in TYPES] + [('BF16', 'I8')]
 
 
 def expected_shapes(op):
     if op == 'qkv':
         return [[1, 2, 4]] + [[4, 4]] * 3 + [[4]] * 3
-    if op == 'matmul':
+    if op == 'matmul_transposed_rhs':
         return [[2, 3], [2, 3]]  # Lumen stores the RHS as [N,K].
     if op == 'batch-matmul':
         return [[1, 2, 2, 3], [1, 2, 3, 2]]
@@ -41,7 +41,7 @@ def forward(op, args):
         return x - w
     if op.startswith('mul-'):
         return x * w
-    if op == 'matmul':
+    if op == 'matmul_transposed_rhs':
         return x @ w.T
     if op == 'batch-matmul':
         return x @ w

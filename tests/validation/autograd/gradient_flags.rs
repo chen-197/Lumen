@@ -1,5 +1,6 @@
 use crate::accuracy_gate::{ordered, run, tensor, values};
-use crate::autograd::{Device, Tensor};
+use crate::autograd::Tensor;
+use crate::device::Device;
 use crate::module::Module;
 #[cfg(feature = "cuda")]
 use crate::ops::fused;
@@ -31,7 +32,7 @@ fn input(
 
 fn case(device: Device, op: &str, xd: DType, wd: DType, layout: usize, flags: usize) {
     let (xs, ws): (&[usize], &[usize]) = match op {
-        "matmul" => (&[2, 3], &[2, 3]),
+        "matmul_transposed_rhs" => (&[2, 3], &[2, 3]),
         "batch-matmul" => (&[1, 2, 2, 3], &[1, 2, 3, 2]),
         "conv" => (&[1, 1, 3, 3], &[2, 1, 2, 2]),
         "rms" => (&[2, 3], &[3]),
@@ -44,7 +45,7 @@ fn case(device: Device, op: &str, xd: DType, wd: DType, layout: usize, flags: us
     let w = input(ws, wd, layout, 7, flags & 2 != 0, device);
     let mut inputs = vec![x.clone(), w.clone()];
     let y = match op {
-        "matmul" => matmul::matmul(&x, &w),
+        "matmul_transposed_rhs" => matmul::matmul_transposed_rhs(&x, &w),
         "batch-matmul" => matmul::batch_matmul(&x, &w),
         "cat" => shape::cat(&[x.clone(), w.clone()], 1),
         "rms" => crate::layers::norm::rms_norm::RMSNorm {
@@ -215,7 +216,7 @@ flag_tests!(
 flag_tests!(
     cpu_matmul_gradient_flags,
     cuda_matmul_gradient_flags,
-    "matmul"
+    "matmul_transposed_rhs"
 );
 flag_tests!(
     cpu_batch_matmul_gradient_flags,
@@ -382,8 +383,8 @@ fn frozen_training(device: Device) {
                 let mut losses = Vec::new();
                 for step in 0..=60 {
                     opt.zero_grad();
-                    let hidden = matmul::matmul(&x, &weight);
-                    let prediction = matmul::matmul(&hidden, &frozen);
+                    let hidden = matmul::matmul_transposed_rhs(&x, &weight);
+                    let prediction = matmul::matmul_transposed_rhs(&hidden, &frozen);
                     let loss = MSELoss::apply(&prediction, &expected);
                     losses.push(values(&loss)[0]);
                     if step < 60 {

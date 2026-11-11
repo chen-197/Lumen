@@ -1,8 +1,9 @@
 //! Public-API manual checks: GPU snapshots, checkpoint files and continued training.
-use lumen::autograd::{Device, StoragePreference, Tensor, TensorRawData};
+use lumen::autograd::{StoragePreference, Tensor, TensorRawData};
+use lumen::device::Device;
 use lumen::loss::MSELoss;
 use lumen::module::{CheckpointTensor, ModelCheckpoint, Module};
-use lumen::ops::matmul::matmul;
+use lumen::ops::matmul::matmul_transposed_rhs;
 use lumen::optim::{Adam, Optimizer, SGD};
 use lumen::precision::{DType, PrecisionConfig, with_precision_config};
 use ndarray::{ArrayD, IxDyn};
@@ -84,7 +85,7 @@ impl Module for Pair {
         vec![self.weight.clone(), self.bias.clone()]
     }
     fn forward(&self, input: Tensor) -> Tensor {
-        &matmul(&input, &self.weight) + &self.bias
+        &matmul_transposed_rhs(&input, &self.weight) + &self.bias
     }
 }
 
@@ -392,7 +393,7 @@ fn main() {
     }
     std::fs::create_dir_all(&root).unwrap();
     let _cuda = lumen::ops::cuda::set_enabled_scoped(device == Device::Cuda);
-    let _strict = lumen::autograd::set_strict_device_execution_scoped(device == Device::Cuda);
+    let _strict = lumen::device::set_strict_device_execution_scoped(device == Device::Cuda);
     let mut rows = Vec::new();
     let mut files = Vec::new();
     snapshots(device, &root, &mut rows, &mut files);

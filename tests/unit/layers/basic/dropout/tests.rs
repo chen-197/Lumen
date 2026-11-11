@@ -1,6 +1,7 @@
 use super::*;
+use crate::autograd::Tensor;
 #[cfg(feature = "cuda")]
-use crate::autograd::{Tensor, set_strict_device_execution};
+use crate::device::set_strict_device_execution;
 use ndarray::{Array, IxDyn};
 
 #[test]

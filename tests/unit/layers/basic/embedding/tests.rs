@@ -156,9 +156,9 @@ fn cuda_embedding_matches_cpu_reference_in_strict_mode() {
     assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| emb.forward(&indices));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
     assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
@@ -204,9 +204,9 @@ fn cuda_empty_embedding_no_grad_stays_on_cuda_in_strict_mode() {
     let indices = make_tensor(&[0], vec![], DType::F32).to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| emb.forward(&indices));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -248,13 +248,13 @@ fn cuda_embedding_backward_matches_cpu_reference_in_strict_mode() {
     let coeff_cuda = coeff_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = emb_cuda.forward(&indices_cuda);
     let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
     cuda_loss.backward();
     assert!(emb_cuda.weight.cloned_cuda_f32_grad().is_some());
     assert!(!emb_cuda.weight.has_host_grad());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let emb_cpu = Embedding::new(6, 3);
@@ -305,9 +305,9 @@ fn cuda_embedding_preserves_i8_dtype_in_strict_mode() {
     assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| emb.forward(&indices));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
     assert!(emb.weight.0.borrow().cuda_f32_data.is_none());
 

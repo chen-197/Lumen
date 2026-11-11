@@ -1,7 +1,7 @@
 use super::*;
-#[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution;
 use crate::autograd::{Tensor, no_grad};
+#[cfg(feature = "cuda")]
+use crate::device::set_strict_device_execution;
 use crate::layers::basic::linear::Linear;
 use crate::loss::MSELoss;
 #[cfg(feature = "cuda")]
@@ -68,12 +68,12 @@ fn module_to_cuda_moves_all_parameters() {
 
     module.to_cuda();
     for param in module.parameters() {
-        assert_eq!(param.device(), crate::autograd::Device::Cuda);
+        assert_eq!(param.device(), crate::device::Device::Cuda);
     }
 
     module.to_cpu();
     for param in module.parameters() {
-        assert_eq!(param.device(), crate::autograd::Device::Cpu);
+        assert_eq!(param.device(), crate::device::Device::Cpu);
     }
 }
 

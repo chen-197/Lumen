@@ -96,9 +96,9 @@ fn cuda_empty_batch_conv2d_no_grad_stays_on_cuda_in_strict_mode() {
     let bias = make_tensor(&[2], vec![0.1, -0.2], DType::F32).to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| conv2d(&input, &weight, Some(&bias), (1, 1), (1, 1)));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -116,9 +116,9 @@ fn cuda_empty_batch_max_pool2d_no_grad_stays_on_cuda_in_strict_mode() {
     let input = make_tensor(&[0, 2, 4, 4], vec![], DType::F32).to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out = no_grad(|| max_pool2d(&input, (2, 2), (1, 1)));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(out.is_cuda());
@@ -153,7 +153,7 @@ fn cuda_conv2d_matches_cpu_reference_in_strict_mode() {
     let bias = make_tensor(&[2], vec![0.1, -0.2], DType::F32);
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| {
         conv2d(
             &input.to_cuda(),
@@ -163,7 +163,7 @@ fn cuda_conv2d_matches_cpu_reference_in_strict_mode() {
             (1, 1),
         )
     });
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = no_grad(|| conv2d(&input, &weight, Some(&bias), (1, 1), (1, 1)));
@@ -205,7 +205,7 @@ fn cuda_conv2d_backward_matches_cpu_reference_in_strict_mode() {
     let coeff_cuda = coeff_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let out_cuda = conv2d(&input_cuda, &weight_cuda, Some(&bias_cuda), (1, 1), (1, 1));
     assert!(out_cuda.is_cuda());
     let loss_cuda = crate::ops::arithmetic::sum(&(&out_cuda * &coeff_cuda));
@@ -216,7 +216,7 @@ fn cuda_conv2d_backward_matches_cpu_reference_in_strict_mode() {
     assert!(!input_cuda.has_host_grad());
     assert!(!weight_cuda.has_host_grad());
     assert!(!bias_cuda.has_host_grad());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let out_cpu = conv2d(&input_cpu, &weight_cpu, Some(&bias_cpu), (1, 1), (1, 1));
@@ -258,9 +258,9 @@ fn cuda_max_pool2d_matches_cpu_reference_in_strict_mode() {
     );
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| max_pool2d(&input.to_cuda(), (2, 2), (1, 1)));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = no_grad(|| max_pool2d(&input, (2, 2), (1, 1)));
@@ -292,9 +292,9 @@ fn cuda_max_pool2d_bf16_reads_native_input_in_strict_mode() {
     assert!(input.0.borrow().cuda_bf16_data.is_some());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = no_grad(|| max_pool2d(&input, (2, 2), (1, 1)));
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     assert!(input.0.borrow().cuda_f32_data.is_none());
@@ -329,14 +329,14 @@ fn cuda_max_pool2d_backward_matches_cpu_reference_in_strict_mode() {
     let coeff_cuda = coeff_cpu.to_cuda();
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = max_pool2d(&input_cuda, (2, 2), (1, 1));
     assert!(cuda_out.is_cuda());
     let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
     cuda_loss.backward();
     assert!(input_cuda.cloned_cuda_f32_grad().is_some());
     assert!(!input_cuda.has_host_grad());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = max_pool2d(&input_cpu, (2, 2), (1, 1));
@@ -384,14 +384,14 @@ fn cuda_max_pool2d_backward_bf16_reads_native_input_in_strict_mode() {
     assert!(input_cuda.0.borrow().cuda_bf16_data.is_some());
 
     crate::ops::cuda::set_enabled(true);
-    crate::autograd::set_strict_device_execution(true);
+    crate::device::set_strict_device_execution(true);
     let cuda_out = max_pool2d(&input_cuda, (2, 2), (1, 1));
     let cuda_loss = crate::ops::arithmetic::sum(&(&cuda_out * &coeff_cuda));
     cuda_loss.backward();
     assert!(input_cuda.cloned_cuda_f32_grad().is_some());
     assert!(!input_cuda.has_host_grad());
     assert!(input_cuda.0.borrow().cuda_bf16_data.is_some());
-    crate::autograd::set_strict_device_execution(false);
+    crate::device::set_strict_device_execution(false);
     crate::ops::cuda::set_enabled(false);
 
     let cpu_out = max_pool2d(&input_cpu, (2, 2), (1, 1));
@@ -438,10 +438,10 @@ fn cuda_conv2d_accepts_lowp_inputs_in_strict_mode() {
         assert_cuda_native_resident_without_f32(&bias_cuda, dtype);
 
         crate::ops::cuda::set_enabled(true);
-        crate::autograd::set_strict_device_execution(true);
+        crate::device::set_strict_device_execution(true);
         let cuda_out =
             no_grad(|| conv2d(&input_cuda, &weight_cuda, Some(&bias_cuda), (1, 1), (1, 1)));
-        crate::autograd::set_strict_device_execution(false);
+        crate::device::set_strict_device_execution(false);
         crate::ops::cuda::set_enabled(false);
         assert_cuda_native_resident_without_f32(&input_cuda, dtype);
         assert_cuda_native_resident_without_f32(&weight_cuda, dtype);

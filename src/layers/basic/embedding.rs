@@ -1,7 +1,7 @@
 use crate::autograd::{
-    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    assert_native_device_support, is_no_grad, is_strict_device_execution,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
 };
+use crate::device::{assert_native_device_support, is_strict_device_execution};
 use crate::init::{InitType, tensor_init, tensor_init_with_dtype};
 use crate::module::Module;
 use crate::ops::cuda;
@@ -75,7 +75,7 @@ impl Embedding {
         assert_native_device_support(
             output_device,
             "embedding",
-            output_device == crate::autograd::Device::Cuda,
+            output_device == crate::device::Device::Cuda,
         );
         assert_eq!(
             indices.device(),
@@ -89,7 +89,7 @@ impl Embedding {
         out_shape.push(e_dim);
 
         let num_elements = indices.len();
-        if output_device == crate::autograd::Device::Cuda && num_elements > 0 {
+        if output_device == crate::device::Device::Cuda && num_elements > 0 {
             if !build_graph {
                 let native_weight = self.weight.cloned_cuda_native_lowp_buffer();
                 if let Some((dtype, weight_buf, scale)) = native_weight {

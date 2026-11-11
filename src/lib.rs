@@ -8,6 +8,7 @@
 pub mod arch;
 pub mod autograd;
 pub mod cpu;
+pub mod device;
 pub mod precision;
 #[macro_use]
 pub mod module;

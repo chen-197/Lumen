@@ -1,8 +1,6 @@
 // src/ops/convolution.rs
-use crate::autograd::{
-    StoragePreference, Tensor, TensorData, TensorStorageView, assert_native_device_support,
-    is_no_grad, is_strict_device_execution,
-};
+use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
+use crate::device::{assert_native_device_support, is_strict_device_execution};
 use crate::ops::cuda;
 use crate::precision::DType;
 use ndarray::linalg::general_mat_mul;
@@ -204,12 +202,12 @@ pub fn conv2d(
     stride: (usize, usize),
     padding: (usize, usize),
 ) -> Tensor {
-    let output_device = crate::autograd::assert_same_device(input, weight, "conv2d");
+    let output_device = crate::device::assert_same_device(input, weight, "conv2d");
     let build_graph = !is_no_grad()
         && (input.requires_grad()
             || weight.requires_grad()
             || bias.is_some_and(|bias| bias.requires_grad()));
-    let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+    let cuda_native_supported = output_device == crate::device::Device::Cuda;
     assert_native_device_support(output_device, "conv2d", cuda_native_supported);
     if let Some(bias) = bias {
         assert_eq!(
@@ -252,7 +250,7 @@ pub fn conv2d(
     checked_dim_product(&[in_channels, k_h, k_w], "kernel");
     checked_dim_product(&[out_h, out_w], "output pixels");
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() && build_graph {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() && build_graph {
         let bias_buffer = bias.and_then(|tensor| tensor.cloned_cuda_f32_buffer());
         let cuda_out = input.with_cuda_f32_buffer(|input_buf| {
             weight.with_cuda_f32_buffer(|weight_buf| {
@@ -398,7 +396,7 @@ pub fn conv2d(
         }
     }
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() && !build_graph {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() && !build_graph {
         let use_typed_conv = input.dtype() != DType::F32
             || weight.dtype() != DType::F32
             || bias.is_some_and(|b| b.dtype() != DType::F32);
@@ -830,7 +828,7 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
     assert_native_device_support(
         output_device,
         "max_pool2d",
-        output_device == crate::autograd::Device::Cuda,
+        output_device == crate::device::Device::Cuda,
     );
 
     let shape = input.shape_vec();
@@ -850,7 +848,7 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
     let out_h = (h - kh) / sh + 1;
     let out_w = (w - kw) / sw + 1;
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() {
         let cuda_out =
             if let Some((dtype, input_buf, scale)) = input.cloned_cuda_native_lowp_buffer() {
                 cuda::max_pool2d_typed(&input_buf, dtype, scale, b, c, h, w, kh, kw, sh, sw)

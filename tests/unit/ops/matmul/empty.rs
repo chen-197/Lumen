@@ -1,6 +1,7 @@
 use super::*;
 
-use crate::autograd::{Device, no_grad, set_strict_device_execution_scoped};
+use crate::autograd::no_grad;
+use crate::device::{Device, set_strict_device_execution_scoped};
 use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
 fn check_empty_products(device: Device) {
@@ -71,7 +72,7 @@ fn check_empty_products(device: Device) {
                                 if is_batched {
                                     batch_matmul(&a, &b)
                                 } else {
-                                    matmul(&a, &b)
+                                    matmul_transposed_rhs(&a, &b)
                                 }
                             };
                             let assert_output = |out: &Tensor, training| {
@@ -156,7 +157,7 @@ fn empty_products_cuda_forward_backward_and_accumulation() {
 fn scalar_lhs_has_explicit_shape_error() {
     let a = Tensor::from_array_no_grad(ArrayD::from_elem(IxDyn(&[]), 1.));
     let b = Tensor::from_array_no_grad(ArrayD::zeros(IxDyn(&[2, 1])));
-    matmul(&a, &b);
+    matmul_transposed_rhs(&a, &b);
 }
 
 #[test]
@@ -164,5 +165,5 @@ fn scalar_lhs_has_explicit_shape_error() {
 fn empty_operands_still_validate_reduction_dimensions() {
     let a = Tensor::from_array_no_grad(ArrayD::zeros(IxDyn(&[2, 0])));
     let b = Tensor::from_array_no_grad(ArrayD::zeros(IxDyn(&[3, 1])));
-    matmul(&a, &b);
+    matmul_transposed_rhs(&a, &b);
 }

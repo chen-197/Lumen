@@ -1,7 +1,7 @@
 use super::*;
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution;
+use crate::device::set_strict_device_execution;
 use crate::ops::arithmetic::sum;
 use crate::precision::{
     ParameterQuantization, PrecisionConfig, with_parameter_quantization, with_precision_config,

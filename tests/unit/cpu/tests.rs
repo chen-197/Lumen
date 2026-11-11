@@ -1,4 +1,86 @@
 use super::*;
+
+#[test]
+fn indexed_fold_owns_disjoint_items_and_observes_context_and_nesting() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap(),
+    );
+    let caller = std::thread::current().id();
+    for budget in [0, 1, 2, 7] {
+        let context = CpuKernelContext::with_pool(pool.clone());
+        let context = if let Some(n) = NonZeroUsize::new(budget) {
+            context.with_task_limit(n)
+        } else {
+            context
+        };
+        context.scope(|| {
+            for units in [0, 1, 2, 12, 65] {
+                let mut output = vec![0usize; units];
+                let visits = (0..units).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+                let peak = AtomicUsize::new(0);
+                let active = AtomicUsize::new(0);
+                let initializations = AtomicUsize::new(0);
+                let parallel = should_parallelize(units, MIN_WORK_PER_TASK);
+                let sum = fold_reduce_indexed(
+                    output.par_iter_mut(),
+                    4 * MIN_WORK_PER_TASK,
+                    || {
+                        assert_eq!(parallelism(), 1);
+                        initializations.fetch_add(1, Ordering::SeqCst);
+                        0usize
+                    },
+                    |sum, (row, value)| {
+                        if parallel {
+                            assert!(pool.current_thread_index().is_some());
+                        } else {
+                            assert_eq!(std::thread::current().id(), caller);
+                        }
+                        assert_eq!(parallelism(), 1);
+                        visits[row].fetch_add(1, Ordering::SeqCst);
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        let thread = std::thread::current().id();
+                        let nested = fold_reduce_indexed(
+                            (0..2).into_par_iter(),
+                            usize::MAX,
+                            || 0,
+                            |a, (_, i)| {
+                                assert_eq!(std::thread::current().id(), thread);
+                                a + i
+                            },
+                            |a, b| a + b,
+                        );
+                        assert_eq!(nested, 1);
+                        *value = row + 1;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        sum + row + 1
+                    },
+                    |a, b| {
+                        assert_eq!(parallelism(), 1);
+                        a + b
+                    },
+                );
+                assert_eq!(sum, units * (units + 1) / 2);
+                assert_eq!(
+                    initializations.load(Ordering::SeqCst),
+                    task_count(
+                        units,
+                        MIN_WORK_PER_TASK,
+                        3,
+                        if budget == 0 { usize::MAX } else { budget }
+                    )
+                );
+                assert_eq!(output, (1..=units).collect::<Vec<_>>());
+                assert!(visits.iter().all(|v| v.load(Ordering::SeqCst) == 1));
+                assert!(peak.load(Ordering::SeqCst) <= if budget == 0 { 3 } else { budget.min(3) });
+            }
+        });
+    }
+}
 use crate::autograd::{Tensor, is_no_grad, no_grad};
 use crate::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel_mixed, matvec_argmax_rowmajor_parallel_mixed,
@@ -308,6 +390,148 @@ fn planner_handles_empty_overflow_and_uneven_budgets() {
             }
         });
     }
+}
+
+#[test]
+fn capped_producer_has_exact_balanced_groups_without_losing_tiles() {
+    struct Tracked {
+        range: std::ops::Range<usize>,
+        leaves: Arc<Mutex<Vec<std::ops::Range<usize>>>>,
+    }
+    impl Producer for Tracked {
+        type Item = usize;
+        type IntoIter = std::ops::Range<usize>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            self.leaves.lock().unwrap().push(self.range.clone());
+            self.range
+        }
+
+        fn split_at(self, index: usize) -> (Self, Self) {
+            assert!(index <= self.range.len());
+            let middle = self.range.start + index;
+            (
+                Self {
+                    range: self.range.start..middle,
+                    leaves: self.leaves.clone(),
+                },
+                Self {
+                    range: middle..self.range.end,
+                    leaves: self.leaves,
+                },
+            )
+        }
+    }
+    let workers = pool(8);
+    workers.install(|| {
+        for units in [1, 2, 7, 8, 9, 12, 17, 31, 65, 129] {
+            for tasks in 1..=units.min(16) {
+                let leaves = Arc::new(Mutex::new(Vec::new()));
+                let seen = Mutex::new(Vec::new());
+                let f = |i| {
+                    assert!(IN_KERNEL.with(Cell::get));
+                    assert_eq!(parallelism(), 1);
+                    seen.lock().unwrap().push(i);
+                };
+                BalancedGroups {
+                    units,
+                    tasks,
+                    f: &f,
+                }
+                .callback(Tracked {
+                    range: 0..units,
+                    leaves: leaves.clone(),
+                });
+                let mut ranges = leaves.lock().unwrap().clone();
+                ranges.sort_by_key(|r| r.start);
+                assert_eq!(ranges.len(), tasks);
+                let mut start = 0;
+                for (i, range) in ranges.iter().enumerate() {
+                    let length = units / tasks + usize::from(i < units % tasks);
+                    assert_eq!(*range, start..start + length);
+                    start += length;
+                }
+                assert_eq!(start, units);
+                let mut seen = seen.into_inner().unwrap();
+                seen.sort_unstable();
+                assert_eq!(seen, (0..units).collect::<Vec<_>>());
+            }
+        }
+    });
+}
+
+#[test]
+fn capped_schedulers_preserve_indices_tails_and_restore_after_worker_panic() {
+    let workers = pool(8);
+    for budget in [1, 2, 3, 5, 8, 11] {
+        let context = CpuKernelContext::with_pool(workers.clone())
+            .with_task_limit(NonZeroUsize::new(budget).unwrap());
+        context.scope(|| {
+            for units in [0_usize, 1, 7, 8, 9, 12, 17, 65] {
+                let len = units.saturating_mul(3).saturating_sub(1);
+                let mut a = vec![usize::MAX; len];
+                let mut b = a.clone();
+                let mut c = a.clone();
+                let mut d = a.clone();
+                for_each_chunk_mut(&mut a, 3, 100_000, |(i, values)| {
+                    assert_eq!(parallelism(), 1);
+                    values.fill(i);
+                });
+                for_each_chunk2_mut(&mut b, &mut c, 3, 100_000, |(i, (b, c))| {
+                    assert_eq!(parallelism(), 1);
+                    b.fill(i);
+                    c.fill(i);
+                });
+                for_each_chunk3_mut(&mut b, &mut c, &mut d, 3, 100_000, |(i, ((b, c), d))| {
+                    assert_eq!(parallelism(), 1);
+                    b.fill(i);
+                    c.fill(i);
+                    d.fill(i);
+                });
+                assert_eq!(a, (0..len).map(|i| i / 3).collect::<Vec<_>>());
+                assert_eq!(a, b);
+                assert_eq!(a, c);
+                assert_eq!(a, d);
+                let mut output = ndarray::Array2::<usize>::zeros((3, units));
+                for_each_indexed(
+                    output.axis_iter_mut(ndarray::Axis(1)),
+                    100_000,
+                    |(i, mut col)| {
+                        assert_eq!(parallelism(), 1);
+                        let thread = std::thread::current().id();
+                        let mut nested = [0; 4];
+                        for_each_chunk_mut(&mut nested, 1, usize::MAX, |(_, v)| {
+                            assert_eq!(std::thread::current().id(), thread);
+                            v.fill(1);
+                        });
+                        assert_eq!(nested, [1; 4]);
+                        col.fill(i);
+                    },
+                );
+                assert!(output.indexed_iter().all(|((_, i), v)| *v == i));
+            }
+        });
+    }
+    let context =
+        CpuKernelContext::with_pool(workers.clone()).with_task_limit(NonZeroUsize::new(5).unwrap());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.scope(|| {
+            let mut values = [0; 12];
+            for_each_chunk_mut(&mut values, 1, 100_000, |(i, _)| {
+                if i == 5 {
+                    panic!("restore capped worker kernel flag");
+                }
+            });
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(!IN_KERNEL.with(Cell::get));
+    assert!(
+        workers
+            .broadcast(|_| !IN_KERNEL.with(Cell::get))
+            .into_iter()
+            .all(|v| v)
+    );
 }
 
 #[test]

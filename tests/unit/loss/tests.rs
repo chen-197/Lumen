@@ -1,7 +1,7 @@
 use super::*;
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution;
+use crate::device::set_strict_device_execution;
 use ndarray::{Array, IxDyn};
 
 fn make_tensor(shape: &[usize], data: Vec<f32>, dtype: DType) -> Tensor {

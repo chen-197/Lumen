@@ -1,7 +1,5 @@
-use crate::autograd::{
-    Device, StoragePreference, Tensor, TensorData, TensorStorageView, assert_native_device_support,
-    is_no_grad, is_strict_device_execution,
-};
+use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
+use crate::device::{Device, assert_native_device_support, is_strict_device_execution};
 use crate::module::Module;
 use crate::ops::cuda;
 use crate::precision::DType;
@@ -124,7 +122,7 @@ fn unary_no_grad(
                 unreachable!("f32 compute preference should expose f32 view")
             }
         };
-        if output_device == crate::autograd::Device::Cuda
+        if output_device == crate::device::Device::Cuda
             && (cuda::should_accelerate_elementwise(input_f32.len())
                 || is_strict_device_execution())
         {
@@ -181,7 +179,7 @@ fn softmax_no_grad(input: &Tensor, axis: usize) -> Tensor {
     };
     let output_device = input.device();
 
-    if output_device == crate::autograd::Device::Cuda && !input.is_empty() {
+    if output_device == crate::device::Device::Cuda && !input.is_empty() {
         let shape = input.shape_vec();
         assert!(!shape.is_empty(), "Softmax expects at least 1D input");
         assert_eq!(
@@ -252,7 +250,7 @@ fn softmax_no_grad(input: &Tensor, axis: usize) -> Tensor {
         );
         let outer_dim = shape.iter().product::<usize>() / last_dim;
 
-        if output_device == crate::autograd::Device::Cuda
+        if output_device == crate::device::Device::Cuda
             && cuda::should_accelerate_softmax(outer_dim, last_dim)
         {
             if output_dtype == DType::F32 {

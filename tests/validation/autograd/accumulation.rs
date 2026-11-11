@@ -1,5 +1,6 @@
 use crate::accuracy_gate::{run, tensor};
-use crate::autograd::{Device, Tensor};
+use crate::autograd::Tensor;
+use crate::device::Device;
 use crate::precision::DType;
 use ndarray::{ArrayD, IxDyn};
 use std::cell::Cell;

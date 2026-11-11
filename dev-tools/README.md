@@ -20,14 +20,31 @@ Cargo registers these Rust programs in the root `Cargo.toml`. Enable the
 
 ```sh
 cargo run --release --features dev-tools --bin cpu_backward_bench -- --threads 4 --tasks 4
+cargo run --release --features dev-tools --bin cpu_scaling_bench -- --kind rms_norm --dtype bf16 --m 16 --k 128 --threads 4 --tasks 2
 cargo run --release --features dev-tools --bin manual_state_check -- --device cpu
 ```
 
 The production inference CLI and weight conversion CLI remain in `src/`.
+The RMSNorm scaling case uses `--m` rows of `--k` values and supports the same
+shared-pool/task/request controls. Its input and weight both use `--dtype`,
+including I8; `--n` and attention head options do not affect this case.
+`--kind rms_norm_backward` retains one training graph and measures gradient
+reset, upstream-seed cloning and the complete input/weight VJP. It uses the same
+row, dtype, pool and request arguments. Both input-gradient rows and
+weight-gradient reduction observe the policy. Set
+`LUMEN_BENCH_DUMP=1` to include represented inputs, seed and gradients after timing.
+`--kind layer_norm` measures affine LayerNorm with weight and bias, using the
+same row/last-dimension arguments. It accepts F32/F16/BF16 storage and produces
+F32 outputs. Per-request records include input/parameter storage dtypes after
+the run, so implicit storage promotion is visible in older baselines.
+`--kind layer_norm_backward` retains an affine LayerNorm graph and measures
+gradient reset, seed cloning and the full input/weight/bias VJP. It accepts
+F32/F16/BF16 storage and the same row, dimension, pool and request controls;
+`LUMEN_BENCH_DUMP=1` exports inputs, parameters, seed and gradients outside timing.
 The `cpu-profiling` feature enables library instrumentation used by benchmarks;
 it depends on `dev-tools` and is disabled by default.
 
-`matmul.total` includes `matmul.kernel`, while `rms_norm` measures the full
+`matmul_transposed_rhs.total` includes `matmul_transposed_rhs.kernel`, while `rms_norm` measures the full
 normalization call. These regions are inclusive and must not be summed as
 independent shares of total time.
 
@@ -63,6 +80,19 @@ The accuracy runner includes `check_qwen3.py`, an independent FP64 reference for
 Q/K normalization, attention heads wider than `hidden_size / num_heads`, tied
 embeddings, full forward logits and parameter gradients. Like the other ordinary
 numerical tests, it uses small fixtures and requires no downloaded weights.
+
+Matrix benchmarks distinguish `matmul` (`A @ B`) from `matmul_transposed_rhs`
+(`A @ Wᵀ`). The projection/scaling benchmarks select the latter with
+`--kind matmul_transposed_rhs`; `generic_prefill_bench --op` accepts either name.
+For a custom matrix shape, use `--op matmul --shape 1,1024,1536 --layout 0`
+(`A=[1,1024]`, `B=[1024,1536]`); layout 0 is row-major and layout 1 is strided.
+Custom shapes use case 0; the default benchmark cases are unchanged.
+Native F16/BF16/I8 layouts are constructed after precision conversion; matrix
+records include `input_strides` and `rhs_strides`. Older low-precision layout
+labels described the array before casting and do not establish native strides.
+The standard product has corresponding `matmul.total` / `matmul.kernel` profiling scopes.
+Historical result files retain their original operator labels; the 2026-10-29
+`matmul` rows measured the transposed-RHS operation.
 
 `prefill_decode_bench` reads an adjacent `config.json` or an explicit `--config`.
 It supports the documented Llama/dense Qwen3 configurations. Qwen3 text prompts

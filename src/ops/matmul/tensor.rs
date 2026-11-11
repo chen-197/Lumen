@@ -1,9 +1,8 @@
-use super::backward::{batch_matmul_backward_cpu_f32, matmul_backward_cpu_f32};
+use super::backward::batch_matmul_backward_cpu_f32;
 use super::conversion::with_native_f32_compute_view;
 use super::cuda_route::{
-    try_cuda_batch_matmul, try_cuda_batch_matmul_buffer, try_cuda_matmul, try_cuda_matmul_buffer,
-    try_cuda_training_batch_matmul_backward, try_cuda_training_batch_matmul_backward_buffers,
-    try_cuda_training_matmul_backward, try_cuda_training_matmul_backward_buffers,
+    try_cuda_batch_matmul, try_cuda_batch_matmul_buffer, try_cuda_training_batch_matmul_backward,
+    try_cuda_training_batch_matmul_backward_buffers,
 };
 use super::prefill::try_prefill_gemm;
 use super::rows::{
@@ -330,13 +329,29 @@ pub(super) fn zero_matmul_output(
 /// Multiply `A[..., K]` by `B[N, K]` transposed, producing `[..., N]`.
 /// Empty leading/output axes are supported. A zero-length reduction returns
 /// zeros; its operand gradients are shaped zeros as well.
+pub fn matmul_transposed_rhs(a: &Tensor, weights: &Tensor) -> Tensor {
+    matrix_product(a, weights, super::layout::RhsLayout::Transposed)
+}
+
+/// Standard matrix product: `A[..., K] @ B[K, N] -> [..., N]`.
+///
+/// The RHS must be a 2D matrix; leading LHS dimensions are preserved, and a
+/// vector LHS produces a vector output. For output-major linear weights use
+/// [`matmul_transposed_rhs`]. For paired 4D batches use [`batch_matmul`].
+/// Empty axes and zero reductions have the same semantics as those APIs.
+/// Earlier versions used a transposed RHS for `matmul`; migrate those weight-layout
+/// calls to `matmul_transposed_rhs`.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
+    matrix_product(a, b, super::layout::RhsLayout::Standard)
+}
+
+fn matrix_product(a: &Tensor, b: &Tensor, layout: super::layout::RhsLayout) -> Tensor {
     #[cfg(feature = "cpu-profiling")]
-    let _profile = crate::cpu::profiling::region("matmul.total");
-    let output_device = assert_same_device(a, b, "matmul");
+    let _profile = crate::cpu::profiling::region(layout.profile_total());
+    let output_device = assert_same_device(a, b, layout.name());
     let build_graph = !is_no_grad() && (a.requires_grad() || b.requires_grad());
-    let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
-    assert_native_device_support(output_device, "matmul", cuda_native_supported);
+    let cuda_native_supported = output_device == crate::device::Device::Cuda;
+    assert_native_device_support(output_device, layout.name(), cuda_native_supported);
 
     let a_shape = a.shape_vec();
     let b_shape = b.shape_vec();
@@ -351,8 +366,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     }
 
     let k_dim_a = a_shape[a_shape.len() - 1];
-    let n_dim = b_shape[0];
-    let k_dim_b = b_shape[1];
+    let (k_dim_b, n_dim) = match layout {
+        super::layout::RhsLayout::Standard => (b_shape[0], b_shape[1]),
+        super::layout::RhsLayout::Transposed => (b_shape[1], b_shape[0]),
+    };
 
     if k_dim_a != k_dim_b {
         panic!(
@@ -378,8 +395,8 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     }
 
     if build_graph
-        && output_device == crate::autograd::Device::Cuda
-        && let Some(buffer) = try_cuda_matmul_buffer(a, b, m_dim, k_dim_a, n_dim)
+        && output_device == crate::device::Device::Cuda
+        && let Some(buffer) = layout.forward_cuda_buffer(a, b, m_dim, k_dim_a, n_dim)
     {
         let mut out_shape = a_shape.clone();
         let last_idx = out_shape.len() - 1;
@@ -415,7 +432,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
                     .and_then(|output| output.cloned_cuda_f32_grad())
                     .filter(|buffer| buffer.len() == grad.len());
                 if is_strict_device_execution() {
-                    match try_cuda_training_matmul_backward_buffers(
+                    match layout.backward_cuda_buffers(
                         grad,
                         cuda_grad.clone(),
                         &a_clone,
@@ -436,9 +453,8 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
                         }
                     }
                 }
-                let cuda_result = try_cuda_training_matmul_backward(
-                    grad, cuda_grad, &a_clone, &b_clone, m_dim, k_dim_a, n_dim,
-                );
+                let cuda_result = layout
+                    .backward_cuda(grad, cuda_grad, &a_clone, &b_clone, m_dim, k_dim_a, n_dim);
                 match cuda_result {
                     Ok(((da, da_buf), (db, db_buf))) => {
                         a_clone.add_backward_grad_with_cuda_buffer(da, Some(da_buf));
@@ -450,11 +466,14 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
                                 "CUDA matmul backward failed in strict device execution mode: {err}"
                             );
                         }
-                        let (da, db) = matmul_backward_cpu_f32(
-                            &a_clone, &b_clone, grad, m_dim, k_dim_a, n_dim,
-                        );
-                        a_clone.add_backward_grad(da);
-                        b_clone.add_backward_grad(db);
+                        let (da, db) =
+                            layout.backward_cpu(&a_clone, &b_clone, grad, m_dim, k_dim_a, n_dim);
+                        if let Some(da) = da {
+                            a_clone.add_backward_grad(da);
+                        }
+                        if let Some(db) = db {
+                            b_clone.add_backward_grad(db);
+                        }
                     }
                 }
             })),
@@ -470,17 +489,18 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         } else {
             DType::F32
         };
-        if let Some(cuda_out) = try_cuda_matmul(a, b, m_dim, n_dim, k_dim_a, output_dtype) {
+        let mut out_shape = a_shape.clone();
+        *out_shape.last_mut().unwrap() = n_dim;
+        if let Some(cuda_out) =
+            layout.forward_cuda(a, b, m_dim, k_dim_a, n_dim, output_dtype, &out_shape)
+        {
             return cuda_out;
         }
-        let res_2d = crate::cpu_profile!(
-            "matmul.kernel",
-            matmul_forward_cpu_native(a, b, m_dim, k_dim_a, n_dim)
-        );
-
-        let mut out_shape = a_shape.clone();
-        let last_idx = out_shape.len() - 1;
-        out_shape[last_idx] = n_dim;
+        let res_2d = {
+            #[cfg(feature = "cpu-profiling")]
+            let _profile = crate::cpu::profiling::region(layout.profile_kernel());
+            layout.forward_cpu(a, b, m_dim, k_dim_a, n_dim)
+        };
         return Tensor::from_f32_data_no_grad_with_device_dtype(
             res_2d.into_shape(out_shape).unwrap().into_dyn(),
             output_dtype,
@@ -488,7 +508,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         );
     }
 
-    let res_2d = matmul_forward_cpu_native(a, b, m_dim, k_dim_a, n_dim);
+    let res_2d = layout.forward_cpu(a, b, m_dim, k_dim_a, n_dim);
 
     let mut out_shape = a_shape.clone();
     let last_idx = out_shape.len() - 1;
@@ -518,9 +538,13 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         parents: vec![a_clone.clone(), b_clone.clone()],
         requires_grad: true,
         backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
-            let (da, db) = matmul_backward_cpu_f32(&a_clone, &b_clone, grad, m_dim, k_dim_a, n_dim);
-            a_clone.add_backward_grad(da);
-            b_clone.add_backward_grad(db);
+            let (da, db) = layout.backward_cpu(&a_clone, &b_clone, grad, m_dim, k_dim_a, n_dim);
+            if let Some(da) = da {
+                a_clone.add_backward_grad(da);
+            }
+            if let Some(db) = db {
+                b_clone.add_backward_grad(db);
+            }
         })),
         device: output_device,
     })))
@@ -556,7 +580,7 @@ pub(super) fn batch_matmul_forward_cpu_f32(
 pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     let output_device = assert_same_device(lhs, rhs, "batch_matmul");
     let build_graph = !is_no_grad() && (lhs.requires_grad() || rhs.requires_grad());
-    let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+    let cuda_native_supported = output_device == crate::device::Device::Cuda;
     assert_native_device_support(output_device, "batch_matmul", cuda_native_supported);
 
     let lhs_shape = lhs.shape_vec();
@@ -577,7 +601,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     }
 
     if build_graph
-        && output_device == crate::autograd::Device::Cuda
+        && output_device == crate::device::Device::Cuda
         && let Some(buffer) = try_cuda_batch_matmul_buffer(lhs, rhs, b, h, m, k, n)
     {
         let lhs_clone = lhs.clone();

@@ -1,6 +1,7 @@
 //! Architecture-independent examples and independent numerical audit records.
 use crate::accuracy_gate::{check, ordered, run, tensor, values};
-use crate::autograd::{Device, Tensor, no_grad};
+use crate::autograd::{Tensor, no_grad};
+use crate::device::Device;
 use crate::layers::{
     AttentionMask, AttentionOptions, LayerNorm, Linear, scaled_dot_product_attention,
 };

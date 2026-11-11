@@ -148,7 +148,7 @@ fn active_cache_views_pack_each_batch_and_head_without_unused_capacity() {
 }
 use crate::autograd::no_grad;
 #[cfg(feature = "cuda")]
-use crate::autograd::set_strict_device_execution;
+use crate::device::set_strict_device_execution;
 use crate::precision::{DType, PrecisionConfig, set_default_runtime_dtype, with_precision_config};
 use ndarray::{Array, IxDyn};
 

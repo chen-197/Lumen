@@ -21,7 +21,7 @@ fn regression_optimizer_sgd_rejects_bad_gradient_before_any_update() {
             continue;
         }
         let _cuda = cuda::set_enabled_scoped(on_cuda);
-        let _strict = crate::autograd::set_strict_device_execution_scoped(on_cuda);
+        let _strict = crate::device::set_strict_device_execution_scoped(on_cuda);
         for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
             for state in [DType::F32, DType::F16, DType::BF16] {
                 for momentum in [0., 0.9] {
@@ -66,7 +66,7 @@ fn regression_optimizer_adam_rejects_bad_gradient_before_any_update() {
             continue;
         }
         let _cuda = cuda::set_enabled_scoped(on_cuda);
-        let _strict = crate::autograd::set_strict_device_execution_scoped(on_cuda);
+        let _strict = crate::device::set_strict_device_execution_scoped(on_cuda);
         for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8] {
             for state in [DType::F32, DType::F16, DType::BF16] {
                 for master in [false, true] {

@@ -36,9 +36,9 @@ def matrix(threads, extended):
             for kind, binary in [('forward', 'generic_prefill_bench'), ('backward', 'cpu_backward_bench')]:
                 add(f'{kind}-tasks-{tasks}-cycle-{cycle}', binary, '--tasks', tasks)
     for dtype in ['f32', 'f16', 'bf16', 'i8']:
-        for kind in (['matmul', 'matvec', 'qkv', 'gate'] if extended else ['matmul', 'qkv']):
+        for kind in (['matmul_transposed_rhs', 'matvec', 'qkv', 'gate'] if extended else ['matmul_transposed_rhs', 'qkv']):
             add(f'projection-{dtype}-{kind}', 'cpu_projection_bench', '--kind', kind,
-                '--dtype', dtype, '--m', 37 if kind == 'matmul' else 1, '--k', 513, '--n', 769)
+                '--dtype', dtype, '--m', 37 if kind == 'matmul_transposed_rhs' else 1, '--k', 513, '--n', 769)
         for kind in (['matvec', 'argmax', 'qkv', 'gate'] if extended else ['argmax']):
             native_input = 'bf16' if dtype == 'i8' else dtype
             for input_dtype in (sorted({'f32', native_input}) if extended else [native_input]):
@@ -46,12 +46,12 @@ def matrix(threads, extended):
                     '--kind', kind, '--dtype', dtype, '--input-dtype', input_dtype,
                     '--k', 257, '--n', 515, '--kv-n', 129, '--sets', 3)
     for dtype in (['f32', 'f16', 'bf16', 'i8'] if extended else ['f32']):
-        for kind in ['matmul', 'attention']:
+        for kind in ['matmul_transposed_rhs', 'attention']:
             for requests in ([1, 2, 4] if extended else [1, 4]):
                 for tasks in ([1, 'auto'] if extended else ['auto']):
                     add(f'scaling-{dtype}-{kind}-requests-{requests}-tasks-{tasks}', 'cpu_scaling_bench',
-                        '--kind', kind, '--dtype', dtype, '--m', 193 if kind == 'matmul' else 129,
-                        '--k', 512 if kind == 'matmul' else 128, '--n', 513,
+                        '--kind', kind, '--dtype', dtype, '--m', 193 if kind == 'matmul_transposed_rhs' else 129,
+                        '--k', 512 if kind == 'matmul_transposed_rhs' else 128, '--n', 513,
                         '--heads', 4, '--kv-heads', 2, '--requests', requests, '--tasks', tasks,
                         counts=(2, 5, 3))
     # This program manages warmup internally and has no --threads/--warmup switches.

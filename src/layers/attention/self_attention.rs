@@ -1,7 +1,7 @@
 use crate::autograd::{
-    Device, StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    assert_native_device_support, is_no_grad, is_strict_device_execution,
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
 };
+use crate::device::{Device, assert_native_device_support, is_strict_device_execution};
 use crate::layers::attention::encoding::RotaryEmbedding;
 use crate::layers::{Linear, RMSNorm};
 use crate::module::Module;

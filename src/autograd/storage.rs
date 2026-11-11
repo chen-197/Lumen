@@ -6,21 +6,21 @@ impl Tensor {
         ArrayD::<f32>::zeros(IxDyn(&[0])).into_shared()
     }
 
-    pub(super) fn clear_non_f32_storage(inner: &mut TensorData) {
+    pub(crate) fn clear_non_f32_storage(inner: &mut TensorData) {
         inner.f16_data = None;
         inner.bf16_data = None;
         inner.i8_data = None;
         inner.i8_scale = None;
     }
 
-    pub(super) fn clear_cuda_storage(inner: &mut TensorData) {
+    pub(crate) fn clear_cuda_storage(inner: &mut TensorData) {
         inner.cuda_f32_data = None;
         inner.cuda_f16_data = None;
         inner.cuda_bf16_data = None;
         inner.cuda_i8_data = None;
     }
 
-    pub(super) fn logical_shape(inner: &TensorData) -> &[usize] {
+    pub(crate) fn logical_shape(inner: &TensorData) -> &[usize] {
         if inner.storage_dtype == DType::F16
             && let Some(f16_data) = inner.f16_data.as_ref()
         {
@@ -48,7 +48,7 @@ impl Tensor {
         }
     }
 
-    pub(super) fn checked_shape_len(shape: &[usize], context: &str) -> usize {
+    pub(crate) fn checked_shape_len(shape: &[usize], context: &str) -> usize {
         shape
             .iter()
             .try_fold(1usize, |len, &dim| len.checked_mul(dim))
@@ -230,7 +230,7 @@ impl Tensor {
         }
     }
 
-    pub(super) fn storage_as_f32_vec(&self) -> Vec<f32> {
+    pub(crate) fn storage_as_f32_vec(&self) -> Vec<f32> {
         let inner = self.0.borrow();
         if inner.has_f32_data {
             return inner.data.iter().copied().collect();
@@ -872,7 +872,7 @@ impl Tensor {
         inner.cuda_f32_grad = None;
     }
 
-    pub(super) fn ensure_native_host_storage(&self) {
+    pub(crate) fn ensure_native_host_storage(&self) {
         let ready = {
             let inner = self.0.borrow();
             match inner.storage_dtype {
